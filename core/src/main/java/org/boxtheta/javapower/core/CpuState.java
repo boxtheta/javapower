@@ -72,6 +72,20 @@ public final class CpuState {
     public volatile Thread runner;
     /** Set by H_CEDE / H_CONFER; the run loop idles until an interrupt is pending, then clears it. */
     public boolean ceded;
+    /**
+     * Index of this hardware thread within the machine (0 for the boot CPU). Also its PAPR
+     * interrupt server number and device tree {@code reg}. Set once, before the CPU runs.
+     */
+    public int index;
+    /**
+     * True while this CPU is in the RTAS "stopped" state: a secondary that has not been started
+     * with {@code start-cpu} yet, or one that called {@code stop-self}. The run loop executes no
+     * instructions and takes no interrupts while it is set; it parks until another thread clears
+     * it and calls {@link #wake}. Whoever clears it (the platform's {@code start-cpu}) first
+     * writes the entry state (pc, r3, MSR and friends) into this object; the volatile write is
+     * what publishes those plain fields to the CPU's own thread.
+     */
+    public volatile boolean halted;
     /** Asks the run loop to return to its caller at the next instruction boundary. */
     public volatile boolean stopRequested;
 

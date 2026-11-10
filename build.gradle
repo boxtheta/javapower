@@ -1,0 +1,33 @@
+subprojects {
+    apply plugin: 'java-library'
+    group = 'javapower'
+    repositories { mavenCentral() }
+    java { toolchain { languageVersion = JavaLanguageVersion.of(27) } }
+    tasks.withType(JavaCompile).configureEach {
+        options.release = 25
+        options.encoding = 'UTF-8'
+        options.compilerArgs += ['-Xlint:all,-serial,-this-escape', '-Werror']
+    }
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:5.13.4')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+    test {
+        useJUnitPlatform()
+        maxHeapSize = '4g'
+        testLogging { events 'failed'; exceptionFormat 'full' }
+    }
+    if (name != 'core') {
+        dependencies { api project(':core') }
+    }
+}
+project(':app') {
+    apply plugin: 'application'
+    dependencies {
+        implementation project(':cpu-int')
+        implementation project(':cpu-fpvec')
+        implementation project(':platform')
+    }
+    application { mainClass = 'javapower.app.Main' }
+}

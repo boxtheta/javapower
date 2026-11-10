@@ -3,10 +3,9 @@ package org.boxtheta.javapower.app;
 import java.nio.file.Path;
 import java.util.Map;
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
-import org.boxtheta.javapower.cpu.IntInsns;
+import org.boxtheta.javapower.Emulator;
+import org.boxtheta.javapower.core.Spr;
 import org.boxtheta.javapower.cpu.Interpreter;
-import org.boxtheta.javapower.fpvec.FpuSets;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
 import org.boxtheta.javapower.papr.StdioCharBackend;
@@ -43,13 +42,9 @@ public final class Main {
             }
         }
 
-        try (Machine m = new Machine(cfg)) {
-            DecodeTable table = new DecodeTable();
-            table.addAll(new IntInsns());
-            FpuSets.registerAll(table);
-            CpuState cpu = new CpuState();
-            m.attachCpu(cpu);
-            Interpreter interp = new Interpreter(cpu, m.memory(), table, clock);
+        try (Emulator emu = new Emulator(cfg, clock)) {
+            CpuState cpu = emu.cpu();
+            Interpreter interp = emu.interpreter();
             interp.icountShift = icountShift;
             interp.unimplementedHook = (s, pc, insn, key) ->
                     System.err.printf("[cpu] unimplemented %s insn=%08x pc=%x msr=%x%n", key, insn, pc, s.msr);
@@ -57,47 +52,31 @@ public final class Main {
                 interp.interruptHook = (s, vector, srr0) ->
                         System.err.printf("[cpu] interrupt %x srr0=%x icount=%d%n", vector, srr0, s.icount);
             }
-
-            int statusTicks = statusSecs * 10;
-            Thread pump = Thread.ofPlatform().daemon().name("pump").start(() -> {
-                try {
-                    long last = 0;
-                    for (int tick = 1; ; tick++) {
-                        Thread.sleep(100);
-                        m.pump();
-                        if (statusTicks > 0 && tick % statusTicks == 0) {
+            if (statusSecs > 0) {
+                long periodMs = statusSecs * 1000L;
+                Thread.ofPlatform().daemon().name("status").start(() -> {
+                    try {
+                        long last = 0;
+                        while (true) {
+                            Thread.sleep(periodMs);
                             // Racy snapshot of the CPU thread's state; good enough for progress reports.
                             long ic = cpu.icount;
                             System.err.printf("[status] icount=%d (+%d) pc=%x msr=%x lr=%x ceded=%b pid=%x%n",
-                                    ic, ic - last, cpu.pc, cpu.msr, cpu.lr, cpu.ceded,
-                                    cpu.spr[org.boxtheta.javapower.core.Spr.PIDR]);
+                                    ic, ic - last, cpu.pc, cpu.msr, cpu.lr, cpu.ceded, cpu.spr[Spr.PIDR]);
                             last = ic;
                         }
+                    } catch (InterruptedException e) {
+                        // exit
                     }
-                } catch (InterruptedException e) {
-                    // exit
-                }
-            });
-
-            long remaining = maxInsns;
-            while (true) {
-                interp.resetPapr();
-                m.reset(cpu);
-                long before = cpu.icount;
-                interp.run(remaining);
-                remaining -= cpu.icount - before;
-                if (cpu.stopRequested && m.shutdownReason() == Machine.ShutdownReason.REBOOT && remaining > 0) {
-                    cpu.stopRequested = false;
-                    continue;
-                }
-                break;
+                });
             }
-            pump.interrupt();
+
+            Machine.ShutdownReason why = emu.run(maxInsns);
+            Machine m = emu.machine();
             System.out.flush();
             System.err.printf("%n[javapower] stopped: reason=%s %s icount=%d pc=%x msr=%x%n",
-                    m.shutdownReason(), m.shutdownMessage() == null ? "" : m.shutdownMessage(),
-                    cpu.icount, cpu.pc, cpu.msr);
-            for (Map.Entry<String, Long> e : interp.unimplementedCounts().entrySet()) {
+                    why, m.shutdownMessage() == null ? "" : m.shutdownMessage(), cpu.icount, cpu.pc, cpu.msr);
+            for (Map.Entry<String, Long> e : emu.unimplementedInstructions().entrySet()) {
                 System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());
             }
         }

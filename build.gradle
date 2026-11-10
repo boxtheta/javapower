@@ -42,12 +42,18 @@ subprojects {
         dependencies { api project(':core') }
     }
 }
+// The embedding entry point: one artifact that pulls in everything.
+project(':emulator') {
+    dependencies {
+        api project(':cpu-int')
+        api project(':cpu-fpvec')
+        api project(':platform')
+    }
+}
 project(':app') {
     apply plugin: 'application'
     dependencies {
-        implementation project(':cpu-int')
-        implementation project(':cpu-fpvec')
-        implementation project(':platform')
+        implementation project(':emulator')
     }
     application { mainClass = 'org.boxtheta.javapower.app.Main' }
 }

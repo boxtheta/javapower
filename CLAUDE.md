@@ -25,6 +25,17 @@ Tumbleweed ppc64le to an interactive console.
 
 Modules other than `core` depend only on `core`, never on each other (`app` depends on all).
 
+## Publishing
+
+The emulator is published as a library as well as a CLI. Maven coordinates are
+`org.boxtheta.javapower:javapower-<module>` (`maven-publish` is applied to every module).
+
+- Java packages will move from `javapower.*` to `org.boxtheta.javapower.*`. The lead does this
+  rename in one pass once the in-flight module work has landed; do not rename packages yourself.
+- Treat public types as library API: embedders construct and drive the machine from their own
+  code, so no `System.exit`, no reliance on stdin/stdout outside the backends meant for it, no
+  global mutable state, and host resources (threads, files) must be closeable.
+
 ## Conventions
 
 - Java 25 language level, no runtime dependencies. JUnit 5 for tests. `-Werror` is on.

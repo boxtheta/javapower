@@ -1,8 +1,28 @@
 subprojects {
     apply plugin: 'java-library'
-    group = 'javapower'
+    apply plugin: 'maven-publish'
+    group = 'org.boxtheta.javapower'
+    version = '0.1.0-SNAPSHOT'
     repositories { mavenCentral() }
-    java { toolchain { languageVersion = JavaLanguageVersion.of(27) } }
+    java {
+        toolchain { languageVersion = JavaLanguageVersion.of(27) }
+        withSourcesJar()
+        withJavadocJar()
+    }
+    // Published as org.boxtheta.javapower:javapower-<module>.
+    base { archivesName = "javapower-${project.name}" }
+    tasks.withType(Javadoc).configureEach {
+        options.encoding = 'UTF-8'
+        options.addStringOption('Xdoclint:none', '-quiet')
+    }
+    publishing {
+        publications {
+            maven(MavenPublication) {
+                artifactId = "javapower-${project.name}"
+                from components.java
+            }
+        }
+    }
     tasks.withType(JavaCompile).configureEach {
         options.release = 25
         options.encoding = 'UTF-8'

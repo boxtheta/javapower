@@ -1,6 +1,7 @@
 # Generate the inline-dispatch block of Interpreter.java from the hot list and the registrations.
-import re, sys
-D='/Users/mxavier/code/javapower/cpu-int/src/main/java/org/boxtheta/javapower/cpu/'
+# usage: python3 gen.py hot.txt <number of hot handlers>   (run from anywhere)
+import os, re, sys
+D=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../src/main/java/org/boxtheta/javapower/cpu/')
 refs={}
 for f in ['Alu','LoadStore','BranchInsns','SystemInsns']:
     src=open(D+f+'.java').read()

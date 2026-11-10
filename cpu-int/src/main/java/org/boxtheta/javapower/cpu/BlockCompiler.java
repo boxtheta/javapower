@@ -83,7 +83,7 @@ final class BlockCompiler {
                 case "SprAccess" -> m.equals("mfspr") ? CONT : 0;
                 case "SystemInsns" -> switch (m) {
                     case "dcbz" -> CONT | STORE;
-                    case "dcbfst", "icbi", "nop", "mfmsr" -> CONT;
+                    case "dcbfst", "icbi", "nop", "eieio", "mfmsr" -> CONT;
                     default -> 0;
                 };
                 default -> 0;

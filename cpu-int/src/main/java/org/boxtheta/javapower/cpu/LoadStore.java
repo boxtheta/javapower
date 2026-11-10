@@ -10,6 +10,7 @@ import static org.boxtheta.javapower.cpu.Fields.si;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.GuestMemory;
 import org.boxtheta.javapower.core.Msr;
+import org.boxtheta.javapower.core.PhysicalMemory;
 import org.boxtheta.javapower.core.PpcException;
 import org.boxtheta.javapower.core.Spr;
 
@@ -485,32 +486,52 @@ final class LoadStore {
             throw PpcException.alignment(ea);
         }
         long ra = s.mem.translateData(ea, false);
-        loadQuad(s, ea, rtp);
+        Interpreter in = Interpreter.of(s);
+        // Under the lock stqcx holds, so the two halves are one value with respect to stqcx.
+        synchronized (in.domain.wideAtomicLock) {
+            loadQuad(s, ea, rtp);
+            // The observed value is the quadword in storage order: first and second doubleword.
+            s.resVal = s.mem.read64(ea);
+            in.resValLo = s.mem.read64(ea + 8);
+        }
         s.resValid = true;
         s.resAddr = ra;
         s.resLen = 16;
-        // For a quadword the observed value is the first doubleword in storage.
-        s.resVal = s.mem.read64(ea);
     }
 
     /**
-     * Store-conditional, as QEMU does it: fails without touching storage unless a reservation of
-     * the same length is held for this address; then succeeds if the reserved storage still holds
-     * the value the larx observed (compare-and-swap model). Sets CR0 = 0b00 || success || SO.
+     * Compare-and-swap of the naturally aligned {@code len}-byte value at real address
+     * {@code pa}, in the byte order of MSR[LE]. Notes the store for compiled blocks.
+     */
+    static boolean casReal(CpuState s, long pa, int len, long expect, long update) {
+        RadixMmu m = Interpreter.of(s).mmu;
+        PhysicalMemory pm = m.physical();
+        boolean le = (s.msr & Msr.LE) != 0;
+        boolean ok = switch (len) {
+            case 1 -> pm.cas8(pa, (int) expect, (int) update);
+            case 2 -> le ? pm.cas16le(pa, (int) expect, (int) update) : pm.cas16be(pa, (int) expect, (int) update);
+            case 4 -> le ? pm.cas32le(pa, (int) expect, (int) update) : pm.cas32be(pa, (int) expect, (int) update);
+            default -> le ? pm.cas64le(pa, expect, update) : pm.cas64be(pa, expect, update);
+        };
+        if (ok) {
+            m.noteStore(pa, len);
+        }
+        return ok;
+    }
+
+    /**
+     * Store-conditional, as QEMU's MTTCG does it: fails without touching storage unless a
+     * reservation of the same length is held for this address; then atomically replaces the
+     * reserved storage with {@code v} if it still holds the value the larx observed (one host
+     * compare-and-swap, atomic with respect to every other CPU). Sets CR0 = 0b00 || success || SO.
      * There is no alignment check: a misaligned address cannot match the (aligned) reservation.
      */
-    private static boolean storeCond(CpuState s, long ea, int len) {
+    private static boolean storeCond(CpuState s, long ea, int len, long v) {
         boolean ok = false;
         if (s.resValid && len == s.resLen) {
             long ra = s.mem.translateData(ea, true);
             if (ra == s.resAddr) {
-                long cur = switch (len) {
-                    case 1 -> s.mem.read8(ea);
-                    case 2 -> s.mem.read16(ea);
-                    case 4 -> s.mem.read32(ea) & 0xffffffffL;
-                    default -> s.mem.read64(ea);
-                };
-                ok = cur == s.resVal;
+                ok = casReal(s, ra, len, s.resVal, v);
             }
         }
         s.resValid = false;
@@ -519,33 +540,27 @@ final class LoadStore {
     }
 
     static void stbcx(CpuState s, int i) {
-        long ea = eaX(s, i);
-        if (storeCond(s, ea, 1)) {
-            s.mem.write8(ea, (int) s.gpr[rt(i)]);
-        }
+        storeCond(s, eaX(s, i), 1, s.gpr[rt(i)] & 0xff);
     }
 
     static void sthcx(CpuState s, int i) {
-        long ea = eaX(s, i);
-        if (storeCond(s, ea, 2)) {
-            s.mem.write16(ea, (int) s.gpr[rt(i)]);
-        }
+        storeCond(s, eaX(s, i), 2, s.gpr[rt(i)] & 0xffff);
     }
 
     static void stwcx(CpuState s, int i) {
-        long ea = eaX(s, i);
-        if (storeCond(s, ea, 4)) {
-            s.mem.write32(ea, (int) s.gpr[rt(i)]);
-        }
+        storeCond(s, eaX(s, i), 4, s.gpr[rt(i)] & 0xffffffffL);
     }
 
     static void stdcx(CpuState s, int i) {
-        long ea = eaX(s, i);
-        if (storeCond(s, ea, 8)) {
-            s.mem.write64(ea, s.gpr[rt(i)]);
-        }
+        storeCond(s, eaX(s, i), 8, s.gpr[rt(i)]);
     }
 
+    /**
+     * stqcx. The host has no 16-byte compare-and-swap. Under the domain's wide-atomic lock (which
+     * lqarx also takes) the second doubleword is compared, then the first is compare-and-swapped
+     * and the second written. Atomic with respect to other lqarx/stqcx; a plain store by another
+     * CPU to the second doubleword between the compare and the write can be lost.
+     */
     static void stqcx(CpuState s, int i) {
         int rsp = rt(i);
         if ((rsp & 1) != 0) {
@@ -555,13 +570,28 @@ final class LoadStore {
         boolean ok = false;
         if (s.resValid && s.resLen == 16) {
             long ra = s.mem.translateData(ea, true);
-            ok = ra == s.resAddr && s.mem.read64(ea) == s.resVal;
+            if (ra == s.resAddr) {
+                Interpreter in = Interpreter.of(s);
+                boolean le = s.littleEndian();
+                long first = le ? s.gpr[rsp + 1] : s.gpr[rsp];
+                long second = le ? s.gpr[rsp] : s.gpr[rsp + 1];
+                PhysicalMemory pm = in.mmu.physical();
+                synchronized (in.domain.wideAtomicLock) {
+                    long cur2 = le ? pm.read64le(ra + 8) : pm.read64be(ra + 8);
+                    if (cur2 == in.resValLo && casReal(s, ra, 8, s.resVal, first)) {
+                        if (le) {
+                            pm.write64le(ra + 8, second);
+                        } else {
+                            pm.write64be(ra + 8, second);
+                        }
+                        in.mmu.noteStore(ra + 8, 8);
+                        ok = true;
+                    }
+                }
+            }
         }
         s.resValid = false;
         s.setCrField(0, (ok ? 2 : 0) | s.so);
-        if (ok) {
-            storeQuad(s, ea, rsp);
-        }
     }
 
     // ---------------------------------------------------------------- multiple / string
@@ -728,6 +758,22 @@ final class LoadStore {
         }
     }
 
+    /** Atomically apply {@code fc} at real address {@code pa}; returns the old value. */
+    private static long amoUpdate(CpuState s, long ea, long pa, boolean word, int fc, long src) {
+        while (true) {
+            long old = ld(s, ea, word);
+            if (casReal(s, pa, word ? 4 : 8, old, amoCompute(fc, old, src) & (word ? 0xffffffffL : -1L))) {
+                return old;
+            }
+        }
+    }
+
+    // The atomic memory operations are atomic with respect to other CPUs: single-location
+    // functions are compare-and-swap loops; the two-location ones (compare-and-swap-not-equal
+    // reads a third register, the bounded/twin forms read the next word) run under the domain's
+    // wide-atomic lock and compare-and-swap the first location, so a plain store by another CPU
+    // to the second location can race them.
+
     private static void loadAtomic(CpuState s, int i, boolean word) {
         int fc = rb(i);
         boolean valid = fc <= 8 || fc == 16 || fc == 24 || fc == 25 || fc == 28;
@@ -742,27 +788,39 @@ final class LoadStore {
         long mask = word ? 0xffffffffL : -1L;
         int rt = rt(i);
         long src = s.gpr[(rt + 1) & 31] & mask;
-        long old = ld(s, ea, word); // QEMU's atomics probe for read first, then write
-        s.mem.translateData(ea, true);
+        ld(s, ea, word); // QEMU's atomics probe for read first, then write
+        long pa = s.mem.translateData(ea, true);
         long result;
         switch (fc) {
             case 16 -> { // compare and swap not equal
-                st(s, ea, word, old != src ? s.gpr[(rt + 2) & 31] : old);
-                result = old;
+                long repl = s.gpr[(rt + 2) & 31] & mask;
+                synchronized (Interpreter.of(s).domain.wideAtomicLock) {
+                    long old;
+                    do {
+                        old = ld(s, ea, word);
+                    } while (!casReal(s, pa, size, old, old != src ? repl : old));
+                    result = old;
+                }
             }
             case 24, 25, 28 -> { // fetch and increment bounded / increment equal / decrement bounded
                 long ea2 = Fields.ea(s, ea + size);
                 s.mem.translateData(ea2, false);
-                long next = ld(s, ea2, word);
-                boolean cond = fc == 25 ? old == next : old != next;
-                long u = old + (fc == 28 ? -1 : 1);
-                st(s, ea, word, cond ? u : old);
-                result = cond ? old : 0xffffffff80000000L;
+                synchronized (Interpreter.of(s).domain.wideAtomicLock) {
+                    long old;
+                    boolean cond;
+                    do {
+                        old = ld(s, ea, word);
+                        long next = ld(s, ea2, word);
+                        cond = fc == 25 ? old == next : old != next;
+                        long u = (old + (fc == 28 ? -1 : 1)) & mask;
+                        if (casReal(s, pa, size, old, cond ? u : old)) {
+                            break;
+                        }
+                    } while (true);
+                    result = cond ? old : 0xffffffff80000000L;
+                }
             }
-            default -> {
-                st(s, ea, word, amoCompute(fc, old, src));
-                result = old;
-            }
+            default -> result = amoUpdate(s, ea, pa, word, fc, src);
         }
         s.gpr[rt] = result;
     }
@@ -779,19 +837,21 @@ final class LoadStore {
         }
         long mask = word ? 0xffffffffL : -1L;
         long src = s.gpr[rt(i)] & mask;
-        long old = ld(s, ea, word); // QEMU's atomics probe for read first, then write
-        s.mem.translateData(ea, true);
+        ld(s, ea, word); // QEMU's atomics probe for read first, then write
+        long pa = s.mem.translateData(ea, true);
         if (fc == 24) { // store twin
             long ea2 = Fields.ea(s, ea + size);
             s.mem.translateData(ea2, true);
-            long next = ld(s, ea2, word);
-            if (old == next) {
-                st(s, ea, word, src);
-                st(s, ea2, word, src);
+            synchronized (Interpreter.of(s).domain.wideAtomicLock) {
+                long old = ld(s, ea, word);
+                long next = ld(s, ea2, word);
+                if (old == next && casReal(s, pa, size, old, src)) {
+                    st(s, ea2, word, src);
+                }
             }
             return;
         }
-        st(s, ea, word, amoCompute(fc, old, src));
+        amoUpdate(s, ea, pa, word, fc, src);
     }
 
     static void lwat(CpuState s, int i) {

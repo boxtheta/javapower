@@ -4,6 +4,8 @@ import static org.boxtheta.javapower.cpu.Fields.raOr0;
 import static org.boxtheta.javapower.cpu.Fields.rb;
 import static org.boxtheta.javapower.cpu.Fields.rt;
 
+import java.lang.invoke.VarHandle;
+
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PpcException;
@@ -54,7 +56,7 @@ final class SystemInsns {
 
         // Storage control. dcbf/dcbst/icbi are translated like loads (QEMU), so they can fault.
         t.addX(31, 598, "sync", SystemInsns::sync);
-        t.addX(31, 854, "eieio", SystemInsns::nop);
+        t.addX(31, 854, "eieio", SystemInsns::eieio);
         Fields.addX(t, 31, 1014, 0x03C00001, "dcbz", SystemInsns::dcbz);
         Fields.addX(t, 31, 278, 0x00000001, "dcbt", SystemInsns::nop);
         Fields.addX(t, 31, 246, 0x00000001, "dcbtst", SystemInsns::nop);
@@ -116,16 +118,44 @@ final class SystemInsns {
 
     static void nop(CpuState s, int i) {}
 
-    /** isync is context synchronising: a pending TLB invalidation takes effect. */
+    // Memory barriers. Guest memory is plain host memory shared by the CPU threads, so the guest's
+    // barriers become host fences: sync is a full fence (it must order earlier stores before later
+    // loads, which x86 and Arm hosts otherwise reorder), lwsync orders everything but that, eieio
+    // orders stores, and isync orders later loads after earlier ones (the "branch; isync" acquire
+    // idiom). Store-conditional is a host compare-and-swap, itself a full fence.
+
+    /**
+     * isync is context synchronising: a pending TLB invalidation takes effect. Code another CPU
+     * modified is seen from the next instruction on (compiled blocks end at isync).
+     */
     static void isync(CpuState s, int i) {
         Interpreter.of(s).mmu.syncFlush();
+        VarHandle.acquireFence();
     }
 
-    /** sync; ptesync (L=2) in supervisor state completes pending TLB invalidations (QEMU). */
+    /**
+     * sync (L=0), lwsync (L=1), ptesync (L=2). ptesync in supervisor state completes pending TLB
+     * invalidations (QEMU), on every CPU if a tlbie is pending.
+     */
     static void sync(CpuState s, int i) {
-        if (((i >>> 21) & 3) == 2 && (s.msr & Msr.PR) == 0) {
-            Interpreter.of(s).mmu.syncFlush();
+        int l = (i >>> 21) & 3;
+        if (l == 1) {
+            VarHandle.acquireFence();
+            VarHandle.releaseFence();
+            return;
         }
+        if (l == 2 && (s.msr & Msr.PR) == 0) {
+            Interpreter in = Interpreter.of(s);
+            in.mmu.syncFlush();
+            if (in.globalFlushPending) {
+                in.completeGlobalFlush();
+            }
+        }
+        VarHandle.fullFence();
+    }
+
+    static void eieio(CpuState s, int i) {
+        VarHandle.storeStoreFence();
     }
 
     static void privileged(CpuState s, int i) {
@@ -281,6 +311,13 @@ final class SystemInsns {
         tlbInvalidate(s, i, false);
     }
 
+    /** Broadcast part of tlbie: every CPU of the domain flushes at the next ptesync or tlbsync. */
+    private static void flushTlbGlobal(CpuState s) {
+        Interpreter in = Interpreter.of(s);
+        in.mmu.requestFlush();
+        in.globalFlushPending = true;
+    }
+
     static void tlbiel(CpuState s, int i) {
         tlbInvalidate(s, i, true);
     }
@@ -320,13 +357,26 @@ final class SystemInsns {
                 }
             }
         }
-        flushTlb(s);
+        if (local) {
+            flushTlb(s);
+        } else {
+            flushTlbGlobal(s);
+        }
     }
 
+    /**
+     * tlbsync. QEMU treats it as a no-op on server processors and completes broadcast
+     * invalidations at ptesync; completing them here as well (both kernels issue
+     * {@code eieio; tlbsync; ptesync}) costs nothing and does not depend on the ptesync.
+     */
     static void tlbsync(CpuState s, int i) {
         checkSupervisor(s);
         if ((s.spr[Spr.LPCR] & Spr.LPCR_GTSE) == 0) {
             throw PpcException.privileged();
+        }
+        Interpreter in = Interpreter.of(s);
+        if (in.globalFlushPending) {
+            in.completeGlobalFlush();
         }
     }
 

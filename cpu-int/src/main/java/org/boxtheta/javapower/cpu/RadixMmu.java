@@ -30,6 +30,11 @@ import org.boxtheta.javapower.core.Spr;
  * context-synchronising event ({@link #requestFlush}, {@link #syncFlush}). Flushes are O(1):
  * a per-context epoch is folded into every tag.
  *
+ * <p>An MMU belongs to one CPU and is used only on that CPU's thread; other CPUs' invalidations
+ * reach it through the {@link CpuDomain} protocol, never by touching its arrays. Page table
+ * entries are read with single 8-byte loads and never written, so walks need no locking
+ * (reference and change bits are the guest's to set, with its own atomic updates).
+ *
  * <p>Accesses outside guest RAM raise a machine check with QEMU's POWER9 SRR1/DSISR codes.
  */
 public final class RadixMmu implements GuestMemory {
@@ -454,6 +459,11 @@ public final class RadixMmu implements GuestMemory {
         } else {
             pm.write64be(pa, v);
         }
+    }
+
+    /** A store made directly to physical memory (store-conditional, atomics): see {@link #guardHi}. */
+    void noteStore(long pa, int size) {
+        guard(pa, size);
     }
 
     /** Note a store of {@code size} bytes at real address {@code pa} against the store guard. */

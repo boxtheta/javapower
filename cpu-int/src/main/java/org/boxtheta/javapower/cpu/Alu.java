@@ -1017,18 +1017,13 @@ final class Alu {
 
     // ---------------------------------------------------------------- darn
 
-    private static final java.util.SplittableRandom DARN_SEED = new java.util.SplittableRandom();
-
     static void darn(CpuState s, int i) {
         int l = (i >>> 16) & 3;
         long r;
         if (l == 3) {
             r = -1L;
         } else {
-            long v;
-            synchronized (DARN_SEED) {
-                v = DARN_SEED.nextLong();
-            }
+            long v = Interpreter.of(s).random.nextLong(); // per CPU, seeded by its CpuDomain
             r = l == 0 ? (v & 0xffffffffL) : v;
             if (r == -1L) {
                 r = 0; // -1 is the "error" value; never return it for a successful read.

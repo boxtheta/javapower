@@ -55,6 +55,17 @@ import org.boxtheta.javapower.core.Spr;
  * <p>Asynchronous interrupts (external, decrementer) are checked between chunks of at most
  * {@value #CHUNK} instructions and whenever an instruction changes state that affects them
  * (MSR, DEC, hcalls).
+ *
+ * <h2>Several CPUs</h2>
+ * A multi-CPU machine has one interpreter per CPU, all built on one {@link CpuDomain} (shared
+ * memory, timebase and TLB invalidation), each run by its own host thread. Everything an
+ * interpreter caches (decode caches, compiled blocks, TLB) is private to it and touched only by
+ * its thread. Guest memory is shared without locks: loads and stores are plain host accesses,
+ * the guest's barriers are host fences, and store-conditional and the atomic memory operations
+ * are host compare-and-swaps (see {@link LoadStore}). Another CPU's stores to code are seen at
+ * once by the interpreter (it compares the fetched word) and by compiled blocks at their next
+ * entry, which is at the latest the next context-synchronising instruction or interrupt: blocks
+ * never span one.
  */
 public final class Interpreter {
     /** Timebase frequency (Hz), as in the reference device tree. */
@@ -131,7 +142,22 @@ public final class Interpreter {
     private final MemorySegment seg;
     private final DecodeTable table;
     private final Clock clock;
-    private final long wallBase = System.nanoTime();
+    /** The CPUs this one shares time, TLB invalidation and wide atomics with. */
+    final CpuDomain domain;
+
+    // Cross-CPU state (see CpuDomain). outside: not executing guest instructions (idle, parked,
+    // in a hypercall or not in run()); written by the owner, read by CPUs completing a tlbie.
+    volatile boolean outside = true;
+    /** Last global TLB flush generation this CPU has applied. */
+    volatile long tlbAck;
+    /** A tlbie was executed; the next ptesync or tlbsync completes it on every CPU. */
+    boolean globalFlushPending;
+    /** Between Hypervisor.cpuExecEnter and cpuExecExit. */
+    private boolean executing;
+    /** Source of {@code darn}; owned by this CPU's thread. */
+    final java.util.SplittableRandom random;
+    /** lqarx: the second doubleword it observed (the first is CpuState.resVal). */
+    long resValLo;
 
     // Decode caches. An entry is (instruction word << 32) | dispatch slot; a slot below
     // FIRST_DYNAMIC is a K_* inline handler, any slot indexes ops[]. Entries are only ever compared
@@ -187,16 +213,27 @@ public final class Interpreter {
     private long fetchPage;
     private long fetchBase;
 
-    /** Deterministic clock. */
+    /** Deterministic clock, single CPU. */
     public Interpreter(CpuState s, PhysicalMemory mem, DecodeTable table) {
         this(s, mem, table, Clock.DETERMINISTIC);
     }
 
+    /** A single CPU with its own {@link CpuDomain}. */
     public Interpreter(CpuState s, PhysicalMemory mem, DecodeTable table, Clock clock) {
+        this(s, new CpuDomain(mem, clock), table);
+    }
+
+    /**
+     * A CPU of a multi-CPU machine: every interpreter of {@code domain} shares its memory and
+     * timebase. Each must run on its own thread. {@code table} may be shared; it must be complete.
+     */
+    public Interpreter(CpuState s, CpuDomain domain, DecodeTable table) {
+        PhysicalMemory mem = domain.memory();
         this.s = s;
         this.seg = mem.segment();
         this.table = table;
-        this.clock = clock;
+        this.domain = domain;
+        this.clock = domain.clock();
         this.mmu = new RadixMmu(s, mem);
         mmu.owner = this;
         s.mem = mmu;
@@ -208,6 +245,8 @@ public final class Interpreter {
             s.spr[Spr.PVR] = Spr.PVR_POWER9;
         }
         storeDec(0xffffffffL);
+        int ordinal = domain.register(this);
+        this.random = new java.util.SplittableRandom(domain.seedFor(ordinal));
     }
 
     public RadixMmu mmu() {
@@ -216,6 +255,14 @@ public final class Interpreter {
 
     public Clock clock() {
         return clock;
+    }
+
+    public CpuDomain domain() {
+        return domain;
+    }
+
+    public CpuState state() {
+        return s;
     }
 
     /** The interpreter driving {@code s}, reached through the installed MMU. */
@@ -247,6 +294,7 @@ public final class Interpreter {
         s.resValid = false;
         s.ceded = false;
         waiting = false;
+        globalFlushPending = false;
         tbOffset = 0;
         storeDec(0xffffffffL);
         mmu.flushAll();
@@ -257,7 +305,7 @@ public final class Interpreter {
 
     /** Current virtual time in nanoseconds. */
     long nowNs() {
-        return clock == Clock.DETERMINISTIC ? s.icount << icountShift : System.nanoTime() - wallBase;
+        return clock == Clock.DETERMINISTIC ? s.icount << icountShift : domain.wallNs();
     }
 
     static long nsToTb(long ns) {
@@ -360,7 +408,16 @@ public final class Interpreter {
     /**
      * Run at most {@code maxInsns} instructions (or until {@code s.stopRequested}). Instructions
      * that raise a synchronous interrupt count as executed; idle time does not. Returns the
-     * number executed.
+     * number executed. {@code s.stopRequested} is left set for the caller to clear.
+     *
+     * <p>The loop honours the platform's contract (see {@link CpuState}): it parks while
+     * {@code halted} is set, runs work posted with {@link CpuState#runOnCpu} between chunks and
+     * while idle or parked, idles after H_CEDE or {@code wait} until an interrupt is pending or
+     * the CPU is prodded, and tells the hypervisor when it stops and resumes executing
+     * ({@link org.boxtheta.javapower.core.Hypervisor#cpuExecExit}, {@code cpuExecEnter}).
+     * Changes other threads make ({@code extIrq}, {@code stopRequested}, {@code halted}, posted
+     * work, TLB flushes) are seen at the next chunk boundary, at most {@value #CHUNK}
+     * instructions later, or at once when the CPU is idle or parked.
      */
     public long run(long maxInsns) {
         Thread prev = s.runner;
@@ -368,11 +425,25 @@ public final class Interpreter {
         long done = 0;
         try {
             while (done < maxInsns && !s.stopRequested) {
+                if (s.halted) {
+                    parkHalted();
+                    continue;
+                }
+                if (s.workPending) {
+                    runPostedWork();
+                    continue;
+                }
                 if (s.ceded || waiting) {
                     if (!idle()) {
                         break;
                     }
                     continue;
+                }
+                if (!executing) {
+                    enterGuest();
+                }
+                if (domain.tlbGeneration.get() != tlbAck) {
+                    applyTlbGeneration();
                 }
                 checkAsync();
                 if (s.stopRequested) {
@@ -382,9 +453,89 @@ public final class Interpreter {
                 done += chunk(budget);
             }
         } finally {
+            leaveGuest();
             s.runner = prev;
         }
         return done;
+    }
+
+    /** About to execute guest instructions (again): see the TLB protocol in {@link CpuDomain}. */
+    private void enterGuest() {
+        executing = true;
+        outside = false; // volatile: ordered before the caller's read of the TLB generation
+        var h = s.hv;
+        if (h != null) {
+            h.cpuExecEnter(s);
+        }
+    }
+
+    /** Stop executing guest instructions (idle, park, return from run). Idempotent. */
+    private void leaveGuest() {
+        if (!executing) {
+            return;
+        }
+        executing = false;
+        outside = true;
+        var h = s.hv;
+        if (h != null) {
+            h.cpuExecExit(s);
+        }
+    }
+
+    /** Flush the software TLB if another CPU completed a global flush since the last one seen. */
+    void applyTlbGeneration() {
+        long g = domain.tlbGeneration.get();
+        if (g != tlbAck) {
+            mmu.flushAll();
+            recheck = true;
+            tlbAck = g;
+        }
+    }
+
+    /** ptesync / tlbsync after a tlbie: invalidate every CPU's TLB before continuing. */
+    void completeGlobalFlush() {
+        globalFlushPending = false;
+        domain.shootdown(this);
+    }
+
+    /**
+     * Run work posted with {@link CpuState#runOnCpu}, then drop everything cached from the state
+     * it may have changed (MSR, LPCR, PIDR, process table, pc): the TLB and the next chunk's
+     * fetch state.
+     */
+    private void runPostedWork() {
+        s.runPostedWork();
+        mmu.flushAll();
+        lastProcTable = s.procTable;
+        recheck = true;
+    }
+
+    /**
+     * RTAS-stopped: execute nothing and take no interrupts until another thread clears
+     * {@code halted} (start-cpu) or asks the loop to stop. Posted work still runs, in order.
+     */
+    private void parkHalted() {
+        leaveGuest();
+        while (s.halted && !s.stopRequested) {
+            if (s.workPending) {
+                runPostedWork();
+            } else {
+                LockSupport.parkNanos(this, MAX_PARK_NS);
+            }
+        }
+        waiting = false;
+    }
+
+    /**
+     * Deliver a system reset interrupt at 0x100 (H_SIGNAL_SYS_RESET, the watchdog's dump-restart
+     * action). Call on this CPU's own thread, e.g. from work posted with
+     * {@link CpuState#runOnCpu}. Ends an H_CEDE or {@code wait} idle; like QEMU for a ceded
+     * pseries vCPU, SRR1 carries no wake-up reason.
+     */
+    public void systemReset() {
+        s.ceded = false;
+        waiting = false;
+        deliver(0x100, s.pc, 0);
     }
 
     /** Deliver a pending asynchronous interrupt if MSR[EE] allows (QEMU POWER9 priority order). */
@@ -553,7 +704,7 @@ public final class Interpreter {
                     case K_ISYNC -> SystemInsns.isync(s, insn);
                     case K_DCBT -> SystemInsns.nop(s, insn);
                     case K_DCBTST -> SystemInsns.nop(s, insn);
-                    case K_EIEIO -> SystemInsns.nop(s, insn);
+                    case K_EIEIO -> SystemInsns.eieio(s, insn);
                     case K_LDARX -> LoadStore.ldarx(s, insn);
                     case K_STDCX_DOT -> LoadStore.stdcx(s, insn);
                     case K_LWARX -> LoadStore.lwarx(s, insn);
@@ -1088,7 +1239,7 @@ public final class Interpreter {
         "Alu.adde", "Alu.addc", "Alu.addme", "Alu.subfme", "BranchInsns.crand", "BranchInsns.crandc",
         "BranchInsns.crnor", "BranchInsns.crnand", "BranchInsns.creqv", "BranchInsns.crorc",
         "BranchInsns.mcrf", "SystemInsns.mfmsr", "SystemInsns.mtmsrd", "SystemInsns.isync",
-        "SystemInsns.nop", "SystemInsns.nop", "SystemInsns.nop", "LoadStore.ldarx",
+        "SystemInsns.nop", "SystemInsns.nop", "SystemInsns.eieio", "LoadStore.ldarx",
         "LoadStore.stdcx", "LoadStore.lwarx", "LoadStore.stwcx", "LoadStore.lwbrx",
         "LoadStore.stwbrx", "LoadStore.ldbrx", "LoadStore.stdbrx", "LoadStore.lhbrx",
         "LoadStore.sthbrx", "LoadStore.ldux", "LoadStore.lwzux", "LoadStore.lbzux",
@@ -1216,11 +1367,15 @@ public final class Interpreter {
      * return because a stop was requested.
      */
     private boolean idle() {
+        leaveGuest();
         while (true) {
             if (s.stopRequested) {
                 return false;
             }
-            if (wakeupPending()) {
+            if (s.halted || s.workPending) {
+                return true; // the run loop parks or runs the work, then idles again if still ceded
+            }
+            if (s.prodded || wakeupPending()) {
                 s.ceded = false;
                 waiting = false;
                 return true;
@@ -1234,7 +1389,7 @@ public final class Interpreter {
                 }
                 LockSupport.parkNanos(this, MAX_PARK_NS);
             } else {
-                long wait = decWakes ? Math.min(nsUntilDec(), MAX_PARK_NS) : MAX_PARK_NS;
+                long wait = decWakes ? Math.min(domain.hostNs(nsUntilDec()), MAX_PARK_NS) : MAX_PARK_NS;
                 if (wait > 0) {
                     LockSupport.parkNanos(this, wait);
                 }
@@ -1386,7 +1541,14 @@ public final class Interpreter {
             s.gpr[3] = H_PRIVILEGE;
             return;
         }
-        s.hv.hcall(s);
+        // Inside the hypervisor this CPU uses no translations: CPUs completing a tlbie need not
+        // wait for it (the run loop checks for flushes before the next instruction).
+        outside = true;
+        try {
+            s.hv.hcall(s);
+        } finally {
+            outside = !executing;
+        }
         recheck = true;
     }
 }

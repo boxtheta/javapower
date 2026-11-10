@@ -8,6 +8,24 @@ import org.junit.jupiter.api.Test;
 
 class CoreTest {
     @Test
+    void postedWorkRunsInOrderOnDemand() throws Exception {
+        CpuState s = new CpuState();
+        java.util.List<Integer> seen = new java.util.ArrayList<>();
+        assertEquals(false, s.workPending);
+        s.runOnCpu(c -> seen.add(1));
+        Thread t = new Thread(() -> s.runOnCpu(c -> seen.add(2)));
+        t.start();
+        t.join();
+        assertEquals(true, s.workPending);
+        assertEquals(java.util.List.of(), seen);
+        s.runPostedWork();
+        assertEquals(java.util.List.of(1, 2), seen);
+        assertEquals(false, s.workPending);
+        s.runPostedWork();
+        assertEquals(java.util.List.of(1, 2), seen);
+    }
+
+    @Test
     void xerRoundTrips() {
         CpuState s = new CpuState();
         s.setXer(0xffffffffffffffffL);

@@ -1,5 +1,6 @@
 package org.boxtheta.javapower.papr;
 
+import java.util.BitSet;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -16,9 +17,11 @@ import java.util.TreeMap;
  * already pending interrupt, otherwise it is rejected and resent later. MSI (edge) sources are
  * remembered as "rejected"/"masked pending"; LSI (level) sources are resent while asserted.
  *
- * <p>All methods are synchronized: device input (e.g. the console reader thread) can raise
- * interrupts concurrently with hcalls on the CPU thread. The presenter's output drives
- * {@link org.boxtheta.javapower.core.CpuState#setExternalIrq} (level-triggered).
+ * <p>All methods are synchronized on this object, a leaf lock: hcalls from every CPU thread
+ * (each CPU's own ICP, plus H_IPI/H_IPOLL and ibm,set-xive aimed at any server) and device input
+ * threads raising interrupts all serialise here, and every operation is short. While holding it
+ * the controller only calls its servers' output lines, which drive
+ * {@link org.boxtheta.javapower.core.CpuState#setExternalIrq} (level-triggered, lock-free).
  */
 public final class Xics {
     public static final int IRQ_BASE = 0x1000;
@@ -89,6 +92,11 @@ public final class Xics {
     private final int[] status = new int[NR_IRQS];
     private final int[] flags = new int[NR_IRQS];
     private final Map<Integer, Icp> icps = new TreeMap<>();
+    /**
+     * Sources a resend could present: rejected MSIs and asserted, unsent LSIs. Kept in step with
+     * {@link #status} so a resend visits only these instead of all {@link #NR_IRQS} sources.
+     */
+    private final BitSet resendable = new BitSet(NR_IRQS);
 
     public Xics() {
         reset();
@@ -113,6 +121,7 @@ public final class Xics {
             savedPriority[i] = 0xff;
             status[i] = 0;
         }
+        resendable.clear();
         for (Icp icp : icps.values()) {
             icp.xirr = 0;
             icp.pendingPriority = 0xff;
@@ -146,14 +155,14 @@ public final class Xics {
         int src = irq - IRQ_BASE;
         if ((flags[src] & FL_LSI) != 0) {
             if (level) {
-                status[src] |= ST_ASSERTED;
+                setStatus(src, status[src] | ST_ASSERTED);
             } else {
-                status[src] &= ~ST_ASSERTED;
+                setStatus(src, status[src] & ~ST_ASSERTED);
             }
             resendLsi(src);
         } else if (level) {
             if (priority[src] == 0xff) {
-                status[src] |= ST_MASKED_PENDING;
+                setStatus(src, status[src] | ST_MASKED_PENDING);
             } else {
                 icpIrq(server[src], irq, priority[src]);
             }
@@ -168,22 +177,30 @@ public final class Xics {
 
     private void resendLsi(int src) {
         if (priority[src] != 0xff && (status[src] & ST_ASSERTED) != 0 && (status[src] & ST_SENT) == 0) {
-            status[src] |= ST_SENT;
+            setStatus(src, status[src] | ST_SENT);
             icpIrq(server[src], src + IRQ_BASE, priority[src]);
         }
     }
 
     private void resendMsi(int src) {
         if ((status[src] & ST_REJECTED) != 0) {
-            status[src] &= ~ST_REJECTED;
+            setStatus(src, status[src] & ~ST_REJECTED);
             if (priority[src] != 0xff) {
                 icpIrq(server[src], src + IRQ_BASE, priority[src]);
             }
         }
     }
 
+    private void setStatus(int src, int v) {
+        status[src] = v;
+        boolean lsi = (flags[src] & FL_LSI) != 0;
+        boolean candidate = lsi ? (v & (ST_ASSERTED | ST_SENT)) == ST_ASSERTED : (v & ST_REJECTED) != 0;
+        resendable.set(src, candidate);
+    }
+
+    /** Resend every source that may need it, in source order (QEMU's ics_resend). */
     private void icsResend() {
-        for (int i = 0; i < NR_IRQS; i++) {
+        for (int i = resendable.nextSetBit(0); i >= 0; i = resendable.nextSetBit(i + 1)) {
             if ((flags[i] & FL_LSI) != 0) {
                 resendLsi(i);
             } else {
@@ -198,16 +215,16 @@ public final class Xics {
         }
         int src = irq - IRQ_BASE;
         if ((flags[src] & FL_MSI) != 0) {
-            status[src] |= ST_REJECTED;
+            setStatus(src, status[src] | ST_REJECTED);
         } else if ((flags[src] & FL_LSI) != 0) {
-            status[src] &= ~ST_SENT;
+            setStatus(src, status[src] & ~ST_SENT);
         }
     }
 
     private void icsEoi(int irq) {
         int src = irq - IRQ_BASE;
         if ((flags[src] & FL_LSI) != 0) {
-            status[src] &= ~ST_SENT;
+            setStatus(src, status[src] & ~ST_SENT);
         }
     }
 
@@ -219,7 +236,7 @@ public final class Xics {
         if ((flags[src] & FL_LSI) != 0) {
             resendLsi(src);
         } else if ((status[src] & ST_MASKED_PENDING) != 0 && prio != 0xff) {
-            status[src] &= ~ST_MASKED_PENDING;
+            setStatus(src, status[src] & ~ST_MASKED_PENDING);
             icpIrq(srv, src + IRQ_BASE, prio);
         }
     }

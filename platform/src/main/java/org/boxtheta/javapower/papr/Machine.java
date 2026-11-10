@@ -18,26 +18,56 @@ import org.boxtheta.javapower.core.Spr;
 /**
  * The PAPR {@code pseries} machine: guest RAM, the SLOF firmware image, the device tree, XICS,
  * the VIO devices (nvram, vty, v-scsi) and the hypervisor itself. Mirrors QEMU's
- * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp 1 -nodefaults} closely enough for the
+ * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp N -nodefaults} closely enough for the
  * stock SLOF binary.
  *
  * <p>Typical use from {@code app}:
  * <pre>{@code
- * MachineConfig cfg = new MachineConfig().ram(2L << 30).console(new StdioCharBackend());
+ * MachineConfig cfg = new MachineConfig().ram(2L << 30).cpus(4).console(new StdioCharBackend());
  * cfg.addDisk(Path.of("disk.raw")).blockSize(4096);
  * Machine m = new Machine(cfg);
- * CpuState cpu = new CpuState();
- * // ... create the interpreter on m.memory(), then:
- * m.attachCpu(cpu);
- * m.reset(cpu);
- * // run the CPU; when it returns with cpu.stopRequested, look at m.shutdownReason():
- * // REBOOT -> m.reset(cpu) and run again; anything else -> m.close().
+ * List<CpuState> cpus = ...;      // m.cpuCount() CpuStates, each with an interpreter on m.memory()
+ * m.attachCpus(cpus);             // sets cpus.get(i).index = i
+ * m.reset();                      // CPU 0 at the SLOF entry point, the others RTAS-stopped (halted)
+ * // run each CPU on its own thread; a CPU whose halted flag is set must park until it is
+ * // cleared (start-cpu). When a CPU returns with stopRequested, look at m.shutdownReason():
+ * // REBOOT -> stop and join every CPU thread, m.reset(), run again; anything else -> m.close().
  * }</pre>
+ * A single-CPU machine can still use {@code attachCpu(cpu)} and {@code reset(cpu)}.
  *
- * <p>Threading: {@link #hcall} runs on the CPU thread. Console input arrives on backend threads
- * and is handed to the vty under the machine lock, which also serialises hcalls, {@link #pump}
- * and {@link #requestPowerdown}. Interrupt delivery to the CPU goes through
- * {@link CpuState#setExternalIrq}, which is safe from any thread.
+ * <h2>Threading and locking</h2>
+ * Every CPU runs on its own host thread and calls {@link #hcall} on that thread; console input
+ * arrives on backend threads and {@link #pump} runs on whatever thread the application chooses.
+ * The locks, always taken in this order (a thread holding one never waits for an earlier one):
+ * <ol>
+ * <li>The <b>machine lock</b> ({@code lock}): partition-wide state. RTAS calls, CAS,
+ *     KVMPPC_H_UPDATE_DT, H_REGISTER_VPA, H_SET_MODE (LE/AIL), H_REGISTER_PROC_TBL,
+ *     H_SIGNAL_SYS_RESET, H_HOME_NODE_ASSOCIATIVITY, H_WATCHDOG, HPT resize, {@link #reset},
+ *     {@link #attachCpu}, {@link #pump}, {@link #close}. CPU start/stop (start-cpu, stop-self)
+ *     happens under it, so a CPU's {@link CpuState#halted} flag only changes with it held.</li>
+ * <li>A <b>device lock</b> per VIO device: CRQ registration and traffic (H_REG_CRQ,
+ *     H_FREE_CRQ, H_SEND_CRQ including the whole SCSI command), H_VIO_SIGNAL, device reset. The
+ *     vty has separate input and output locks instead, so console output never waits for input.</li>
+ * <li>Leaf locks: the {@link Xics} monitor (all ICS and ICP state; H_CPPR, H_IPI, H_XIRR,
+ *     H_XIRR_X, H_EOI, H_IPOLL and every interrupt source change) and each {@link TceTable}.
+ *     Holders of a leaf lock only call {@link CpuState#setExternalIrq}, which takes no lock.</li>
+ * </ol>
+ * The frequent calls therefore never take the machine lock: H_CEDE, H_CONFER, H_PROD and H_JOIN
+ * touch only {@code CpuState} volatiles and this CPU's own fields; the XICS calls hold the short
+ * XICS lock; H_PUT_TERM_CHAR/H_GET_TERM_CHAR hold only the vty locks; TCE calls lock one table;
+ * H_LOGICAL_* and H_PAGE_INIT touch only guest memory.
+ *
+ * <p>Other CPUs' state: a CPU's plain fields are written only by its own thread, with one
+ * exception: start-cpu (holding the machine lock) writes the entry state into the stopped target,
+ * posts the same state with {@link CpuState#runOnCpu} (see {@code startCpu} for why), then
+ * clears {@code halted}, whose volatile write publishes it. Partition-wide updates (LPCR from
+ * H_SET_MODE and H_REGISTER_PROC_TBL, {@code procTable}, PCR from CAS) apply at once to the
+ * calling CPU and reach every other CPU, stopped or running, through {@link CpuState#runOnCpu},
+ * which its run loop executes on its own thread (QEMU's {@code run_on_cpu}); system resets aimed
+ * at other CPUs (H_SIGNAL_SYS_RESET, watchdog) travel the same way. The volatiles other threads
+ * write directly are {@code extIrq} (XICS), {@code prodded} (H_PROD), {@code stopRequested}
+ * (shutdown) and {@code halted} (start-cpu). {@link #reset} and {@link #attachCpus} must only be
+ * called while no CPU thread is running.
  */
 public final class Machine implements Hypervisor, AutoCloseable {
     /** Where SLOF starts (QEMU's SPAPR_ENTRY_POINT). */
@@ -64,6 +94,20 @@ public final class Machine implements Hypervisor, AutoCloseable {
     static final int SPR_DAWR0 = Spr.DAWR0;
     static final int SPR_DAWRX0 = Spr.DAWRX0;
     static final int SPR_CIABR = Spr.CIABR;
+    static final int SPR_PCR = 338;
+
+    /** LPCR at the SLOF entry point: LD | PECE (PDEE HDEE EEE DEE OEE) | LPES0. */
+    static final long LPCR_BOOT = 0x3f008L;
+    /** POWER9 power-saving exit enables (QEMU's lpcr_pm): PDEE HDEE EEE DEE OEE, ISA bits 47..51. */
+    static final long LPCR_PM = 0x1f000L;
+    /** PSSCR[EC], ISA bit 43. */
+    static final long PSSCR_EC = 1L << 20;
+    /** PCR compatibility-level bits (ISA bits 60..62) a POWER9 implements. */
+    static final long PCR_COMPAT_2_07 = 1L << 3;
+    static final long PCR_COMPAT_2_06 = 1L << 2;
+    static final long PCR_COMPAT_2_05 = 1L << 1;
+    /** Offset of the dispatch (yield) counter in a VPA. */
+    static final int VPA_DISPATCH_COUNTER = 0x100;
 
     /** Why the machine asked the CPU to stop. */
     public enum ShutdownReason {
@@ -95,12 +139,13 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final List<Drc> drcs = new ArrayList<>();
     private final Rtas rtas;
 
-    private CpuState cpu;
+    /** Per-vCPU hypervisor state, indexed by CPU number. */
+    private final VCpu[] vcpus;
     private volatile ShutdownReason shutdown = ShutdownReason.NONE;
     private volatile String shutdownMessage;
-    private Consumer<CpuState> systemResetHandler;
+    private volatile Consumer<CpuState> systemResetHandler;
 
-    // Machine state reset at every machine reset.
+    // Machine state reset at every machine reset. Guarded by the machine lock.
     private OptionVector ov5 = new OptionVector();
     private OptionVector ov5Cas = new OptionVector();
     private int compatPvr;
@@ -110,14 +155,32 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private byte[] rngSeed = new byte[32];
     private byte[] fdtBlob;
     private int fdtInitialSize;
-    private long fdtAddr;
-    private boolean prod;
-    private long vpaAddr;
-    private long slbShadowAddr;
-    private int slbShadowSize;
-    private long dtlAddr;
-    private int dtlSize;
+    private volatile long fdtAddr;
     private final Watchdog[] watchdogs = {new Watchdog(), new Watchdog(), new Watchdog(), new Watchdog()};
+
+    /**
+     * What the hypervisor keeps per vCPU (QEMU's SpaprCpuState). The registrations are written
+     * under the machine lock by any CPU (H_REGISTER_VPA names its target) and read without it by
+     * the target's own thread (dispatch counter updates) and by H_CONFER, hence volatile.
+     */
+    private static final class VCpu {
+        final int id;
+        volatile CpuState cpu;
+        volatile long vpaAddr;
+        volatile long slbShadowAddr;
+        volatile int slbShadowSize;
+        volatile long dtlAddr;
+        volatile int dtlSize;
+
+        VCpu(int id) {
+            this.id = id;
+        }
+
+        void clearRegistrations() {
+            vpaAddr = slbShadowAddr = dtlAddr = 0;
+            slbShadowSize = dtlSize = 0;
+        }
+    }
 
     /** One of the four PAPR watchdogs (H_WATCHDOG), timed on the host monotonic clock. */
     private static final class Watchdog {
@@ -142,6 +205,19 @@ public final class Machine implements Hypervisor, AutoCloseable {
             throw new IOException("firmware image larger than " + FW_MAX_SIZE + " bytes");
         }
         this.firmware = fw;
+
+        // One presentation controller per CPU; its output drives whichever CpuState is attached.
+        vcpus = new VCpu[config.cpus];
+        for (int i = 0; i < vcpus.length; i++) {
+            VCpu v = new VCpu(i);
+            vcpus[i] = v;
+            xics.addServer(i, level -> {
+                CpuState c = v.cpu;
+                if (c != null) {
+                    c.setExternalIrq(level);
+                }
+            });
+        }
 
         // Static machine option vector 5 (spapr_machine_init).
         ov5.set(OptionVector.OV5_DRCONF_MEMORY).set(OptionVector.OV5_FORM1_AFFINITY)
@@ -206,8 +282,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
             n++;
         }
 
-        // DR connectors: one CPU core, 31 PHB slots, and the 256 PCI slots of PHB 0.
-        drcs.add(new Drc(Drc.Kind.CPU, 0, () -> DeviceTree.cpuNode(this)));
+        // DR connectors: one per CPU core, 31 PHB slots, and the 256 PCI slots of PHB 0.
+        for (int i = 0; i < config.cpus; i++) {
+            int id = i;
+            drcs.add(new Drc(Drc.Kind.CPU, id, () -> DeviceTree.cpuNode(this, id)));
+        }
         for (int i = 0; i < DeviceTree.MAX_PHBS; i++) {
             drcs.add(new Drc(Drc.Kind.PHB, i, i == 0 && config.phb ? () -> DeviceTree.phbNode(this) : null));
         }
@@ -301,12 +380,48 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return random;
     }
 
-    Object lock() {
-        return lock;
+    /** Number of guest CPUs ({@link MachineConfig#cpus}). */
+    public int cpuCount() {
+        return vcpus.length;
     }
 
-    CpuState cpu() {
-        return cpu;
+    /** The CpuState attached as CPU {@code id}, or null. */
+    public CpuState cpu(int id) {
+        return id >= 0 && id < vcpus.length ? vcpus[id].cpu : null;
+    }
+
+    /** The attached CPUs in CPU-number order. */
+    public List<CpuState> cpus() {
+        List<CpuState> r = new ArrayList<>();
+        for (VCpu v : vcpus) {
+            if (v.cpu != null) {
+                r.add(v.cpu);
+            }
+        }
+        return Collections.unmodifiableList(r);
+    }
+
+    /** The attached CPU numbered {@code id} (any long the guest passes), or null (QEMU's spapr_find_cpu). */
+    CpuState findCpu(long id) {
+        return id >= 0 && id < vcpus.length ? vcpus[(int) id].cpu : null;
+    }
+
+    private VCpu findVcpu(long id) {
+        return id >= 0 && id < vcpus.length && vcpus[(int) id].cpu != null ? vcpus[(int) id] : null;
+    }
+
+    /** The hypervisor state of the calling CPU. */
+    private VCpu self(CpuState s) {
+        int i = s.index;
+        if (i < 0 || i >= vcpus.length || vcpus[i].cpu != s) {
+            throw new IllegalStateException("hypercall from a CPU not attached to this machine (index " + i + ")");
+        }
+        return vcpus[i];
+    }
+
+    /** Real address of the VPA registered for CPU {@code id} (0 if none); tests and debugging. */
+    public long vpaAddress(int id) {
+        return vcpus[id].vpaAddr;
     }
 
     /** The device tree blob the hypervisor currently holds (reset, CAS or KVMPPC_H_UPDATE_DT). */
@@ -337,8 +452,10 @@ public final class Machine implements Hypervisor, AutoCloseable {
     }
 
     /**
-     * Install the action for H_SIGNAL_SYS_RESET aimed at the CPU (deliver a system reset
-     * interrupt). Without one the call is reported as unimplemented and fails with H_HARDWARE.
+     * Install the action that delivers a system reset interrupt to a CPU (H_SIGNAL_SYS_RESET, the
+     * watchdog's dump-restart action). It is always called on the target CPU's own thread: directly
+     * when a CPU resets itself, otherwise through {@link CpuState#runOnCpu}. Without one
+     * H_SIGNAL_SYS_RESET is reported as unimplemented and fails with H_HARDWARE.
      */
     public void setSystemResetHandler(Consumer<CpuState> h) {
         this.systemResetHandler = h;
@@ -346,30 +463,83 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     // ---- CPU wiring and reset ----------------------------------------------------------------
 
-    /** Connect the (single) CPU: its interrupt input, and this machine as its hypervisor. */
+    /**
+     * Connect {@code s} as CPU number {@code s.index} (0 for a single-CPU machine): its interrupt
+     * input, and this machine as its hypervisor. Attaching the same object again is a no-op.
+     */
     public void attachCpu(CpuState s) {
         synchronized (lock) {
-            if (cpu != null && cpu != s) {
-                throw new IllegalStateException("only one CPU is supported");
+            int i = s.index;
+            if (i < 0 || i >= vcpus.length) {
+                throw new IllegalArgumentException("CPU index " + i + " outside 0.." + (vcpus.length - 1));
             }
-            if (cpu == null) {
-                xics.addServer(0, s::setExternalIrq);
+            VCpu v = vcpus[i];
+            if (v.cpu == s) {
+                return;
             }
-            cpu = s;
+            if (v.cpu != null) {
+                throw new IllegalStateException("CPU " + i + " is already attached");
+            }
+            for (VCpu o : vcpus) {
+                if (o.cpu == s) {
+                    throw new IllegalStateException("this CpuState is already attached as CPU " + o.id);
+                }
+            }
             s.hv = this;
+            v.cpu = s;
+            s.extIrq = xics.outputLevel(i);
         }
     }
 
     /**
-     * Machine reset (power-on or reboot), then set up {@code s} the way QEMU hands control to
-     * SLOF: firmware at 0, device tree at {@link #fdtAddress()}, PC = 0x100, r3 = tree address,
-     * MSR = ME|FP, POWER9 SPR reset values. Call after the interpreter's own reset so these values
-     * win; the decrementer and timebase are the CPU module's.
+     * Attach every CPU at once: {@code cpus.get(i)} becomes CPU i (its {@code index} is set).
+     * The list must hold exactly {@link #cpuCount()} distinct, not yet attached CpuStates (or the
+     * ones already attached at those positions).
      */
-    public void reset(CpuState s) {
+    public void attachCpus(List<CpuState> cpus) {
         synchronized (lock) {
-            if (cpu == null) {
-                attachCpu(s);
+            if (cpus.size() != vcpus.length) {
+                throw new IllegalArgumentException("machine has " + vcpus.length + " CPUs, got " + cpus.size());
+            }
+            for (int i = 0; i < cpus.size(); i++) {
+                CpuState c = cpus.get(i);
+                if (vcpus[i].cpu != c) {
+                    c.index = i;
+                }
+                attachCpu(c);
+            }
+        }
+    }
+
+    /** Machine reset with the attached CPU 0 as boot CPU; see {@link #reset(CpuState)}. */
+    public void reset() {
+        synchronized (lock) {
+            CpuState boot = vcpus[0].cpu;
+            if (boot == null) {
+                throw new IllegalStateException("CPU 0 is not attached");
+            }
+            reset(boot);
+        }
+    }
+
+    /**
+     * Machine reset (power-on or reboot). {@code boot} must be CPU 0 (it is attached if nothing
+     * is yet). It is set up the way QEMU hands control to SLOF: firmware at 0, device tree at
+     * {@link #fdtAddress()}, PC = 0x100, r3 = tree address, MSR = ME|FP, POWER9 SPR reset values.
+     * Every other attached CPU gets QEMU's reset state for a secondary and is left RTAS-stopped
+     * ({@code halted} set) until the guest starts it with start-cpu. Call after the interpreters'
+     * own reset so these values win, and only while no CPU thread runs; the decrementer and
+     * timebase are the CPU module's.
+     */
+    public void reset(CpuState boot) {
+        synchronized (lock) {
+            if (vcpus[0].cpu == null) {
+                if (boot.index != 0) {
+                    throw new IllegalArgumentException("the boot CPU must have index 0");
+                }
+                attachCpu(boot);
+            } else if (vcpus[0].cpu != boot) {
+                throw new IllegalArgumentException("reset takes the boot CPU (CPU 0)");
             }
             shutdown = ShutdownReason.NONE;
             shutdownMessage = null;
@@ -381,9 +551,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             ov5Cas = new OptionVector();
             compatPvr = 0;
             casPreIsa3 = false;
-            prod = false;
-            vpaAddr = slbShadowAddr = dtlAddr = 0;
-            slbShadowSize = dtlSize = 0;
+            for (VCpu v : vcpus) {
+                v.clearRegistrations();
+            }
             for (Watchdog w : watchdogs) {
                 w.armed = false;
             }
@@ -402,19 +572,41 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (firmware != null) {
                 mem.write(0, firmware, 0, firmware.length);
             }
-            fdtAddr = Math.min(rmaSize(), FDT_MAX_ADDR) - FDT_MAX_SIZE;
+            long addr = Math.min(rmaSize(), FDT_MAX_ADDR) - FDT_MAX_SIZE;
+            fdtAddr = addr;
             byte[] blob = DeviceTree.blob(DeviceTree.build(this, true));
             if (blob.length > FDT_MAX_SIZE) {
                 throw new IllegalStateException("device tree too large");
             }
-            mem.write(fdtAddr, blob, 0, blob.length);
+            mem.write(addr, blob, 0, blob.length);
             fdtBlob = blob;
             fdtInitialSize = blob.length;
 
-            resetCpuState(s);
-            s.pc = ENTRY_POINT;
-            s.npc = ENTRY_POINT;
-            s.gpr[3] = fdtAddr;
+            for (VCpu v : vcpus) {
+                CpuState c = v.cpu;
+                if (c == null) {
+                    continue;
+                }
+                // Requests posted before the reset are overtaken by it; run them now (no CPU
+                // thread is running) so they cannot fire into the new boot.
+                c.runPostedWork();
+                resetCpuState(c);
+                c.prodded = false;
+                c.extIrq = false;
+                if (c == boot) {
+                    c.pc = ENTRY_POINT;
+                    c.npc = ENTRY_POINT;
+                    c.gpr[3] = addr;
+                    c.halted = false;
+                } else {
+                    // spapr_reset_vcpu for a CPU that is not the boot CPU: no power-saving exit
+                    // causes until start-cpu, PSSCR[EC] set, RTAS-stopped.
+                    c.spr[Spr.LPCR] = LPCR_BOOT & ~LPCR_PM;
+                    c.pc = ENTRY_POINT;
+                    c.npc = ENTRY_POINT;
+                    c.halted = true;
+                }
+            }
         }
     }
 
@@ -433,20 +625,101 @@ public final class Machine implements Hypervisor, AutoCloseable {
         for (int r : new int[] {Spr.SRR0, Spr.SRR1, Spr.SPRG0, Spr.SPRG1, Spr.SPRG2, Spr.SPRG3, Spr.DAR,
                 Spr.DSISR, Spr.PIDR, Spr.AMR, Spr.IAMR, Spr.UAMOR, Spr.FSCR, Spr.CTRL_R, Spr.CTRL_W, Spr.DSCR,
                 Spr.TAR, Spr.CFAR, Spr.PPR, Spr.DAWR0, Spr.DAWRX0, Spr.CIABR, Spr.VRSAVE, Spr.HSRR0, Spr.HSRR1,
-                Spr.PSPB, Spr.MMCR1, Spr.MMCR2, Spr.MMCRA, Spr.BESCR, Spr.EBBHR, Spr.EBBRR, Spr.PTCR}) {
+                Spr.PSPB, Spr.MMCR1, Spr.MMCR2, Spr.MMCRA, Spr.BESCR, Spr.EBBHR, Spr.EBBRR, Spr.PTCR, SPR_PCR}) {
             s.spr[r] = 0;
         }
         s.spr[Spr.PVR] = Spr.PVR_POWER9;
-        // LPCR as QEMU reports it at the SLOF entry point: LD | PECE (PDEE HDEE EEE DEE OEE) | LPES0.
-        s.spr[Spr.LPCR] = 0x3f008L;
+        s.spr[Spr.LPCR] = LPCR_BOOT;
         s.spr[SPR_AMOR] = -1L;
-        s.spr[SPR_PSSCR] = 0x100000L; // EC
+        s.spr[SPR_PSSCR] = PSSCR_EC;
         s.spr[Spr.MMCR0] = 0x80000000L; // FC
         s.spr[SPR_PMCR] = 1;
         s.spr[SPR_RPR] = 0x103070f1f3fL;
         s.resValid = false;
         s.procTable = 0;
         s.ceded = false;
+    }
+
+    /**
+     * RTAS start-cpu (QEMU's rtas_start_cpu): give the stopped CPU {@code t} the entry state, LPCR
+     * modes copied from the caller, and set it running. Returns false (RTAS hardware error) if
+     * {@code t} is not stopped. Caller holds the machine lock.
+     *
+     * <p>The entry state is written into {@code t} directly and also posted with
+     * {@link CpuState#runOnCpu}, then {@code halted} is cleared. The posted copy is what makes a
+     * start right after the target's stop-self safe: the target's thread may still be finishing
+     * that stop-self hypercall (writing r3, advancing the PC) when this runs, and those writes
+     * would clobber the direct copy. The run loop must therefore run posted work after leaving
+     * the halted park and before its first instruction; it then sees exactly the entry state.
+     */
+    boolean startCpu(CpuState caller, CpuState t, long start, long r3) {
+        if (!t.halted) {
+            return false;
+        }
+        long callerLpcr = caller.spr[Spr.LPCR];
+        long lpcr = t.spr[Spr.LPCR];
+        lpcr = (lpcr & ~Spr.LPCR_ILE) | (callerLpcr & Spr.LPCR_ILE);
+        lpcr = (lpcr & ~Spr.LPCR_AIL_MASK) | (callerLpcr & Spr.LPCR_AIL_MASK);
+        // New CPUs start in the radix/hash mode of the existing ones.
+        long radixBits = Spr.LPCR_UPRT | Spr.LPCR_GTSE | Spr.LPCR_HR;
+        lpcr = (callerLpcr & Spr.LPCR_HR) != 0 ? lpcr | radixBits : lpcr & ~radixBits;
+        // spapr_cpu_set_entry_state turns the power-saving exit causes back on.
+        long entryLpcr = lpcr | LPCR_PM;
+        long psscr = t.spr[SPR_PSSCR] & ~PSSCR_EC;
+        long procTable = (patbEntry & PATE1_GR) != 0 ? patbEntry & ~PATE1_GR : 0;
+        Consumer<CpuState> entry = c -> {
+            c.spr[Spr.LPCR] = entryLpcr;
+            c.spr[SPR_PSSCR] = psscr;
+            c.msr = Msr.SF | Msr.ME;
+            c.pc = start;
+            c.npc = start;
+            c.gpr[1] = 0;
+            c.gpr[3] = r3;
+            c.gpr[4] = 0;
+            c.procTable = procTable;
+            c.ceded = false;
+            c.resValid = false;
+        };
+        entry.accept(t);
+        t.runOnCpu(entry);
+        // The volatile write publishes everything above to t's thread.
+        t.halted = false;
+        t.wake();
+        return true;
+    }
+
+    /**
+     * RTAS stop-self (QEMU's rtas_stop_self) on the calling CPU's own thread: PSSCR[EC] set, no
+     * power-saving exit causes, RTAS-stopped. The run loop parks until start-cpu. Caller holds
+     * the machine lock.
+     */
+    void stopSelf(CpuState s) {
+        s.spr[SPR_PSSCR] |= PSSCR_EC;
+        s.spr[Spr.LPCR] &= ~LPCR_PM;
+        // Also idle the CPU for run loops that do not yet park on halted.
+        s.ceded = true;
+        s.halted = true;
+    }
+
+    /**
+     * Apply a partition-wide register update to every attached CPU, the way QEMU's
+     * spapr_set_all_lpcrs uses run_on_cpu: at once on the caller, posted to every other CPU's
+     * own thread, stopped or running. Posting even to stopped CPUs keeps all updates in one FIFO
+     * per CPU: a CPU that stops with updates still queued gets them, then any later ones, then
+     * start-cpu's entry state, in that order. Caller holds the machine lock.
+     */
+    private void forAllCpus(CpuState caller, Consumer<CpuState> f) {
+        for (VCpu v : vcpus) {
+            CpuState c = v.cpu;
+            if (c == null) {
+                continue;
+            }
+            if (c == caller) {
+                f.accept(c);
+            } else {
+                c.runOnCpu(f);
+            }
+        }
     }
 
     static int hptShiftForRam(long ram) {
@@ -474,8 +747,14 @@ public final class Machine implements Hypervisor, AutoCloseable {
                         case 1 -> requestStop(ShutdownReason.POWER_OFF, "watchdog");
                         case 2 -> requestStop(ShutdownReason.REBOOT, "watchdog");
                         default -> {
-                            if (systemResetHandler != null && cpu != null) {
-                                systemResetHandler.accept(cpu);
+                            // Dump-restart: a system reset on every CPU, each on its own thread.
+                            Consumer<CpuState> h = systemResetHandler;
+                            if (h != null && vcpus[0].cpu != null) {
+                                for (VCpu v : vcpus) {
+                                    if (v.cpu != null) {
+                                        v.cpu.runOnCpu(h);
+                                    }
+                                }
                             } else {
                                 requestStop(ShutdownReason.REBOOT, "watchdog dump-restart");
                             }
@@ -491,15 +770,23 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
     }
 
-    /** Ask the CPU to stop with the given reason (first reason wins until the next reset). */
+    /**
+     * Ask every CPU to stop with the given reason (first reason wins until the next reset). Each
+     * CPU's run loop returns at its next instruction boundary, or at once if it is idle or parked.
+     */
     void requestStop(ShutdownReason r, String msg) {
-        if (shutdown == ShutdownReason.NONE) {
-            shutdown = r;
-            shutdownMessage = msg;
+        synchronized (lock) {
+            if (shutdown == ShutdownReason.NONE) {
+                shutdownMessage = msg;
+                shutdown = r;
+            }
         }
-        if (cpu != null) {
-            cpu.stopRequested = true;
-            cpu.wake();
+        for (VCpu v : vcpus) {
+            CpuState c = v.cpu;
+            if (c != null) {
+                c.stopRequested = true;
+                c.wake();
+            }
         }
     }
 
@@ -535,12 +822,41 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return addr & 0x0fffffffffffffffL;
     }
 
+    /** Runs on the calling CPU's thread; each handler takes the locks it needs (see the class comment). */
     @Override
     public void hcall(CpuState s) {
-        synchronized (lock) {
-            long op = s.gpr[3];
-            s.gpr[3] = dispatch(s, op);
+        long op = s.gpr[3];
+        s.gpr[3] = dispatch(s, op);
+    }
+
+    /** Marks the vCPU preempted in its VPA dispatch counter (odd), as QEMU's cpu_exec_exit hook. */
+    @Override
+    public void cpuExecExit(CpuState s) {
+        bumpDispatchCounter(s, 1);
+    }
+
+    /** Clears a pending prod and marks the vCPU dispatched (even), as QEMU's cpu_exec_enter hook. */
+    @Override
+    public void cpuExecEnter(CpuState s) {
+        s.prodded = false;
+        bumpDispatchCounter(s, 0);
+    }
+
+    private void bumpDispatchCounter(CpuState s, int parity) {
+        int i = s.index;
+        if (i < 0 || i >= vcpus.length || vcpus[i].cpu != s) {
+            return;
         }
+        long vpa = vcpus[i].vpaAddr;
+        if (vpa == 0 || !mem.contains(vpa + VPA_DISPATCH_COUNTER, 4)) {
+            return;
+        }
+        int d = mem.read32be(vpa + VPA_DISPATCH_COUNTER) + 1;
+        if ((d & 1) != parity) {
+            PaprLog.once("vpa-dispatch-parity", "VPA: incorrect dispatch counter value, correcting");
+            d++;
+        }
+        mem.write32be(vpa + VPA_DISPATCH_COUNTER, d);
     }
 
     private long arg(CpuState s, int i) {
@@ -553,13 +869,19 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     private long dispatch(CpuState s, long op) {
         if (op == H.KVMPPC_H_RTAS) {
-            return rtas.call(s, toReal(arg(s, 0)));
+            synchronized (lock) {
+                return rtas.call(s, toReal(arg(s, 0)));
+            }
         }
         if (op == H.KVMPPC_H_CAS) {
-            return hCas(s);
+            synchronized (lock) {
+                return hCas(s);
+            }
         }
         if (op == H.KVMPPC_H_UPDATE_DT) {
-            return hUpdateDt(s);
+            synchronized (lock) {
+                return hUpdateDt(s);
+            }
         }
         if (op == H.KVMPPC_H_LOGICAL_MEMOP) {
             return hLogicalMemop(s);
@@ -570,71 +892,105 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return switch ((int) op) {
             case H.ENTER, H.REMOVE, H.READ, H.PROTECT, H.BULK_REMOVE -> hashMmu(s, (int) op);
             case H.CLEAR_MOD, H.CLEAR_REF -> unknown(op);
-            case H.RESIZE_HPT_PREPARE, H.RESIZE_HPT_COMMIT -> htabShift == 0 ? H.NOT_AVAILABLE : hptResize(op);
+            case H.RESIZE_HPT_PREPARE, H.RESIZE_HPT_COMMIT -> {
+                synchronized (lock) {
+                    yield htabShift == 0 ? H.NOT_AVAILABLE : hptResize(op);
+                }
+            }
             case H.SET_SPRG0 -> {
                 s.spr[Spr.SPRG0] = arg(s, 0);
                 yield H.SUCCESS;
             }
             case H.SET_DABR, H.SET_XDABR -> H.HARDWARE; // POWER9 has no DABR
             case H.PAGE_INIT -> hPageInit(s);
-            case H.REGISTER_VPA -> hRegisterVpa(s);
+            case H.REGISTER_VPA -> {
+                synchronized (lock) {
+                    yield hRegisterVpa(s);
+                }
+            }
             case H.CEDE -> hCede(s);
             case H.CONFER -> hConfer(s);
             case H.PROD -> hProd(s);
-            case H.JOIN -> (s.msr & Msr.EE) != 0 ? H.BAD_MODE : H.CONTINUE;
+            case H.JOIN -> hJoin(s);
             case H.LOGICAL_CI_LOAD, H.LOGICAL_CACHE_LOAD -> hLogicalLoad(s);
             case H.LOGICAL_CI_STORE, H.LOGICAL_CACHE_STORE -> hLogicalStore(s);
             case H.LOGICAL_ICBI, H.LOGICAL_DCBF -> H.SUCCESS;
-            case H.SET_MODE -> hSetMode(s);
+            case H.SET_MODE -> {
+                synchronized (lock) {
+                    yield hSetMode(s);
+                }
+            }
             case H.CLEAN_SLB, H.INVALIDATE_PID -> {
                 PaprLog.unimplemented("hcall-0x" + Long.toHexString(op), "");
                 yield H.FUNCTION;
             }
-            case H.REGISTER_PROC_TBL -> hRegisterProcTbl(s);
-            case H.SIGNAL_SYS_RESET -> hSignalSysReset(s);
+            case H.REGISTER_PROC_TBL -> {
+                synchronized (lock) {
+                    yield hRegisterProcTbl(s);
+                }
+            }
+            case H.SIGNAL_SYS_RESET -> {
+                synchronized (lock) {
+                    yield hSignalSysReset(s);
+                }
+            }
             case H.GET_CPU_CHARACTERISTICS -> hGetCpuCharacteristics(s);
             case H.GET_TERM_CHAR -> hGetTermChar(s);
             case H.PUT_TERM_CHAR -> hPutTermChar(s);
+            // XICS: the calling CPU's own presentation controller, except that H_IPI and H_IPOLL
+            // name a server (any CPU's).
             case H.EOI -> {
-                xics.eoi(0, (int) arg(s, 0));
+                xics.eoi(self(s).id, (int) arg(s, 0));
                 yield H.SUCCESS;
             }
             case H.CPPR -> {
-                xics.setCppr(0, (int) arg(s, 0) & 0xff);
+                xics.setCppr(self(s).id, (int) arg(s, 0) & 0xff);
                 yield H.SUCCESS;
             }
             case H.IPI -> {
-                if (arg(s, 0) != 0 || !xics.hasServer(0)) {
+                VCpu t = findVcpu(arg(s, 0));
+                if (t == null) {
                     yield H.PARAMETER;
                 }
-                xics.setMfrr(0, (int) arg(s, 1) & 0xff);
+                xics.setMfrr(t.id, (int) arg(s, 1) & 0xff);
                 yield H.SUCCESS;
             }
             case H.IPOLL -> {
-                if (arg(s, 0) != 0) {
+                VCpu t = findVcpu(arg(s, 0));
+                if (t == null) {
                     yield H.PARAMETER;
                 }
-                int[] r = xics.ipoll(0);
+                int[] r = xics.ipoll(t.id);
                 ret(s, 0, r[0] & 0xffffffffL);
                 ret(s, 1, r[1]);
                 yield H.SUCCESS;
             }
             case H.XIRR -> {
-                ret(s, 0, xics.accept(0) & 0xffffffffL);
+                ret(s, 0, xics.accept(self(s).id) & 0xffffffffL);
                 yield H.SUCCESS;
             }
             case H.XIRR_X -> {
-                ret(s, 0, xics.accept(0) & 0xffffffffL);
+                ret(s, 0, xics.accept(self(s).id) & 0xffffffffL);
                 ret(s, 1, System.nanoTime());
                 yield H.SUCCESS;
             }
             case H.REG_CRQ -> {
                 VioDevice d = vioByReg(arg(s, 0));
-                yield d == null ? H.PARAMETER : d.registerCrq(arg(s, 1), arg(s, 2));
+                if (d == null) {
+                    yield H.PARAMETER;
+                }
+                synchronized (d.lock()) {
+                    yield d.registerCrq(arg(s, 1), arg(s, 2));
+                }
             }
             case H.FREE_CRQ -> {
                 VioDevice d = vioByReg(arg(s, 0));
-                yield d == null ? H.PARAMETER : d.freeCrq();
+                if (d == null) {
+                    yield H.PARAMETER;
+                }
+                synchronized (d.lock()) {
+                    yield d.freeCrq();
+                }
             }
             case H.SEND_CRQ -> {
                 VioDevice d = vioByReg(arg(s, 0));
@@ -645,7 +1001,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                     yield H.HARDWARE;
                 }
                 byte[] crq = ByteBuffer.allocate(16).putLong(arg(s, 1)).putLong(arg(s, 2)).array();
-                yield d.handleCrq(crq);
+                synchronized (d.lock()) {
+                    yield d.handleCrq(crq);
+                }
             }
             case H.ENABLE_CRQ -> vioByReg(arg(s, 0)) == null ? H.PARAMETER : H.SUCCESS;
             case H.VIO_SIGNAL -> {
@@ -653,7 +1011,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 if (d == null || (arg(s, 1) & ~d.signalMask()) != 0) {
                     yield H.PARAMETER;
                 }
-                d.setSignalState(arg(s, 1));
+                synchronized (d.lock()) {
+                    d.setSignalState(arg(s, 1));
+                }
                 yield H.SUCCESS;
             }
             case H.PUT_TCE -> {
@@ -681,8 +1041,16 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 ret(s, 0, random.nextLong());
                 yield H.SUCCESS;
             }
-            case H.HOME_NODE_ASSOCIATIVITY -> hHomeNodeAssociativity(s);
-            case H.WATCHDOG -> hWatchdog(s);
+            case H.HOME_NODE_ASSOCIATIVITY -> {
+                synchronized (lock) {
+                    yield hHomeNodeAssociativity(s);
+                }
+            }
+            case H.WATCHDOG -> {
+                synchronized (lock) {
+                    yield hWatchdog(s);
+                }
+            }
             default -> unknown(op);
         };
     }
@@ -772,7 +1140,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
         long flags = arg(s, 0);
         long procno = arg(s, 1);
         long addr = arg(s, 2);
-        if (procno != 0) {
+        VCpu t = findVcpu(procno);
+        if (t == null) {
             return H.PARAMETER;
         }
         if (flags == registerVpa) {
@@ -792,14 +1161,14 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (addr / 4096 != (addr + size - 1) / 4096 || !mem.contains(addr, size)) {
                 return H.PARAMETER;
             }
-            vpaAddr = addr;
+            t.vpaAddr = addr;
             mem.write8(addr + 9, mem.read8(addr + 9) | 0x2); // shared processor
             return H.SUCCESS;
         } else if (flags == deregisterVpa) {
-            if (slbShadowAddr != 0 || dtlAddr != 0) {
+            if (t.slbShadowAddr != 0 || t.dtlAddr != 0) {
                 return H.RESOURCE;
             }
-            vpaAddr = 0;
+            t.vpaAddr = 0;
             return H.SUCCESS;
         } else if (flags == registerSlb) {
             if (addr == 0) {
@@ -812,15 +1181,15 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (Integer.compareUnsigned(size, 8) < 0 || addr / 4096 != (addr + (size & 0xffffffffL) - 1) / 4096) {
                 return H.PARAMETER;
             }
-            if (vpaAddr == 0) {
+            if (t.vpaAddr == 0) {
                 return H.RESOURCE;
             }
-            slbShadowAddr = addr;
-            slbShadowSize = size;
+            t.slbShadowSize = size;
+            t.slbShadowAddr = addr;
             return H.SUCCESS;
         } else if (flags == deregisterSlb) {
-            slbShadowAddr = 0;
-            slbShadowSize = 0;
+            t.slbShadowAddr = 0;
+            t.slbShadowSize = 0;
             return H.SUCCESS;
         } else if (flags == registerDtl) {
             if (addr == 0) {
@@ -833,29 +1202,30 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (Integer.compareUnsigned(size, 48) < 0) {
                 return H.PARAMETER;
             }
-            if (vpaAddr == 0) {
+            if (t.vpaAddr == 0) {
                 return H.RESOURCE;
             }
-            dtlAddr = addr;
-            dtlSize = size;
+            t.dtlSize = size;
+            t.dtlAddr = addr;
             return H.SUCCESS;
         } else if (flags == deregisterDtl) {
-            dtlAddr = 0;
-            dtlSize = 0;
+            t.dtlAddr = 0;
+            t.dtlSize = 0;
             return H.SUCCESS;
         }
         return H.PARAMETER;
     }
 
-    /** Registered VPA address (0 if none); tests and debugging. */
+    /** Registered VPA address of CPU 0 (0 if none); tests and debugging. */
     public long vpaAddress() {
-        return vpaAddr;
+        return vcpus[0].vpaAddr;
     }
 
+    /** H_CEDE: own CPU only, no lock. Idle with MSR[EE]=1 until an interrupt or H_PROD. */
     private long hCede(CpuState s) {
         s.msr |= Msr.EE;
-        if (prod) {
-            prod = false;
+        if (s.prodded) {
+            s.prodded = false;
             return H.SUCCESS;
         }
         if (!s.extIrq) {
@@ -864,31 +1234,74 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return H.SUCCESS;
     }
 
-    private long hConfer(CpuState s) {
-        long target = arg(s, 0);
-        if (target == -1) {
-            return H.SUCCESS; // yield to everyone else: nobody else to run
-        }
-        if (target != 0) {
-            return H.PARAMETER;
-        }
-        // Confer to self: wait until prodded (or interrupted).
-        if (prod) {
-            prod = false;
+    /** H_CONFER to self (and H_JOIN): wait until prodded, without enabling interrupts. */
+    private long conferSelf(CpuState s) {
+        if (s.prodded) {
+            s.prodded = false;
             return H.SUCCESS;
         }
         s.ceded = true;
         return H.SUCCESS;
     }
 
+    /**
+     * H_CONFER (QEMU's h_confer): -1 yields to everyone; a target of self waits for H_PROD;
+     * another target is yielded to only if its VPA dispatch counter still equals the caller's
+     * sample and is odd (that vCPU is preempted). Yielding is a host thread yield.
+     */
+    private long hConfer(CpuState s) {
+        long target = arg(s, 0);
+        int dispatch = (int) arg(s, 1);
+        if (target != -1) {
+            VCpu t = findVcpu(target);
+            if (t == null) {
+                return H.PARAMETER;
+            }
+            if (t.cpu == s) {
+                return conferSelf(s);
+            }
+            long vpa = t.vpaAddr;
+            if (vpa == 0 || (dispatch & 1) == 0 || !mem.contains(vpa + VPA_DISPATCH_COUNTER, 4)) {
+                return H.SUCCESS;
+            }
+            if (mem.read32be(vpa + VPA_DISPATCH_COUNTER) != dispatch) {
+                return H.SUCCESS;
+            }
+        }
+        Thread.yield();
+        return H.SUCCESS;
+    }
+
+    /** H_PROD: mark the target prodded and wake it if it is idle (any thread may do this). */
     private long hProd(CpuState s) {
-        if (arg(s, 0) != 0) {
+        CpuState t = findCpu(arg(s, 0));
+        if (t == null) {
             return H.PARAMETER;
         }
-        prod = true;
-        s.ceded = false;
-        s.wake();
+        t.prodded = true;
+        t.wake();
         return H.SUCCESS;
+    }
+
+    /**
+     * H_JOIN (QEMU's h_join): with MSR[EE]=0, confer to self unless every other CPU is already
+     * joined or stopped, in which case return H_CONTINUE. "Joined" is read from the other CPUs'
+     * {@code ceded}/{@code msr} without synchronisation, as QEMU reads their halted flags.
+     */
+    private long hJoin(CpuState s) {
+        if ((s.msr & Msr.EE) != 0) {
+            return H.BAD_MODE;
+        }
+        for (VCpu v : vcpus) {
+            CpuState c = v.cpu;
+            if (c == null || c == s) {
+                continue;
+            }
+            if (!(c.halted || c.ceded) || (c.msr & Msr.EE) != 0) {
+                return conferSelf(s);
+            }
+        }
+        return H.CONTINUE;
     }
 
     private long hLogicalLoad(CpuState s) {
@@ -1019,7 +1432,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 if (mflags != 0 && mflags != 3) {
                     return H.UNSUPPORTED_FLAG;
                 }
-                s.spr[Spr.LPCR] = (s.spr[Spr.LPCR] & ~Spr.LPCR_AIL_MASK) | (mflags << Spr.LPCR_AIL_SHIFT);
+                long ail = mflags << Spr.LPCR_AIL_SHIFT;
+                forAllCpus(s, c -> c.spr[Spr.LPCR] = (c.spr[Spr.LPCR] & ~Spr.LPCR_AIL_MASK) | ail);
                 return H.SUCCESS;
             }
             case 4 -> { // interrupt endianness
@@ -1030,11 +1444,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
                     return H.P4;
                 }
                 if (mflags == 0) {
-                    s.spr[Spr.LPCR] &= ~Spr.LPCR_ILE;
+                    forAllCpus(s, c -> c.spr[Spr.LPCR] &= ~Spr.LPCR_ILE);
                     return H.SUCCESS;
                 }
                 if (mflags == 1) {
-                    s.spr[Spr.LPCR] |= Spr.LPCR_ILE;
+                    forAllCpus(s, c -> c.spr[Spr.LPCR] |= Spr.LPCR_ILE);
                     return H.SUCCESS;
                 }
                 return H.UNSUPPORTED_FLAG;
@@ -1113,8 +1527,12 @@ public final class Machine implements Hypervisor, AutoCloseable {
             update |= Spr.LPCR_GTSE;
         }
         long mask = Spr.LPCR_UPRT | Spr.LPCR_HR | Spr.LPCR_GTSE;
-        s.spr[Spr.LPCR] = (s.spr[Spr.LPCR] & ~mask) | update;
-        s.procTable = (cproc & PATE1_GR) != 0 ? cproc & ~PATE1_GR : 0;
+        long lpcrBits = update;
+        long procTable = (cproc & PATE1_GR) != 0 ? cproc & ~PATE1_GR : 0;
+        forAllCpus(s, c -> {
+            c.spr[Spr.LPCR] = (c.spr[Spr.LPCR] & ~mask) | lpcrBits;
+            c.procTable = procTable;
+        });
         return H.SUCCESS;
     }
 
@@ -1125,23 +1543,47 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
     }
 
+    /**
+     * H_SIGNAL_SYS_RESET (QEMU's h_signal_sys_reset): -1 all CPUs, -2 all but the caller (both
+     * skip RTAS-stopped CPUs), otherwise one CPU by number. The reset runs on each target's own
+     * thread: at once for the caller, through {@link CpuState#runOnCpu} for the others.
+     */
     private long hSignalSysReset(CpuState s) {
         long target = arg(s, 0);
+        List<CpuState> targets = new ArrayList<>();
         if (target < 0) {
             if (target < -2) {
                 return H.PARAMETER;
             }
-            if (target == -2) {
-                return H.SUCCESS; // all but self: there is no other CPU
+            for (VCpu v : vcpus) {
+                CpuState c = v.cpu;
+                if (c == null || (target == -2 && c == s) || c.halted) {
+                    continue;
+                }
+                targets.add(c);
             }
-        } else if (target != 0) {
-            return H.PARAMETER;
+            if (targets.isEmpty()) {
+                return H.SUCCESS;
+            }
+        } else {
+            CpuState c = findCpu(target);
+            if (c == null) {
+                return H.PARAMETER;
+            }
+            targets.add(c);
         }
-        if (systemResetHandler == null) {
+        Consumer<CpuState> h = systemResetHandler;
+        if (h == null) {
             PaprLog.unimplemented("signal-sys-reset", "no system reset handler installed");
             return H.HARDWARE;
         }
-        systemResetHandler.accept(s);
+        for (CpuState c : targets) {
+            if (c == s) {
+                h.accept(c);
+            } else {
+                c.runOnCpu(h);
+            }
+        }
         return H.SUCCESS;
     }
 
@@ -1242,11 +1684,13 @@ public final class Machine implements Hypervisor, AutoCloseable {
         if (arg(s, 0) != 1) {
             return H.FUNCTION;
         }
-        if (arg(s, 1) != 0) {
+        VCpu t = findVcpu(arg(s, 1));
+        if (t == null) {
             return H.P2;
         }
         // vCPU associativity without its length cell: FORM1 {0,0,0,node,vcpu}, FORM2 {node,vcpu}.
-        int[] assoc = ov5Cas.test(OptionVector.OV5_FORM2_AFFINITY) ? new int[] {0, 0} : new int[] {0, 0, 0, 0, 0};
+        int[] assoc = ov5Cas.test(OptionVector.OV5_FORM2_AFFINITY) ? new int[] {0, t.id}
+                : new int[] {0, 0, 0, 0, t.id};
         int k = 0;
         for (int i = 0; i < 6; i++) {
             int a = k < assoc.length ? assoc[k++] : -1;
@@ -1333,6 +1777,16 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return pvr == PVR_LOGICAL_2_06_PLUS ? PVR_LOGICAL_2_06 * 2 + 1 : pvr * 2;
     }
 
+    /** PCR value for a logical PVR, masked to what a POWER9 implements (QEMU's ppc_set_compat). */
+    static long pcrForCompat(int pvr) {
+        return switch (pvr) {
+            case PVR_LOGICAL_2_05 -> PCR_COMPAT_2_07 | PCR_COMPAT_2_06 | PCR_COMPAT_2_05;
+            case PVR_LOGICAL_2_06, PVR_LOGICAL_2_06_PLUS -> PCR_COMPAT_2_07 | PCR_COMPAT_2_06;
+            case PVR_LOGICAL_2_07 -> PCR_COMPAT_2_07;
+            default -> 0; // raw mode or ISA 3.00: the 3.00/3.10 bits are outside POWER9's mask
+        };
+    }
+
     private long hCas(CpuState s) {
         long vec = toReal(arg(s, 0));
         long buf = arg(s, 1);
@@ -1343,6 +1797,15 @@ public final class Machine implements Hypervisor, AutoCloseable {
             return H.PARAMETER;
         }
         bufSize -= 4;
+
+        // CAS is only allowed while the boot CPU is the only one running (or idle).
+        for (VCpu v : vcpus) {
+            CpuState c = v.cpu;
+            if (c != null && c != s && !(c.halted || c.ceded)) {
+                PaprLog.warn("guest has multiple active vCPUs at CAS, which is not allowed");
+                return H.MULTI_THREADS_ACTIVE;
+            }
+        }
 
         // PVR list: (mask, pvr) pairs terminated by an entry with pvr bits outside its mask.
         boolean explicit = false;
@@ -1368,6 +1831,10 @@ public final class Machine implements Hypervisor, AutoCloseable {
         if (best == 0 && !explicit) {
             PaprLog.warn("Couldn't negotiate a suitable PVR during CAS");
             return H.HARDWARE;
+        }
+        if (compatPvr != best) {
+            long pcr = pcrForCompat(best);
+            forAllCpus(s, c -> c.spr[SPR_PCR] = pcr);
         }
         compatPvr = best;
 

@@ -7,7 +7,7 @@ import java.util.List;
 /**
  * Builds the flattened device tree the machine hands to SLOF at reset and back to the guest at
  * client-architecture-support time, following QEMU's {@code spapr_build_fdt} for
- * {@code -M pseries,ic-mode=xics -cpu power9 -smp 1 -nodefaults}.
+ * {@code -M pseries,ic-mode=xics -cpu power9 -smp N -nodefaults}.
  *
  * <p>Nodes and properties are created here in their final order. libfdt inserts each new
  * property and subnode at the front of its parent, so QEMU's source creates them in the reverse
@@ -124,7 +124,7 @@ final class DeviceTree {
         ic.setCell("phandle", PHANDLE_INTC);
         ic.setCell("linux,phandle", PHANDLE_INTC);
         ic.setCell("#interrupt-cells", 2);
-        ic.setCells("ibm,interrupt-server-ranges", 0, 1);
+        ic.setCells("ibm,interrupt-server-ranges", 0, c.cpus);
         ic.setEmpty("interrupt-controller");
         ic.setString("compatible", "IBM,ppc-xicp");
         ic.setString("device_type", "PowerPC-External-Interrupt-Presentation");
@@ -194,17 +194,20 @@ final class DeviceTree {
         for (int i = RTAS_TOKENS.length - 1; i >= 0; i--) {
             r.setCell(RTAS_TOKENS[i], Rtas.TOKEN_BASE + i);
         }
-        // FADump: CPU state data region sized for max_cpus = 1 (QEMU spapr_dt_rtas_fadump).
-        r.setCells("ibm,configure-kernel-dump-sizes", 1, 0, 0x510, 2, 0, 0);
+        // FADump: CPU state data region sized for max_cpus (QEMU spapr_dt_rtas_fadump): a 16-byte
+        // header, 12 bytes of padding, the CPU count, then 79 16-byte register entries per CPU.
+        int cpus = m.config().cpus;
+        r.setCells("ibm,configure-kernel-dump-sizes", 1, 0, 16 + 12 + 4 + cpus * 79 * 16, 2, 0, 0);
         r.set("ibm,configure-kernel-dump-version", new byte[] {0x01, 0x00, 0x01, 0x00});
         long maxAddr = m.config().ramSize;
         r.setCells("ibm,lrdr-capacity", (int) (maxAddr >>> 32), (int) maxAddr, (int) (LMB_SIZE >>> 32),
-                (int) LMB_SIZE, 1);
+                (int) LMB_SIZE, cpus);
         r.setEmpty("ibm,extended-os-term");
         r.setEmpty("ibm,change-msix-capable");
         r.setCell("rtas-event-scan-rate", Rtas.EVENT_SCAN_RATE);
         r.setCell("rtas-error-log-max", Rtas.ERROR_LOG_MAX);
-        r.setCell("rtas-size", Rtas.MIN_SIZE + Rtas.ERROR_LOG_MAX + 16 + 8);
+        // Room for the FWNMI save area: two doublewords per CPU, plus 8 bytes (spapr_dt_rtas).
+        r.setCell("rtas-size", Rtas.MIN_SIZE + Rtas.ERROR_LOG_MAX + cpus * 16 + 8);
         if (form2(m)) {
             r.set("ibm,numa-distance-table", new byte[] {0, 0, 0, 1, 10});
             r.setCells("ibm,numa-lookup-index-table", 1, 0);
@@ -233,16 +236,19 @@ final class DeviceTree {
         drcProps(cpus, m.drcs(Drc.Kind.CPU));
         cpus.setCell("#size-cells", 0);
         cpus.setCell("#address-cells", 1);
-        cpus.addChild(cpuNode(m));
+        for (int i = 0; i < m.config().cpus; i++) {
+            cpus.addChild(cpuNode(m, i));
+        }
     }
 
-    /** The node of CPU 0 (also the ibm,configure-connector fragment of its DRC). */
-    static Fdt.Node cpuNode(Machine m) {
-        Fdt.Node n = new Fdt.Node("PowerPC,POWER9@0");
+    /** The node of CPU {@code id} (also the ibm,configure-connector fragment of its DRC). */
+    static Fdt.Node cpuNode(Machine m, int id) {
+        Fdt.Node n = new Fdt.Node("PowerPC,POWER9@" + Integer.toHexString(id));
         n.setCell("ibm,dec-bits", 56);
         n.setCells("ibm,processor-radix-AP-encodings", 0x0c, 0xa0000010, 0x20000015, 0x4000001e);
-        n.setCells("ibm,ppc-interrupt-gserver#s", 0, 0);
-        n.setCells("ibm,ppc-interrupt-server#s", 0);
+        // One thread per core: the core's only server number is its CPU number.
+        n.setCells("ibm,ppc-interrupt-gserver#s", id, 0);
+        n.setCells("ibm,ppc-interrupt-server#s", id);
         n.setCells("ibm,pft-size", 0, m.htabShift());
         n.setCell("ibm,chip-id", 0);
         n.set("ibm,pi-features", new byte[] {1, 0, 0});
@@ -270,8 +276,8 @@ final class DeviceTree {
         n.setCell("d-cache-block-size", 128);
         n.setCell("cpu-version", m.compatPvr() != 0 ? m.compatPvr() : (int) org.boxtheta.javapower.core.Spr.PVR_POWER9);
         n.setString("device_type", "cpu");
-        n.setCell("reg", 0);
-        n.setCell("ibm,my-drc-index", Drc.Kind.CPU.base);
+        n.setCell("reg", id);
+        n.setCell("ibm,my-drc-index", Drc.Kind.CPU.base | id);
         return n;
     }
 

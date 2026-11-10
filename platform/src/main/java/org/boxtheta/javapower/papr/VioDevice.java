@@ -9,12 +9,17 @@ import org.boxtheta.javapower.core.PhysicalMemory;
  *
  * <p>The CRQ is a ring of 16-byte entries in guest memory, addressed through the device's DMA
  * window; byte 0 of an entry is the "valid" byte, 0 meaning free.
+ *
+ * <p>Threading: the CRQ, the signal state and everything a subclass does in {@link #handleCrq}
+ * and {@link #resetDevice} are guarded by the device lock ({@link #lock()}), which the machine
+ * takes around those calls; CPUs on different threads may call in concurrently.
  */
 public abstract class VioDevice {
     /** First unit address QEMU assigns. */
     public static final int REG_BASE = 0x71000000;
 
     protected Machine machine;
+    private final Object lock = new Object();
     private int reg;
     private int irq;
     private TceTable tce;
@@ -83,6 +88,11 @@ public abstract class VioDevice {
         return Xics.IRQ_VIO | idx;
     }
 
+    /** The device lock (see the class comment). */
+    final Object lock() {
+        return lock;
+    }
+
     public final int reg() {
         return reg;
     }
@@ -109,20 +119,24 @@ public abstract class VioDevice {
 
     /** Bus reset: shut down the CRQ and TCEs, clear signal state. */
     final void reset() {
-        quiesce();
-        signalState = 0;
-        if (tce != null) {
-            tce.setBypass(false);
+        synchronized (lock) {
+            quiesce();
+            signalState = 0;
+            if (tce != null) {
+                tce.setBypass(false);
+            }
+            resetDevice();
         }
-        resetDevice();
     }
 
     /** RTAS quiesce: free the CRQ and reset the TCE table (QEMU's spapr_vio_quiesce_one). */
     final void quiesce() {
-        if (tce != null) {
-            tce.clear();
+        synchronized (lock) {
+            if (tce != null) {
+                tce.clear();
+            }
+            freeCrq();
         }
-        freeCrq();
     }
 
     // ---- interrupts --------------------------------------------------------------------------

@@ -8,7 +8,7 @@
 set -e
 R=platform/src/test/resources/org/boxtheta/javapower/papr
 gradle -q :platform:test --tests org.boxtheta.javapower.papr.DeviceTreeTest
-for t in reset:pseries-min cas-linux:cas-linux cas-freebsd:cas-freebsd; do
+for t in reset:pseries-min cas-linux:cas-linux cas-freebsd:cas-freebsd reset-smp2:pseries-smp2 reset-smp4:pseries-smp4 cas-linux-smp2:cas-linux-smp2 cas-linux-smp4:cas-linux-smp4 cas-freebsd-smp2:cas-freebsd-smp2 cas-freebsd-smp4:cas-freebsd-smp4; do
     ours=${t%%:*}; ref=${t##*:}
     dtc -q -I dtb -O dts -o platform/build/dt/$ours.dts platform/build/dt/$ours.dtb
     dtc -q -I dtb -O dts -o platform/build/dt/$ref.ref.dts $R/$ref.dtb

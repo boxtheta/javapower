@@ -7,10 +7,16 @@ import java.util.Random;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.PhysicalMemory;
 
-/** Test harness: a machine, its CPU, and helpers to make hypercalls and RTAS calls. */
+/**
+ * Test harness: a machine, its CPUs, and helpers to make hypercalls and RTAS calls. Nothing runs
+ * the CPUs; a test "executes" on CPU n by calling the helpers with {@code cpus[n]}.
+ */
 final class Rig {
     final Machine m;
-    final CpuState cpu = new CpuState();
+    /** All CPUs; {@code cpus[i].index == i}. */
+    final CpuState[] cpus;
+    /** The boot CPU, {@code cpus[0]}. */
+    final CpuState cpu;
     final PhysicalMemory mem;
     final BufferCharBackend console;
 
@@ -34,22 +40,42 @@ final class Rig {
             throw new UncheckedIOException(e);
         }
         mem = m.memory();
-        m.attachCpu(cpu);
-        m.reset(cpu);
+        cpus = new CpuState[m.cpuCount()];
+        for (int i = 0; i < cpus.length; i++) {
+            cpus[i] = new CpuState();
+        }
+        cpu = cpus[0];
+        if (cpus.length == 1) {
+            m.attachCpu(cpu);
+            m.reset(cpu);
+        } else {
+            m.attachCpus(java.util.List.of(cpus));
+            m.reset();
+        }
+    }
+
+    /** A 256 MiB machine with {@code n} CPUs. */
+    static Rig smp(int n) {
+        return new Rig(new MachineConfig().ram(256L << 20).cpus(n));
     }
 
     Rig() {
         this(new MachineConfig().ram(256L << 20));
     }
 
-    /** Make hypercall {@code op} with r4.. = args; returns r3. */
+    /** Make hypercall {@code op} on the boot CPU with r4.. = args; returns r3. */
     long hcall(long op, long... args) {
-        cpu.gpr[3] = op;
+        return hcallOn(cpu, op, args);
+    }
+
+    /** Make hypercall {@code op} on CPU {@code c} with r4.. = args; returns r3. */
+    long hcallOn(CpuState c, long op, long... args) {
+        c.gpr[3] = op;
         for (int i = 0; i < 9; i++) {
-            cpu.gpr[4 + i] = i < args.length ? args[i] : 0;
+            c.gpr[4 + i] = i < args.length ? args[i] : 0;
         }
-        m.hcall(cpu);
-        return cpu.gpr[3];
+        m.hcall(c);
+        return c.gpr[3];
     }
 
     long r(int n) {
@@ -62,7 +88,15 @@ final class Rig {
     }
 
     int[] rtas(int token, int nret, int... args) {
-        long b = RTAS_BUF;
+        return rtasOn(cpu, RTAS_BUF, token, nret, args);
+    }
+
+    /** RTAS call made by CPU {@code c} with its argument block at {@code b}. */
+    int[] rtasOn(CpuState c, long b, String name, int nret, int... args) {
+        return rtasOn(c, b, token(name), nret, args);
+    }
+
+    int[] rtasOn(CpuState c, long b, int token, int nret, int... args) {
         mem.write32be(b, token);
         mem.write32be(b + 4, args.length);
         mem.write32be(b + 8, nret);
@@ -73,7 +107,7 @@ final class Rig {
         for (int i = 0; i < nret; i++) {
             mem.write32be(rets + 4L * i, 0xdeadbeef);
         }
-        long st = hcall(H.KVMPPC_H_RTAS, b);
+        long st = hcallOn(c, H.KVMPPC_H_RTAS, b);
         if (st != H.SUCCESS) {
             throw new AssertionError("H_RTAS returned " + st);
         }

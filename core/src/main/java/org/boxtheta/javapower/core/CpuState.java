@@ -88,6 +88,20 @@ public final class CpuState {
     public volatile boolean halted;
     /** Asks the run loop to return to its caller at the next instruction boundary. */
     public volatile boolean stopRequested;
+    /**
+     * Set by another CPU's H_PROD (any thread). Ends this CPU's H_CEDE / H_CONFER / wait idle: the
+     * run loop's idle wait must also return when it is set. The hypervisor consumes it (the next
+     * H_CEDE returns at once, like QEMU's per-vCPU {@code prod} flag) and clears it when the CPU
+     * resumes executing ({@link Hypervisor#cpuExecEnter}).
+     */
+    public volatile boolean prodded;
+    /**
+     * True while work posted with {@link #runOnCpu} may be waiting. The run loop polls it at
+     * instruction-chunk boundaries and while idle or halted, and then calls {@link #runPostedWork}.
+     */
+    public volatile boolean workPending;
+    private final java.util.concurrent.ConcurrentLinkedQueue<java.util.function.Consumer<CpuState>> work =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     /** Instructions retired since reset; the basis for virtual time. */
     public long icount;
@@ -108,6 +122,27 @@ public final class CpuState {
         Thread t = runner;
         if (t != null) {
             java.util.concurrent.locks.LockSupport.unpark(t);
+        }
+    }
+
+    /**
+     * Ask this CPU's own thread to run {@code w} at its next instruction boundary (QEMU's
+     * {@code async_run_on_cpu}): how another thread changes this CPU's plain fields (LPCR, PCR,
+     * {@code procTable}, a system reset interrupt) without racing the run loop. Safe from any
+     * thread; returns at once and wakes the CPU if it is parked.
+     */
+    public void runOnCpu(java.util.function.Consumer<CpuState> w) {
+        work.add(w);
+        workPending = true;
+        wake();
+    }
+
+    /** Run the work posted with {@link #runOnCpu}, in order. Call only on this CPU's own thread. */
+    public void runPostedWork() {
+        workPending = false;
+        java.util.function.Consumer<CpuState> w;
+        while ((w = work.poll()) != null) {
+            w.accept(this);
         }
     }
 

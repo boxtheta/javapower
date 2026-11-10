@@ -8,13 +8,20 @@ import java.util.Random;
 
 /**
  * Configuration of a {@link Machine}: the equivalent of QEMU's
- * {@code -M pseries,ic-mode=xics -cpu power9 -smp 1 -m <ram> -nodefaults} plus one spapr-vty, one
+ * {@code -M pseries,ic-mode=xics -cpu power9 -smp <cpus> -m <ram> -nodefaults} plus one spapr-vty, one
  * spapr-vscsi and its SCSI devices. Plain mutable fields with fluent setters; read once when the
  * machine is constructed.
  */
 public final class MachineConfig {
     /** Default firmware location (the stock SLOF image QEMU ships). */
     public static final Path DEFAULT_FIRMWARE = Path.of("/usr/share/qemu/slof.bin");
+    /**
+     * Most guest CPUs a machine may have. Each guest CPU is a host thread running in parallel, so
+     * the real limit is the host's core count; 64 is an arbitrary bound well above that for the
+     * hosts we run on. The device tree grows by about 660 bytes per CPU, far below its 2 MiB
+     * reservation and the 2 MiB CAS buffer SLOF provides.
+     */
+    public static final int MAX_CPUS = 64;
 
     /** One SCSI device on the v-scsi bus. */
     public static final class Disk {
@@ -88,6 +95,7 @@ public final class MachineConfig {
     }
 
     long ramSize = 2L << 30;
+    int cpus = 1;
     Path firmware = DEFAULT_FIRMWARE;
     byte[] firmwareImage;
     CharBackend console;
@@ -106,6 +114,18 @@ public final class MachineConfig {
     /** Guest RAM in bytes (a multiple of 256 MiB; the reference uses 2 GiB). */
     public MachineConfig ram(long bytes) {
         this.ramSize = bytes;
+        return this;
+    }
+
+    /**
+     * Number of guest CPUs, like QEMU's {@code -smp n}: n cores of one thread each, CPU (and
+     * interrupt server) numbers 0..n-1, CPU 0 boots. 1 .. {@link #MAX_CPUS}; default 1.
+     */
+    public MachineConfig cpus(int n) {
+        if (n < 1 || n > MAX_CPUS) {
+            throw new IllegalArgumentException("cpus must be 1.." + MAX_CPUS + ", got " + n);
+        }
+        this.cpus = n;
         return this;
     }
 

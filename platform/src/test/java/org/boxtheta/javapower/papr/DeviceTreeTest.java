@@ -23,6 +23,12 @@ import org.junit.jupiter.api.Test;
  * ({@code pseries-min.dtb}) and the trees H_CAS returned to openSUSE's and FreeBSD's
  * {@code ibm,client-architecture-support} calls (captured with {@code dumpdtb} right after CAS).
  *
+ * <p>The same three trees are also compared for {@code -smp 2} and {@code -smp 4}
+ * ({@code pseries-smpN.dtb}, {@code cas-linux-smpN.dtb}, {@code cas-freebsd-smpN.dtb}): the reset
+ * trees were dumped with the monitor's {@code dumpdtb} before the first instruction, the CAS trees
+ * by a QEMU 11.1 build instrumented to write the blob H_CAS returns, while openSUSE and FreeBSD
+ * booted with the reference command line plus {@code -smp N}.
+ *
  * <p>Two normalisations: {@code rng-seed} is random, and the order of the {@code ibm,drc-*}
  * arrays is QEMU's hash-table iteration order (we emit connectors sorted by index); both arrays
  * are compared as sets of (index, name, type, power-domain) tuples.
@@ -32,16 +38,21 @@ class DeviceTreeTest {
     static final long CAS_BUF = 0x400000;
     static final int CAS_BUF_SIZE = 0x100000;
 
-    private static Rig shared;
+    private static final java.util.Map<Integer, Rig> shared = new java.util.HashMap<>();
 
     /** A 2 GiB machine like the reference, shared by the tests and reset before each use. */
-    static synchronized Rig twoGig() {
-        if (shared == null) {
-            shared = new Rig(new MachineConfig().ram(2L << 30));
+    static Rig twoGig() {
+        return twoGig(1);
+    }
+
+    /** A 2 GiB machine with {@code cpus} CPUs, shared by the tests and reset before each use. */
+    static synchronized Rig twoGig(int cpus) {
+        Rig r = shared.computeIfAbsent(cpus, n -> new Rig(new MachineConfig().ram(2L << 30).cpus(n)));
+        for (org.boxtheta.javapower.core.CpuState c : r.cpus) {
+            c.stopRequested = false;
         }
-        shared.cpu.stopRequested = false;
-        shared.m.reset(shared.cpu);
-        return shared;
+        r.m.reset(r.cpu);
+        return r;
     }
 
     @Test
@@ -55,6 +66,53 @@ class DeviceTreeTest {
         Fdt.Node ours = Fdt.parse(blob);
         Fdt.Node ref = Fdt.parse(Rig.resource("pseries-min.dtb"));
         compare("", ref, ours);
+    }
+
+    @Test
+    void resetTreesForSmpMatchQemu() throws IOException {
+        for (int n : new int[] {2, 4}) {
+            Rig r = twoGig(n);
+            long fdt = r.m.fdtAddress();
+            byte[] blob = r.readBytes(fdt, r.mem.read32be(fdt + 4));
+            dump("reset-smp" + n + ".dtb", blob);
+            compare("", Fdt.parse(Rig.resource("pseries-smp" + n + ".dtb")), Fdt.parse(blob));
+        }
+    }
+
+    @Test
+    void casTreesForSmpMatchQemu() throws IOException {
+        for (int n : new int[] {2, 4}) {
+            Rig r = twoGig(n);
+            writeCasVector(r, true, LINUX_OV5);
+            byte[] blob = doCas(r);
+            dump("cas-linux-smp" + n + ".dtb", blob);
+            compare("", Fdt.parse(Rig.resource("cas-linux-smp" + n + ".dtb")), Fdt.parse(blob));
+
+            r = twoGig(n);
+            writeCasVector(r, false, FREEBSD_OV5);
+            blob = doCas(r);
+            dump("cas-freebsd-smp" + n + ".dtb", blob);
+            compare("", Fdt.parse(Rig.resource("cas-freebsd-smp" + n + ".dtb")), Fdt.parse(blob));
+        }
+    }
+
+    @Test
+    void secondaryCpusStartStopped() {
+        Rig r = twoGig(4);
+        assertEquals(0x100, r.cpu.pc);
+        assertTrue(!r.cpu.halted);
+        for (int i = 1; i < 4; i++) {
+            org.boxtheta.javapower.core.CpuState c = r.cpus[i];
+            assertEquals(i, c.index);
+            assertTrue(c.halted);
+            // Values read back from QEMU 11.1 (-smp 2, CPU 1 before the first instruction).
+            assertEquals(0x100, c.pc);
+            assertEquals(0x3000, c.msr);
+            assertEquals(0x20008L, c.spr[Spr.LPCR]);
+            assertEquals(0x100000L, c.spr[Machine.SPR_PSSCR]);
+            assertEquals(-1L, c.spr[Machine.SPR_AMOR]);
+            assertEquals(0, c.gpr[3]);
+        }
     }
 
     @Test
@@ -103,6 +161,14 @@ class DeviceTreeTest {
         return v;
     }
 
+    /**
+     * Linux asks for: DRCONF memory, FORM1+FORM2 affinity, hotplug events, HPT resize,
+     * dynamic-memory-v2, radix + GTSE, XICS; plus a few bits the machine does not offer.
+     */
+    static final byte[] LINUX_OV5 = ov5(1, 0x80, 2, 0x20, 5, 0xa0, 6, 0x05, 22, 0x80, 24, 0x40, 25, 0x80, 26, 0x40);
+    /** FreeBSD: radix + GTSE only (and it does not claim ISA 3.00 in OV1). */
+    static final byte[] FREEBSD_OV5 = ov5(24, 0x40, 26, 0x40);
+
     static byte[] doCas(Rig r) {
         long st = r.hcall(H.KVMPPC_H_CAS, CAS_VEC, CAS_BUF, CAS_BUF_SIZE);
         assertEquals(H.SUCCESS, st);
@@ -114,9 +180,7 @@ class DeviceTreeTest {
     @Test
     void casTreeForLinuxMatchesQemu() throws IOException {
         Rig r = twoGig();
-        // Linux asks for: DRCONF memory, FORM1+FORM2 affinity, hotplug events, HPT resize,
-        // dynamic-memory-v2, radix + GTSE, XICS; plus a few bits the machine does not offer.
-        writeCasVector(r, true, ov5(1, 0x80, 2, 0x20, 5, 0xa0, 6, 0x05, 22, 0x80, 24, 0x40, 25, 0x80, 26, 0x40));
+        writeCasVector(r, true, LINUX_OV5);
         byte[] blob = doCas(r);
         dump("cas-linux.dtb", blob);
         assertEquals(blob.length, Fdt.totalSize(blob));
@@ -127,8 +191,7 @@ class DeviceTreeTest {
     @Test
     void casTreeForFreeBsdMatchesQemu() throws IOException {
         Rig r = twoGig();
-        // FreeBSD: radix + GTSE only, and it does not claim ISA 3.00 in OV1.
-        writeCasVector(r, false, ov5(24, 0x40, 26, 0x40));
+        writeCasVector(r, false, FREEBSD_OV5);
         byte[] blob = doCas(r);
         dump("cas-freebsd.dtb", blob);
         compare("", Fdt.parse(Rig.resource("cas-freebsd.dtb")), Fdt.parse(blob));

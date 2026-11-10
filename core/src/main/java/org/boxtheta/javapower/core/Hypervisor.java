@@ -12,4 +12,19 @@ public interface Hypervisor {
      * Execution continues at the instruction after the {@code sc 1}.
      */
     void hcall(CpuState s);
+
+    /**
+     * The run loop of {@code s} stops executing instructions to idle or park (H_CEDE, a wait
+     * instruction, the RTAS stopped state). Called on that CPU's own thread. PAPR uses it to
+     * mark the vCPU preempted in its VPA dispatch counter, as QEMU's {@code cpu_exec_exit} hook does.
+     */
+    default void cpuExecExit(CpuState s) {
+    }
+
+    /**
+     * The run loop of {@code s} resumes executing instructions after idling or parking (and once
+     * when it first starts). Called on that CPU's own thread, before the first instruction.
+     */
+    default void cpuExecEnter(CpuState s) {
+    }
 }

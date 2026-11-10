@@ -14,6 +14,8 @@ import org.boxtheta.javapower.core.PhysicalMemory;
  * {@code token, nargs, nret, args[nargs], rets[nret]}, 32 bits each. Semantics follow QEMU's
  * hw/ppc/spapr_rtas.c and the RTAS handlers spread over spapr_rtc.c, spapr_events.c,
  * spapr_drc.c, spapr_vio.c, spapr_pci.c, spapr_nvram.c and xics_spapr.c.
+ *
+ * <p>Every call runs on the calling CPU's thread with the machine lock held.
  */
 final class Rtas {
     static final int TOKEN_BASE = 0x2000;
@@ -44,7 +46,6 @@ final class Rtas {
     private long rtcOffsetNs;
     private long fwnmiResetAddr = -1;
     private long fwnmiMceAddr = -1;
-    private boolean cpuQuiesced;
     private int ccsDepth;
 
     Rtas(Machine m) {
@@ -55,7 +56,6 @@ final class Rtas {
     void reset() {
         fwnmiResetAddr = -1;
         fwnmiMceAddr = -1;
-        cpuQuiesced = false;
         ccsDepth = 0;
     }
 
@@ -115,31 +115,33 @@ final class Rtas {
                 m.requestStop(Machine.ShutdownReason.REBOOT, "system-reboot");
                 st(rets, 0, SUCCESS);
             }
-            case 0x05 -> { // query-cpu-stopped-state
+            case 0x05 -> { // query-cpu-stopped-state: 0 stopped, 2 running
                 if (nargs != 1 || nret != 2) {
                     st(rets, 0, PARAM_ERROR);
                     break;
                 }
-                if (ld(args, 0) != 0) {
+                CpuState t = m.findCpu(ldu(args, 0));
+                if (t == null) {
                     st(rets, 0, PARAM_ERROR);
                     break;
                 }
-                st(rets, 1, cpuQuiesced ? 0 : 2);
+                st(rets, 1, t.halted ? 0 : 2);
                 st(rets, 0, SUCCESS);
             }
-            case 0x06 -> { // start-cpu
+            case 0x06 -> { // start-cpu(id, start address, r3)
                 if (nargs != 3 || nret != 1) {
                     st(rets, 0, PARAM_ERROR);
                     break;
                 }
-                // The only CPU is the caller, so it is never halted.
-                st(rets, 0, ld(args, 0) == 0 ? HW_ERROR : PARAM_ERROR);
+                CpuState t = m.findCpu(ldu(args, 0));
+                if (t == null) {
+                    st(rets, 0, PARAM_ERROR);
+                    break;
+                }
+                st(rets, 0, m.startCpu(s, t, ldu(args, 1), ldu(args, 2)) ? SUCCESS : HW_ERROR);
             }
-            case 0x07 -> { // stop-self
-                PaprLog.warn("stop-self on the only CPU; it will idle until interrupted");
-                cpuQuiesced = true;
-                s.ceded = true;
-            }
+            case 0x07 -> // stop-self: no return words; the CPU stops until start-cpu
+                    m.stopSelf(s);
             case 0x08 -> getSystemParameter(args, rets);
             case 0x09 -> {
                 int p = ld(args, 0);
@@ -273,8 +275,9 @@ final class Rtas {
         int r;
         switch (param) {
             case 20 -> { // SPLPAR characteristics
-                String v = String.format("MaxEntCap=%d,DesMem=%d,DesProcs=%d,MaxPlatProcs=%d", 1,
-                        m.config().ramSize >>> 20, 1, 1);
+                int n = m.cpuCount();
+                String v = String.format("MaxEntCap=%d,DesMem=%d,DesProcs=%d,MaxPlatProcs=%d", n,
+                        m.config().ramSize >>> 20, n, n);
                 byte[] b = (v + "\0").getBytes(StandardCharsets.US_ASCII);
                 r = sysparmStore(buffer, length, b);
             }

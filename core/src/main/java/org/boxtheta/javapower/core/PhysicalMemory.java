@@ -14,6 +14,20 @@ import java.nio.ByteOrder;
  * <p>Shared by the CPUs and by device models doing DMA. Plain accesses are not synchronised and
  * only as atomic as the host makes aligned accesses of their size; the {@code cas*} methods are
  * atomic read-modify-writes for store-conditional and atomic memory operations.
+ *
+ * <h2>Code-write tracking</h2>
+ * Execution engines that translate guest code ahead of executing it need to know when that code
+ * changes. Every 4 KiB page has a <em>code generation</em>: an engine about to translate code
+ * from a page calls {@link #watchCode}, which flags the page and returns its generation, and
+ * keeps its translation only while {@link #codeGeneration} still returns that value. Every write
+ * through this class (the plain accessors, {@link #write}, {@link #fill} and the
+ * compare-and-swaps) to a flagged page advances its generation and clears the flag; so does
+ * {@link #invalidateCode}, which engines call for writes they make to the segment directly and
+ * for instruction-cache invalidations. A write racing with a {@code watchCode} on another thread
+ * may go unnoticed, exactly as a store by another processor may: the guest's own
+ * cross-modification protocol ({@code icbi}, then a context-synchronising instruction on the
+ * executing CPU) is what makes the new code visible, and engines implement {@code icbi} with
+ * {@link #invalidateCode}.
  */
 public final class PhysicalMemory {
     private static final ValueLayout.OfShort S_BE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
@@ -25,10 +39,19 @@ public final class PhysicalMemory {
 
     private final MemorySegment ram;
     private final long size;
+    /** Per 4 KiB page: nonzero while some engine holds code translated from it (see the class comment). */
+    private final byte[] codePages;
+    /** Per 4 KiB page: the code generation. */
+    private final int[] codeGens;
+    /** Advanced after every advance of any page's code generation (see {@link #codeWriteCount}). */
+    private final java.util.concurrent.atomic.AtomicInteger codeWrites = new java.util.concurrent.atomic.AtomicInteger();
 
     public PhysicalMemory(long size) {
         this.size = size;
         this.ram = Arena.ofAuto().allocate(size, 4096);
+        int pages = (int) Math.min(Integer.MAX_VALUE - 8, (size + 4095) >>> CODE_PAGE_SHIFT);
+        this.codePages = new byte[pages];
+        this.codeGens = new int[pages];
     }
 
     public long size() {
@@ -52,13 +75,13 @@ public final class PhysicalMemory {
     public long read64be(long a) { return ram.get(L_BE, a); }
     public long read64le(long a) { return ram.get(L_LE, a); }
 
-    public void write8(long a, int v) { ram.set(ValueLayout.JAVA_BYTE, a, (byte) v); }
-    public void write16be(long a, int v) { ram.set(S_BE, a, (short) v); }
-    public void write16le(long a, int v) { ram.set(S_LE, a, (short) v); }
-    public void write32be(long a, int v) { ram.set(I_BE, a, v); }
-    public void write32le(long a, int v) { ram.set(I_LE, a, v); }
-    public void write64be(long a, long v) { ram.set(L_BE, a, v); }
-    public void write64le(long a, long v) { ram.set(L_LE, a, v); }
+    public void write8(long a, int v) { ram.set(ValueLayout.JAVA_BYTE, a, (byte) v); wrote(a, 1); }
+    public void write16be(long a, int v) { ram.set(S_BE, a, (short) v); wrote(a, 2); }
+    public void write16le(long a, int v) { ram.set(S_LE, a, (short) v); wrote(a, 2); }
+    public void write32be(long a, int v) { ram.set(I_BE, a, v); wrote(a, 4); }
+    public void write32le(long a, int v) { ram.set(I_LE, a, v); wrote(a, 4); }
+    public void write64be(long a, long v) { ram.set(L_BE, a, v); wrote(a, 8); }
+    public void write64le(long a, long v) { ram.set(L_LE, a, v); wrote(a, 8); }
 
     public void read(long addr, byte[] dst, int off, int len) {
         MemorySegment.copy(ram, ValueLayout.JAVA_BYTE, addr, dst, off, len);
@@ -66,10 +89,106 @@ public final class PhysicalMemory {
 
     public void write(long addr, byte[] src, int off, int len) {
         MemorySegment.copy(src, off, ram, ValueLayout.JAVA_BYTE, addr, len);
+        if (len > 0) {
+            wroteRange(addr, len);
+        }
     }
 
     public void fill(long addr, long len, byte value) {
         ram.asSlice(addr, len).fill(value);
+        if (len > 0) {
+            wroteRange(addr, len);
+        }
+    }
+
+    // ---- code-write tracking (see the class comment) ------------------------------------------
+
+    /** log2 of the code-write tracking granule (4 KiB). */
+    public static final int CODE_PAGE_SHIFT = 12;
+    private static final java.lang.invoke.VarHandle CODE_PAGE =
+            java.lang.invoke.MethodHandles.arrayElementVarHandle(byte[].class);
+    private static final java.lang.invoke.VarHandle CODE_GEN =
+            java.lang.invoke.MethodHandles.arrayElementVarHandle(int[].class);
+
+    /**
+     * Flag the page holding real address {@code addr} as holding translated code and return its
+     * code generation. Call before reading the code to translate; the translation is current
+     * while {@link #codeGeneration} returns the value returned here. A full fence: the flag is
+     * visible to other threads before any later read of the code.
+     */
+    public int watchCode(long addr) {
+        int p = (int) (addr >>> CODE_PAGE_SHIFT);
+        CODE_PAGE.setVolatile(codePages, p, (byte) 1);
+        java.lang.invoke.VarHandle.fullFence();
+        return (int) CODE_GEN.getVolatile(codeGens, p);
+    }
+
+    /** The code generation of the page holding real address {@code addr} (a plain read). */
+    public int codeGeneration(long addr) {
+        return codeGens[(int) (addr >>> CODE_PAGE_SHIFT)];
+    }
+
+    /**
+     * A counter advanced after every advance of any page's code generation. While it has not
+     * changed, no page's generation has: an engine that checked its code against the page
+     * generations when the counter had some value may skip the check while it still has it.
+     * A volatile read.
+     */
+    public int codeWriteCount() {
+        return codeWrites.get();
+    }
+
+    /** Whether the page holding real address {@code addr} is flagged as holding translated code. */
+    public boolean isCodePage(long addr) {
+        return codePages[(int) (addr >>> CODE_PAGE_SHIFT)] != 0;
+    }
+
+    /**
+     * Advance the code generation of every page that {@code [addr, addr + len)} touches, flagged
+     * or not, and clear their flags: translations of code in them are no longer current. For
+     * writes made to {@link #segment} directly and for instruction-cache invalidation.
+     */
+    public void invalidateCode(long addr, long len) {
+        if (len <= 0) {
+            return;
+        }
+        int last = (int) ((addr + len - 1) >>> CODE_PAGE_SHIFT);
+        for (int p = (int) (addr >>> CODE_PAGE_SHIFT); p <= last; p++) {
+            codePages[p] = 0;
+            CODE_GEN.getAndAdd(codeGens, p, 1);
+        }
+        codeWrites.incrementAndGet();
+    }
+
+    /** After a write of {@code n} (1..8) bytes at {@code a}: advance the generation of flagged pages. */
+    private void wrote(long a, int n) {
+        byte[] cp = codePages;
+        int p0 = (int) (a >>> CODE_PAGE_SHIFT);
+        int p1 = (int) ((a + n - 1) >>> CODE_PAGE_SHIFT);
+        if ((cp[p0] | cp[p1]) != 0) {
+            codeWritten(p0, p1);
+        }
+    }
+
+    private void wroteRange(long a, long len) {
+        byte[] cp = codePages;
+        int last = (int) ((a + len - 1) >>> CODE_PAGE_SHIFT);
+        for (int p = (int) (a >>> CODE_PAGE_SHIFT); p <= last; p++) {
+            if (cp[p] != 0) {
+                codeWritten(p, last);
+                return;
+            }
+        }
+    }
+
+    private void codeWritten(int first, int last) {
+        for (int p = first; p <= last; p++) {
+            if (codePages[p] != 0) {
+                codePages[p] = 0;
+                CODE_GEN.getAndAdd(codeGens, p, 1);
+            }
+        }
+        codeWrites.incrementAndGet();
     }
 
     // ---- atomic compare-and-swap, for store-conditional and atomic memory operations ----------
@@ -94,11 +213,19 @@ public final class PhysicalMemory {
     }
 
     private boolean casRaw32(long a, int expectRaw, int updateRaw) {
-        return (boolean) I_VH.compareAndSet(ram, a, expectRaw, updateRaw);
+        boolean ok = (boolean) I_VH.compareAndSet(ram, a, expectRaw, updateRaw);
+        if (ok) {
+            wrote(a, 4);
+        }
+        return ok;
     }
 
     private boolean casRaw64(long a, long expectRaw, long updateRaw) {
-        return (boolean) L_VH.compareAndSet(ram, a, expectRaw, updateRaw);
+        boolean ok = (boolean) L_VH.compareAndSet(ram, a, expectRaw, updateRaw);
+        if (ok) {
+            wrote(a, 8);
+        }
+        return ok;
     }
 
     public boolean cas32be(long a, int expect, int update) {

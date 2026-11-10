@@ -34,6 +34,12 @@ final class Asm {
         return emit(18 << 26);
     }
 
+    /** Branch and link. */
+    Asm bl(String l) {
+        fixups.add(new Object[] {words.size(), l, 0});
+        return emit((18 << 26) | 1);
+    }
+
     Asm bc(int bo, int bi, String l) {
         fixups.add(new Object[] {words.size(), l, 1});
         return emit((16 << 26) | (bo << 21) | (bi << 16));

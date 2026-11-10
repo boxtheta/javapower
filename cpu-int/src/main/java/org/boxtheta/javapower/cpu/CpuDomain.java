@@ -46,6 +46,16 @@ public final class CpuDomain {
     /** Serialises the quadword and two-location atomic operations (see LoadStore). */
     final Object wideAtomicLock = new Object();
 
+    /**
+     * Compiled code shared by the CPUs: entries are keyed by real address, mode and tier (see
+     * {@link Interpreter.Code}) and validated against the page's code generation by every user,
+     * so code compiled by one CPU, or for one process, serves all. Bounded: when it reaches
+     * {@link #MAX_SHARED_CODE} entries it is emptied (CPUs keep the code they hold).
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Long, Interpreter.Code> compiledCode =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    static final int MAX_SHARED_CODE = 1 << 17;
+
     final LongAdder shootdowns = new LongAdder();
     final LongAdder shootdownWaitNs = new LongAdder();
 
@@ -179,6 +189,32 @@ public final class CpuDomain {
         if (t0 != 0) {
             shootdownWaitNs.add(System.nanoTime() - t0);
         }
+    }
+
+    Interpreter.Code findCode(long key) {
+        return compiledCode.get(key);
+    }
+
+    /** Publish {@code c} under {@code key}; returns the code already there if another CPU won the race. */
+    Interpreter.Code publishCode(long key, Interpreter.Code c) {
+        if (compiledCode.size() >= MAX_SHARED_CODE) {
+            compiledCode.clear();
+        }
+        Interpreter.Code prev = compiledCode.putIfAbsent(key, c);
+        return prev != null ? prev : c;
+    }
+
+    void replaceCode(long key, Interpreter.Code old, Interpreter.Code c) {
+        compiledCode.replace(key, old, c);
+    }
+
+    void dropCode(long key, Interpreter.Code c) {
+        compiledCode.remove(key, c);
+    }
+
+    /** Number of compiled code entries shared by the CPUs (statistics). */
+    public int sharedCodeEntries() {
+        return compiledCode.size();
     }
 
     /** For tests and diagnostics: per-CPU acknowledged TLB generations. */

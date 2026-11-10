@@ -76,7 +76,8 @@ and output) are ready-made console backends.
 ```
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
-    [--max-insns n] [--log-interrupts] [--status-secs n]
+    [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
+    [--no-code-sharing]
 ```
 
 | Flag | Meaning |
@@ -92,6 +93,8 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--max-insns n` | Stop after CPU 0 has executed `n` instructions |
 | `--log-interrupts` | Print every interrupt to stderr |
 | `--status-secs n` | Print per-CPU progress to stderr every `n` seconds |
+| `--jit off\|blocks\|regions` | Compile hot guest code to JVM bytecode: not at all, basic blocks only, or blocks plus whole-page regions (default `regions`) |
+| `--no-code-sharing` | Compile code separately for each CPU and address space instead of sharing it |
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr.

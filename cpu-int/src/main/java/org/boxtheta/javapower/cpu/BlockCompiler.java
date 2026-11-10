@@ -8,7 +8,9 @@ import static java.lang.constant.ConstantDescs.INIT_NAME;
 import static java.lang.constant.ConstantDescs.MTD_void;
 
 import java.lang.classfile.ClassFile;
+import java.lang.classfile.CodeBuilder;
 import java.lang.classfile.Label;
+import java.lang.classfile.TypeKind;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.DynamicConstantDesc;
@@ -27,6 +29,10 @@ import org.boxtheta.javapower.core.Op;
  * same handler the interpreter would (this module's handlers by direct static call, others
  * through their {@link Op}, held as a constant), with the instruction word as a constant. The JIT
  * then inlines the handlers and folds the decoded fields.
+ *
+ * <p>The code does not depend on the block's effective address: it reads it from {@code s.pc} on
+ * entry, so one compiled block serves every address its real address is mapped at (any CPU, any
+ * process).
  *
  * <p>For instruction {@code k} at address {@code pc} the generated code does what one run-loop
  * iteration does: {@code s.pc = pc; s.npc = pc + 4} (masked to the computation mode the block was
@@ -106,6 +112,17 @@ final class BlockCompiler {
         return op instanceof Reg.Local ? 0 : CONT | STORE | FOREIGN;
     }
 
+    /** Push {@code (base + off) & mask} (a long), base being a long local. */
+    private static void address(CodeBuilder cob, int base, long off, long mask) {
+        cob.lload(base);
+        if (off != 0) {
+            cob.loadConstant(off).ladd();
+            if (mask != -1L) {
+                cob.loadConstant(mask).land();
+            }
+        }
+    }
+
     /**
      * Generate the block for the {@code n} instructions {@code words}, decoded to dispatch slots
      * {@code slots}, starting at effective address {@code ea}. {@code pcMask} is the run loop's
@@ -121,16 +138,20 @@ final class BlockCompiler {
                     .invokespecial(CD_BASE, INIT_NAME, MTD_void)
                     .return_());
             clb.withMethodBody("run", MTD_RUN, ClassFile.ACC_FINAL, cob -> {
+                int base = cob.allocateLocal(TypeKind.LONG);
+                cob.aload(1).getfield(CD_CPU, "pc", CD_long).lstore(base);
                 Label start = cob.newLabel();
                 Label end = cob.newLabel();
                 Label exit = cob.newLabel();
                 Label fault = cob.newLabel();
                 cob.labelBinding(start);
                 for (int k = 0; k < n; k++) {
-                    long pc = ea + 4L * k;
-                    long npc = (pc + 4) & pcMask;
-                    cob.aload(1).loadConstant(pc).putfield(CD_CPU, "pc", CD_long);
-                    cob.aload(1).loadConstant(npc).putfield(CD_CPU, "npc", CD_long);
+                    cob.aload(1);
+                    address(cob, base, 4L * k, pcMask);
+                    cob.putfield(CD_CPU, "pc", CD_long);
+                    cob.aload(1);
+                    address(cob, base, 4L * k + 4, pcMask);
+                    cob.putfield(CD_CPU, "npc", CD_long);
                     int slot = slots[k];
                     if (slot < Interpreter.INLINE_HANDLERS.length) {
                         String h = Interpreter.INLINE_HANDLERS[slot];
@@ -155,7 +176,9 @@ final class BlockCompiler {
                                     .ifne(exit);
                         }
                         if ((f & FOREIGN) != 0) {
-                            cob.aload(1).getfield(CD_CPU, "npc", CD_long).loadConstant(npc).lcmp().ifne(exit);
+                            cob.aload(1).getfield(CD_CPU, "npc", CD_long);
+                            address(cob, base, 4L * k + 4, pcMask);
+                            cob.lcmp().ifne(exit);
                         }
                     }
                 }
@@ -165,7 +188,8 @@ final class BlockCompiler {
                 cob.aload(1).aload(1).getfield(CD_CPU, "npc", CD_long).putfield(CD_CPU, "pc", CD_long);
                 cob.loadConstant(CompiledBlock.CONTINUE).ireturn();
                 cob.labelBinding(fault);
-                cob.astore(3).aload(2).aload(3).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
+                int ex = cob.allocateLocal(TypeKind.REFERENCE);
+                cob.astore(ex).aload(2).aload(ex).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
                 cob.loadConstant(CompiledBlock.FAULTED).ireturn();
                 cob.exceptionCatch(start, end, fault, CD_PPCEX);
             });

@@ -75,7 +75,7 @@ public final class RadixMmu implements GuestMemory {
     static final long MC_SRR1_FETCH = (1L << (63 - 36)) | (1L << (63 - 44)) | (1L << (63 - 45));
     static final long MC_DSISR_LOAD = 1L << (63 - 57);
 
-    private static final int TLB_BITS = 10;
+    static final int TLB_BITS = 10;
     private static final int TLB_SIZE = 1 << TLB_BITS;
     private static final int EPOCH_MASK = 0xfff;
     private static final long PAGE_MASK = ~0xfffL;
@@ -89,10 +89,10 @@ public final class RadixMmu implements GuestMemory {
     private final long ramSize;
 
     /** Tags and addends, indexed by ((ctx * 3 + type) << TLB_BITS) | (vpn & mask). */
-    private final long[] tag = new long[4 * 3 * TLB_SIZE];
-    private final long[] addend = new long[4 * 3 * TLB_SIZE];
+    final long[] tag = new long[4 * 3 * TLB_SIZE];
+    final long[] addend = new long[4 * 3 * TLB_SIZE];
     /** Per-context epoch (1..4095) folded into the low 12 bits of every tag. */
-    private final int[] epoch = {1, 1, 1, 1};
+    final int[] epoch = {1, 1, 1, 1};
 
     /** A tlbie/tlbiel/slbia is waiting for a context-synchronising event. */
     private boolean flushPending;
@@ -134,6 +134,15 @@ public final class RadixMmu implements GuestMemory {
         for (int c = 0; c < 4; c++) {
             bump(c);
         }
+    }
+
+    /**
+     * PIDR changed: drop the translations of quadrant 0 (the only ones that use PIDR). Quadrant 3
+     * translations use PID 0 and stay. A pending tlbie flush stays pending.
+     */
+    public void flushProcess() {
+        bump(0); // MSR[PR]=0, quadrant 0
+        bump(2); // MSR[PR]=1, quadrant 0
     }
 
     /** tlbie / tlbiel / slbia: invalidate at the next context-synchronising event. */
@@ -459,6 +468,17 @@ public final class RadixMmu implements GuestMemory {
         } else {
             pm.write64be(pa, v);
         }
+    }
+
+    /**
+     * dcbz: zero the 128-byte block at {@code ea} (aligned, already truncated). One translation
+     * (as the block's first doubleword store would make; the block never crosses a page) and one
+     * fill; faults exactly as the first of sixteen doubleword stores would.
+     */
+    void zeroBlock(long ea) {
+        long pa = xlate(ea, STORE, 8);
+        guard(pa, 128);
+        pm.fill(pa, 128, (byte) 0);
     }
 
     /** A store made directly to physical memory (store-conditional, atomics): see {@link #guardHi}. */

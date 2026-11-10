@@ -267,7 +267,7 @@ final class SprAccess {
                 if (nv != s.spr[Spr.PIDR]) {
                     s.spr[Spr.PIDR] = nv;
                     Interpreter in = Interpreter.of(s);
-                    in.mmu.flushAll();
+                    in.mmu.flushProcess(); // quadrant 3 does not use PIDR
                     in.recheck = true;
                 }
             }

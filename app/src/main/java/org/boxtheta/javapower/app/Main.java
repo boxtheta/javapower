@@ -25,7 +25,7 @@ public final class Main {
 
     private static final String USAGE = "usage: javapower [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]"
             + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
-            + " [--max-insns n] [--log-interrupts] [--status-secs n]";
+            + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
@@ -37,6 +37,8 @@ public final class Main {
         int smp = 1;
         boolean logInterrupts = false;
         int statusSecs = 0;
+        String jit = "regions";
+        boolean shareCode = true;
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
@@ -52,6 +54,13 @@ public final class Main {
                     case "--max-insns" -> maxInsns = Long.parseLong(args[++i]);
                     case "--log-interrupts" -> logInterrupts = true;
                     case "--status-secs" -> statusSecs = Integer.parseInt(args[++i]);
+                    case "--jit" -> {
+                        jit = args[++i];
+                        if (!jit.equals("off") && !jit.equals("blocks") && !jit.equals("regions")) {
+                            throw new IllegalArgumentException("--jit takes off, blocks or regions");
+                        }
+                    }
+                    case "--no-code-sharing" -> shareCode = false;
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
@@ -75,6 +84,10 @@ public final class Main {
             for (Interpreter interp : emu.interpreters()) {
                 int n = interp.state().index;
                 interp.icountShift = icountShift;
+                // Compilation tiers (for debugging; results are identical either way).
+                interp.compileBlocks = !jit.equals("off");
+                interp.compileRegions = jit.equals("regions");
+                interp.shareCode = shareCode;
                 interp.unimplementedHook = (s, pc, insn, key) -> System.err.printf(
                         "[cpu%d] unimplemented %s insn=%08x pc=%x msr=%x%n", n, key, insn, pc, s.msr);
                 if (logInterrupts) {

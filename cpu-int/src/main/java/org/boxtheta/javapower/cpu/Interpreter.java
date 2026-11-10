@@ -45,12 +45,16 @@ import org.boxtheta.javapower.core.Spr;
  * <p>This module's own handlers are executed inline from a switch in the run loop (see
  * {@link Reg}), so the JIT can inline them; other handlers are called through {@link Op#exec}.
  *
- * <p>Hot straight-line runs of guest code are translated to JVM bytecode ({@link BlockCompiler},
- * on by default, see {@link #compileBlocks}). A compiled block runs only where it is exactly
- * equivalent to interpreting: its code words are compared with memory on every entry, it runs
- * only if it fits before the end of the current chunk, and it stops early after a store into its
- * own code. Results, instruction counts and interrupt timing are therefore identical with and
- * without it.
+ * <p>Hot guest code is translated to JVM bytecode in two tiers (on by default, see
+ * {@link #compileBlocks}): straight-line blocks that call the instruction handlers
+ * ({@link BlockCompiler}), and, for entries that stay hot, regions of a page with guest registers in
+ * JVM locals and inline memory access ({@link RegionCompiler}). Compiled code runs only where it
+ * is exactly equivalent to interpreting: its page's code generation (see
+ * {@link PhysicalMemory#watchCode}) must not have changed since its words were last checked
+ * (otherwise they are compared again), its first block must fit before the end of the current
+ * chunk, and it stops early after a store into its own code. Results, instruction counts and
+ * interrupt timing are therefore identical with and without it. Compiled code does not depend on
+ * its effective address and is shared by the CPUs of a domain ({@link #shareCode}).
  *
  * <p>Asynchronous interrupts (external, decrementer) are checked between chunks of at most
  * {@value #CHUNK} instructions and whenever an instruction changes state that affects them
@@ -58,14 +62,16 @@ import org.boxtheta.javapower.core.Spr;
  *
  * <h2>Several CPUs</h2>
  * A multi-CPU machine has one interpreter per CPU, all built on one {@link CpuDomain} (shared
- * memory, timebase and TLB invalidation), each run by its own host thread. Everything an
- * interpreter caches (decode caches, compiled blocks, TLB) is private to it and touched only by
- * its thread. Guest memory is shared without locks: loads and stores are plain host accesses,
+ * memory, timebase and TLB invalidation), each run by its own host thread. What an interpreter
+ * caches (decode caches, its table of compiled entries, TLB) is private to it and touched only by
+ * its thread; compiled code itself is immutable and shared through the domain. Guest memory is
+ * shared without locks: loads and stores are plain host accesses,
  * the guest's barriers are host fences, and store-conditional and the atomic memory operations
- * are host compare-and-swaps (see {@link LoadStore}). Another CPU's stores to code are seen at
- * once by the interpreter (it compares the fetched word) and by compiled blocks at their next
- * entry, which is at the latest the next context-synchronising instruction or interrupt: blocks
- * never span one.
+ * are host compare-and-swaps (see {@link LoadStore}). Another CPU's stores to code (and device
+ * DMA) are seen at once by the interpreter (it compares the fetched word) and by compiled code at
+ * its next entry, which is at the latest the next context-synchronising instruction or interrupt:
+ * compiled code never spans one. A store that races with another CPU's compile of the same page
+ * may go unnoticed until the guest's {@code icbi}, as the architecture allows.
  */
 public final class Interpreter {
     /** Timebase frequency (Hz), as in the reference device tree. */
@@ -139,6 +145,7 @@ public final class Interpreter {
 
     final CpuState s;
     final RadixMmu mmu;
+    private final PhysicalMemory pm;
     private final MemorySegment seg;
     private final DecodeTable table;
     private final Clock clock;
@@ -184,7 +191,8 @@ public final class Interpreter {
     public volatile UnimplementedHook unimplementedHook;
 
     private final Map<String, LongAdder> unimplemented = new ConcurrentHashMap<>();
-    private final Op unimplementedOp = this::unimplemented;
+    /** Handler of instructions without one; static so compiled code that calls it can be shared. */
+    private static final Op UNIMPLEMENTED_OP = (st, insn) -> Interpreter.of(st).unimplemented(st, insn);
 
     // Decrementer: DEC = decNext - TB. Pending is level-triggered and latched (QEMU book3s model):
     // raised when DEC reaches 0 or a negative value is written, lowered when a non-negative
@@ -205,7 +213,8 @@ public final class Interpreter {
     long decodes;
 
     // Run-loop state for the current chunk (see chunk()).
-    private long chunkEnd;
+    /** icount at which the current chunk ends; read by compiled regions for their budget checks. */
+    long chunkEnd;
     private boolean fetchLe;
     private long pcMask;
     private TraceHook hook;
@@ -230,6 +239,7 @@ public final class Interpreter {
     public Interpreter(CpuState s, CpuDomain domain, DecodeTable table) {
         PhysicalMemory mem = domain.memory();
         this.s = s;
+        this.pm = mem;
         this.seg = mem.segment();
         this.table = table;
         this.domain = domain;
@@ -571,7 +581,7 @@ public final class Interpreter {
         hook = trace;
         fetchPage = -1;
         jitOn = compileBlocks && hook == null;
-        blockMode = (fetchLe ? 1 : 0) | (pcMask == -1L ? 2 : 0);
+        blockMode = RegionCompiler.mode(s.msr);
         // Whether pc may start a compiled block: true at a branch target and after a block.
         boolean blockStart = true;
         while (true) {
@@ -784,42 +794,107 @@ public final class Interpreter {
 
     /** {@link #runBlock} result: no compiled block was run. */
     private static final int NO_BLOCK = -1;
-    private static final int BLOCK_TABLE_BITS = 14;
+    private static final int BLOCK_TABLE_BITS = 17;
 
     /**
-     * Translate straight-line runs of hot guest code to JVM bytecode (see {@link BlockCompiler}).
-     * Compiled blocks behave exactly like the interpreter; this only trades compile time for speed.
-     * Not used while a {@link #trace} hook is installed.
+     * Translate hot guest code to JVM bytecode. Compiled code behaves exactly like the
+     * interpreter; this only trades compile time for speed. Not used while a {@link #trace} hook
+     * is installed. Off: everything is interpreted (both tiers below are off).
      */
     public volatile boolean compileBlocks = true;
-    /** Executions of a block's entry before it is compiled (tests use 1). */
-    int blockThreshold = 10_000;
+    /**
+     * Second tier (see {@link RegionCompiler}): compile whole regions of a page with guest
+     * registers in JVM locals and inline memory access. Off: hot code is compiled by the first
+     * tier only ({@link BlockCompiler}: straight-line blocks calling the instruction handlers).
+     */
+    public volatile boolean compileRegions = true;
+    /**
+     * Executions of a block's entry before it is compiled (tests use 1). Compiled code costs JVM
+     * compile time and instruction-cache footprint; kernels and userland run a flat profile of
+     * thousands of warm blocks, where compiling less is faster (measured on both guests).
+     */
+    int blockThreshold = 20_000;
+    /**
+     * Executions of a block's entry before it is compiled as a second-tier region. At or below
+     * {@link #blockThreshold}, hot entries become regions directly; above it, they first run as
+     * first-tier blocks (cheap to compile) and are promoted when they reach this count.
+     */
+    int regionThreshold = 200_000;
+    /** Largest region, in instructions (smaller regions compile faster; see {@link RegionCompiler#MAX_INSNS}). */
+    int regionMaxInsns = 64;
+    /**
+     * Share compiled code with the other CPUs of the {@link CpuDomain} (see
+     * {@link CpuDomain#compiledCode}). Off: this CPU compiles everything it runs itself.
+     */
+    public volatile boolean shareCode = true;
     /** Statistics, for tests and tuning. */
     long blocksCompiled;
     long blocksRun;
+    long regionsCompiled;
+    long regionInsns;
+    long revalidations;
+    /** Compiled code found in the domain's cache instead of being compiled. */
+    long sharedHits;
+    /** Compiles of code (real address, mode, tier) this CPU had compiled before. */
+    long dupCompiles;
+    private final java.util.Set<Long> compiledAt = new java.util.HashSet<>();
 
     private boolean jitOn;
-    /** Block key bits for the current chunk: MSR[LE] (fetch order) and MSR[SF] (address mask). */
+    /** Block key bits for the current chunk: the MSR bits compiled code depends on (RegionCompiler.mode). */
     private int blockMode;
     private final Block[] blocks = new Block[1 << BLOCK_TABLE_BITS];
     /** Execution counts of block entries without a table entry, by table index (collisions add up). */
     private final int[] heat = new int[1 << BLOCK_TABLE_BITS];
 
-    /** A hot block entry: its compiled code and the words it was built from. */
+    /**
+     * Compiled code for one entry point (real address, mode, tier) and the code words it was
+     * built from. Immutable but for {@link #gen}; shared by the CPUs of a domain (see
+     * {@link CpuDomain#compiledCode}). The code does not depend on the effective address it
+     * runs at.
+     */
+    static final class Code {
+        final CompiledBlock run;
+        final boolean region;
+        final long pa;
+        /** First tier: the number of instructions; region: the length of its entry block. */
+        final int n;
+        /** First tier: the real address just past the block (the store guard's end). */
+        final long paEnd;
+        /** The words the code covers, as raw memory (native-order ints) from rawPa. */
+        final long rawPa;
+        final int[] rawWords;
+        /** Code generation of the page when the words were last known to be current. */
+        volatile int gen;
+        /**
+         * {@link PhysicalMemory#codeWriteCount} when the code was last found current: while it
+         * still has this value, no page's generation has changed and the check can be skipped.
+         */
+        volatile int checkedAt = -1;
+
+        Code(CompiledBlock run, boolean region, long pa, int n, long paEnd, long rawPa, int[] rawWords, int gen) {
+            this.run = run;
+            this.region = region;
+            this.pa = pa;
+            this.n = n;
+            this.paEnd = paEnd;
+            this.rawPa = rawPa;
+            this.rawWords = rawWords;
+            this.gen = gen;
+        }
+    }
+
+    /** A hot block entry of this CPU (effective and real address, mode) and its compiled code. */
     private static final class Block {
         final long ea;
         final long pa;
         final int mode;
         int count;
-        CompiledBlock code;
-        int[] words;
-        /** Number of instructions, and the real address just past them. */
-        int n;
-        long paEnd;
-        /** The code as raw memory: words in pairs (native-order longs), then an odd last word. */
-        long[] raw;
-        int rawTail;
+        Code code;
         boolean uncompilable;
+        /** Region compilation failed or is not wanted for this entry. */
+        boolean noRegion;
+        /** Runs of the first-tier code, counting towards promotion to a region. */
+        int hot;
 
         Block(long ea, long pa, int mode) {
             this.ea = ea;
@@ -828,96 +903,242 @@ public final class Interpreter {
         }
     }
 
+    /** Key of compiled code in the domain's cache: real address, mode, tier. */
+    private static long codeKey(long pa, int mode, boolean region) {
+        return (pa << 5) | ((long) mode << 1) | (region ? 1 : 0);
+    }
+
     /**
      * At an instruction that may start a block (effective address {@code pc}, real address
      * {@code pa}, page already translated by the run loop): count it, compile it once hot, and run
      * its compiled code if that is exactly equivalent to interpreting from here, i.e. the code
-     * words in memory are still the ones it was built from and the whole block fits before the
-     * end of the chunk. Returns {@link #NO_BLOCK} or the block's {@link CompiledBlock#run} result.
+     * words in memory are still the ones it was built from and the code's first block fits before
+     * the end of the chunk. Returns {@link #NO_BLOCK} or the code's {@link CompiledBlock#run} result.
      */
     private int runBlock(long pc, long pa) {
         int h = ((int) (pa >>> 2) ^ (int) (pc >>> 14)) & ((1 << BLOCK_TABLE_BITS) - 1);
         Block b = blocks[h];
         if (b == null || b.pa != pa || b.ea != pc || b.mode != blockMode) {
-            if (++heat[h] < blockThreshold) {
-                return NO_BLOCK;
-            }
-            heat[h] = 0;
-            b = new Block(pc, pa, blockMode);
-            blocks[h] = b;
-            b.count = blockThreshold - 1;
-        }
-        CompiledBlock code = b.code;
-        if (code != null) {
-            if (s.icount + b.n > chunkEnd) {
-                return NO_BLOCK;
-            }
-            if (!codeMatches(b)) {
-                b.code = null; // the guest changed the code: rebuild it from the current words
-                code = null;
+            int ht = ++heat[h];
+            if (ht < blockThreshold) {
+                // Now and then, look for code another CPU (or this one, at another address) compiled.
+                if ((ht & 63) != 0 || !shareCode || (b = adoptShared(pc, pa, h)) == null) {
+                    return NO_BLOCK;
+                }
+            } else {
+                heat[h] = 0;
+                b = new Block(pc, pa, blockMode);
+                blocks[h] = b;
+                b.count = blockThreshold - 1;
             }
         }
-        if (code == null) {
-            if (b.uncompilable || ++b.count < blockThreshold || !compileBlock(b)) {
+        Code c = b.code;
+        if (c != null) {
+            if (s.icount + c.n > chunkEnd) {
                 return NO_BLOCK;
             }
-            code = b.code;
-            if (s.icount + b.n > chunkEnd) {
+            if (!isCurrent(c)) {
+                // The guest changed the code: rebuild it from the current words.
+                domain.dropCode(codeKey(pa, b.mode, c.region), c);
+                b.code = null;
+                c = null;
+            } else if (!c.region && !b.noRegion && ++b.hot >= regionThreshold - blockThreshold && compileRegions) {
+                // Still hot after running as a first-tier block: promote it to a region.
+                b.hot = 0;
+                Code r = regionFor(b);
+                if (r != null) {
+                    b.code = c = r;
+                    if (s.icount + c.n > chunkEnd) {
+                        return NO_BLOCK;
+                    }
+                } else {
+                    b.noRegion = true;
+                }
+            }
+        }
+        if (c == null) {
+            if (b.uncompilable || ++b.count < blockThreshold || (c = compileBlock(b)) == null) {
+                return NO_BLOCK;
+            }
+            if (!isCurrent(c)) {
+                return NO_BLOCK; // changed while being compiled (another thread): try again later
+            }
+            b.code = c;
+            if (s.icount + c.n > chunkEnd) {
                 return NO_BLOCK;
             }
         }
         // A RuntimeException escaping run() leaves the guard set; that can only make later
         // blocks stop early, which is always safe.
         RadixMmu m = mmu;
-        m.guardLo = pa;
-        m.guardHi = b.paEnd;
+        if (c.region) {
+            m.guardLo = pa & ~0xfffL; // a region stops after any store into its page
+            m.guardHi = (pa & ~0xfffL) + 0x1000;
+        } else {
+            m.guardLo = pa;
+            m.guardHi = c.paEnd;
+        }
         blocksRun++;
-        int r = code.run(s, this);
+        int r = c.run.run(s, this);
         m.guardLo = 0;
         m.guardHi = 0;
         m.guardHit = false;
         return r;
     }
 
-    /** Whether memory still holds the words {@code b} was compiled from (compared as raw bytes). */
-    private boolean codeMatches(Block b) {
-        long[] raw = b.raw;
-        long pa = b.pa;
-        int n = b.n;
-        int pairs = n >>> 1;
-        for (int j = 0; j < pairs; j++) {
-            if (seg.get(ValueLayout.JAVA_LONG_UNALIGNED, pa + 8L * j) != raw[j]) {
-                return false;
-            }
+    /** Install a table entry for code the domain already holds for this entry, if any is current. */
+    private Block adoptShared(long pc, long pa, int h) {
+        Code c = null;
+        if (compileRegions) {
+            c = currentShared(codeKey(pa, blockMode, true));
         }
-        return (n & 1) == 0 || seg.get(ValueLayout.JAVA_INT_UNALIGNED, pa + 8L * pairs) == b.rawTail;
+        if (c == null) {
+            c = currentShared(codeKey(pa, blockMode, false));
+        }
+        if (c == null) {
+            return null;
+        }
+        sharedHits++;
+        heat[h] = 0;
+        Block b = new Block(pc, pa, blockMode);
+        b.code = c;
+        b.count = blockThreshold;
+        blocks[h] = b;
+        return b;
     }
 
-    /** Whether the raw snapshot of {@code b} still decodes to the words it was compiled from. */
-    private boolean codeMatchesWords(Block b) {
-        if (!codeMatches(b)) {
-            return false;
+    /** The domain's code for {@code key} if its words are still current, else null (and dropped). */
+    private Code currentShared(long key) {
+        if (!shareCode) {
+            return null;
         }
-        for (int k = 0; k < b.words.length; k++) {
-            long a = b.pa + 4L * k;
-            if ((fetchLe ? seg.get(I_LE, a) : seg.get(I_BE, a)) != b.words[k]) {
+        Code c = domain.findCode(key);
+        if (c == null) {
+            return null;
+        }
+        if (isCurrent(c)) {
+            return c;
+        }
+        domain.dropCode(key, c);
+        return null;
+    }
+
+    /**
+     * Whether {@code c}'s code words are still those in memory: nothing translated was written
+     * since the last check, or its page's generation is unchanged, or its words compare equal.
+     */
+    private boolean isCurrent(Code c) {
+        int w = pm.codeWriteCount();
+        if (c.checkedAt == w) {
+            return true;
+        }
+        if (pm.codeGeneration(c.pa) == c.gen || revalidate(c)) {
+            c.checkedAt = w;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The page of {@code c} was written since its words were last checked: watch the page again
+     * and compare the words. Returns whether the compiled code is still current.
+     */
+    private boolean revalidate(Code c) {
+        revalidations++;
+        int g = pm.watchCode(c.pa);
+        if (codeMatches(c)) {
+            c.gen = g; // published only once the words are known to match
+            return true;
+        }
+        return false;
+    }
+
+    /** Whether memory still holds the words {@code c} was compiled from (compared as raw memory). */
+    private boolean codeMatches(Code c) {
+        int[] w = c.rawWords;
+        long a = c.rawPa;
+        for (int j = 0; j < w.length; j++) {
+            if (seg.get(ValueLayout.JAVA_INT_UNALIGNED, a + 4L * j) != w[j]) {
                 return false;
             }
         }
         return true;
     }
 
+    private static final boolean NATIVE_LE = java.nio.ByteOrder.nativeOrder() == java.nio.ByteOrder.LITTLE_ENDIAN;
+
+    /** Instruction word from a raw (native-order) memory word, in this chunk's fetch order. */
+    private int fetchOrder(int raw) {
+        return fetchLe == NATIVE_LE ? raw : Integer.reverseBytes(raw);
+    }
+
+    /** Code for a hot entry: a region directly, or a first-tier block (found in the domain or compiled). */
+    private Code compileBlock(Block b) {
+        if (compileRegions && !b.noRegion && regionThreshold <= blockThreshold) {
+            Code r = regionFor(b);
+            if (r != null) {
+                return r;
+            }
+            b.noRegion = true;
+        }
+        long key = codeKey(b.pa, b.mode, false);
+        Code c = currentShared(key);
+        if (c != null) {
+            sharedHits++;
+            return c;
+        }
+        c = compileFirstTier(b);
+        if (c == null) {
+            b.uncompilable = true;
+            return null;
+        }
+        return publish(key, c);
+    }
+
+    /** The region for {@code b}'s entry, from the domain or compiled; null if none can be built. */
+    private Code regionFor(Block b) {
+        long key = codeKey(b.pa, b.mode, true);
+        Code c = currentShared(key);
+        if (c != null) {
+            sharedHits++;
+            return c;
+        }
+        c = compileRegion(b);
+        return c == null ? null : publish(key, c);
+    }
+
+    private Code publish(long key, Code c) {
+        if (compiledAt.size() > 1 << 18) {
+            compiledAt.clear(); // statistics only: keep it bounded
+        }
+        if (!compiledAt.add(key)) {
+            dupCompiles++;
+        }
+        if (!shareCode) {
+            return c;
+        }
+        Code got = domain.publishCode(key, c);
+        if (got != c && !isCurrent(got)) {
+            domain.replaceCode(key, got, c); // another CPU's, but stale
+            return c;
+        }
+        return got;
+    }
+
     /** Decode the block at {@code b.pa} (up to a terminator, the page end or the size limit) and compile it. */
-    private boolean compileBlock(Block b) {
+    private Code compileFirstTier(Block b) {
         long pa = b.pa;
+        // Watch the page before reading the code: any later write to it advances the generation.
+        int gen = pm.watchCode(pa);
         long room = Math.min(0x1000 - (pa & 0xfff), seg.byteSize() - pa) / 4;
         int max = (int) Math.min(BlockCompiler.MAX_LENGTH, room);
+        int[] raw = new int[max];
         int[] words = new int[max];
         int[] slots = new int[max];
         int n = 0;
         while (n < max) {
-            long a = pa + 4L * n;
-            int insn = fetchLe ? seg.get(I_LE, a) : seg.get(I_BE, a);
+            raw[n] = seg.get(ValueLayout.JAVA_INT_UNALIGNED, pa + 4L * n);
+            int insn = fetchOrder(raw[n]);
             int slot = (int) lookupEntry(insn);
             words[n] = insn;
             slots[n] = slot;
@@ -927,25 +1148,59 @@ public final class Interpreter {
             }
         }
         if (n < 2) {
-            b.uncompilable = true;
-            return false;
+            return null;
         }
-        b.words = java.util.Arrays.copyOf(words, n);
-        b.n = n;
-        b.paEnd = pa + 4L * n;
-        b.raw = new long[n >>> 1];
-        for (int j = 0; j < n >>> 1; j++) {
-            b.raw[j] = seg.get(ValueLayout.JAVA_LONG_UNALIGNED, pa + 8L * j);
-        }
-        if ((n & 1) != 0) {
-            b.rawTail = seg.get(ValueLayout.JAVA_INT_UNALIGNED, pa + 8L * (n >>> 1));
-        }
-        if (!codeMatchesWords(b)) {
-            return false; // changed under us (another thread): try again later
-        }
-        b.code = BlockCompiler.compile(b.ea, pcMask, words, slots, n, ops);
+        long mask = (b.mode & RegionCompiler.MODE_SF) != 0 ? -1L : 0xffffffffL;
+        CompiledBlock run = BlockCompiler.compile(b.ea, mask, words, slots, n, ops);
         blocksCompiled++;
-        return true;
+        return new Code(run, false, pa, n, pa + 4L * n, pa, java.util.Arrays.copyOf(raw, n), gen);
+    }
+
+    /**
+     * Compile the second-tier region entered at {@code b}: snapshot its page (after watching it,
+     * so any later write advances the page's code generation), compile from the snapshot, keep
+     * the part of the snapshot the region covers for revalidation.
+     */
+    private Code compileRegion(Block b) {
+        long page = b.pa & ~0xfffL;
+        if (page + 0x1000 > seg.byteSize()) {
+            return null;
+        }
+        int gen = pm.watchCode(page);
+        int[] raw = new int[1024];
+        for (int j = 0; j < 1024; j++) {
+            raw[j] = seg.get(ValueLayout.JAVA_INT_UNALIGNED, page + 4L * j);
+        }
+        RegionCompiler.Source src = new RegionCompiler.Source() {
+            @Override
+            public int slot(int insn) {
+                return (int) lookupEntry(insn);
+            }
+
+            @Override
+            public Op op(int slot) {
+                return ops[slot];
+            }
+
+            @Override
+            public String name(int insn) {
+                DecodeTable.Entry e = table.lookup(insn);
+                return e == null ? null : e.name();
+            }
+
+            @Override
+            public int word(int off) {
+                return fetchOrder(raw[off >>> 2]);
+            }
+        };
+        RegionCompiler.Result r = RegionCompiler.compile(b.ea, b.pa, b.mode, src, pm, regionMaxInsns);
+        if (r == null) {
+            return null;
+        }
+        regionsCompiled++;
+        regionInsns += r.insns();
+        return new Code(r.code(), true, b.pa, r.entryLen(), 0, page + r.spanLo(),
+                java.util.Arrays.copyOfRange(raw, r.spanLo() >>> 2, r.spanHi() >>> 2), gen);
     }
 
     /** A compiled block's instruction raised an interrupt: what the run loop does in that case. */
@@ -1033,7 +1288,7 @@ public final class Interpreter {
 
     private Op decode(int insn) {
         DecodeTable.Entry e = table.lookup(insn);
-        return e == null ? unimplementedOp : e.op();
+        return e == null ? UNIMPLEMENTED_OP : e.op();
     }
 
     // ================================================================== inline dispatch

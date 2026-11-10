@@ -54,6 +54,7 @@ class MultiCpuTest {
             Interpreter in = new Interpreter(s, d, table);
             in.resetPapr();
             in.blockThreshold = 50; // get compiled blocks into the race early
+            in.regionThreshold = 200; // and regions soon after
             s.msr = Msr.SF | Msr.ME | Msr.LE;
             s.spr[Spr.LPCR] |= Spr.LPCR_ILE; // interrupts stay little-endian
             r.add(in);
@@ -313,6 +314,59 @@ class MultiCpuTest {
     }
 
     // ---- time --------------------------------------------------------------------------------
+
+    /**
+     * Cross-modifying code: CPU 1 rewrites a subroutine CPU 0 is running (compiled) with the
+     * architected sequence (store; dcbst; sync; icbi; sync), then raises a flag. Once CPU 0 has
+     * seen the flag and executed isync, every call must run the new code: 300 calls must add
+     * exactly 300 * 100.
+     */
+    @Test
+    void codeModifiedByAnotherCpuIsSeenAfterIsync() throws Exception {
+        vectors();
+        long sub = 0x5000;
+        long flag = 0x6000;
+        int newWord = (14 << 26) | (21 << 21) | (21 << 16) | 100; // addi r21,r21,100
+        Asm a = new Asm();
+        a.li(20, (int) flag).li(21, 0);
+        a.label("spin").bl("sub");
+        a.ld(5, 0, 20).cmpdi(5, 0).beq("spin");
+        a.isync();
+        a.mr(24, 21).li(25, 300).emit(0x7c0903a6 | (25 << 21)); // mtctr r25
+        a.label("again").bl("sub").bc(16, 0, "again"); // bdnz
+        a.emit((31 << 26) | (26 << 21) | (24 << 16) | (21 << 11) | (40 << 1)); // subf r26,r24,r21
+        a.cmpdi(26, 30000).beq("ok").li(3, 0xbad).sc1();
+        a.label("ok").li(3, 0).sc1();
+        while (a.here() < sub - 0x1000) {
+            a.emit(0x60000000);
+        }
+        a.label("sub").addi(21, 21, 1).emit(0x4e800020); // blr
+        a.load(pm, 0x1000, true);
+
+        Asm w = new Asm();
+        w.li(20, (int) flag).li(21, (int) sub);
+        w.emit((15 << 26) | (22 << 21) | (newWord >>> 16)).emit((24 << 26) | (22 << 21) | (22 << 16) | (newWord & 0xffff));
+        w.li(23, 20000).emit(0x7c0903a6 | (23 << 21));
+        w.label("wait").bc(16, 0, "wait");
+        w.stw(22, 0, 21);
+        w.emit((31 << 26) | (21 << 11) | (54 << 1)); // dcbst 0,r21
+        w.sync();
+        w.emit((31 << 26) | (21 << 11) | (982 << 1)); // icbi 0,r21
+        w.sync();
+        w.li(5, 1).std(5, 0, 20);
+        w.li(3, 0).sc1();
+        w.load(pm, 0x8000, true);
+
+        for (int round = 0; round < 5; round++) {
+            pm.write64le(flag, 0);
+            pm.write32le(sub, (14 << 26) | (21 << 21) | (21 << 16) | 1); // addi r21,r21,1
+            CpuDomain d = new CpuDomain(pm);
+            List<Interpreter> cpus = cpus(2, d);
+            cpus.get(0).state().pc = 0x1000;
+            cpus.get(1).state().pc = 0x8000;
+            runAll(cpus);
+        }
+    }
 
     @Test
     void cpusOfADomainShareOneTimebase() {

@@ -27,18 +27,30 @@ class GoldenTest {
         return replay(false);
     }
 
-    /** The same vectors with every block compiled (see BlockCompiler) before it first runs. */
+    /** The same vectors with every region compiled (see RegionCompiler) before it first runs. */
     @TestFactory
     Stream<DynamicNode> goldenCompiled() throws IOException {
         return replay(true);
     }
 
+    /** The same vectors through the first tier only (see BlockCompiler). */
+    @TestFactory
+    Stream<DynamicNode> goldenBlocks() throws IOException {
+        return replay(true, false);
+    }
+
     private Stream<DynamicNode> replay(boolean compiled) throws IOException {
+        return replay(compiled, true);
+    }
+
+    private Stream<DynamicNode> replay(boolean compiled, boolean regions) throws IOException {
         DecodeTable t = new DecodeTable();
         t.addAll(new IntInsns());
         Golden.Machine m = new Golden.Machine(t);
         if (compiled) {
             m.cpu.blockThreshold = 1;
+            m.cpu.regionThreshold = 1;
+            m.cpu.compileRegions = regions;
         } else {
             m.cpu.compileBlocks = false;
         }

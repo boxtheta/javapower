@@ -8,7 +8,7 @@ import org.boxtheta.javapower.core.PhysicalMemory;
  * byte {@code n} (1-based, as PAPR numbers them) bit {@code b} (0 = most significant bit of the
  * byte) is bit {@code (n - 1) * 8 + b}, the same numbering as QEMU's {@code OV_BIT(n, b)}.
  */
-public final class OptionVector {
+final class OptionVector {
     /** Largest vector length in bytes (not counting the length byte). */
     public static final int MAX_BYTES = 256;
 

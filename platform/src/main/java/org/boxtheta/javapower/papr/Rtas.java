@@ -43,6 +43,7 @@ final class Rtas {
 
     private final Machine m;
     private final PhysicalMemory mem;
+    private final PaprLog log;
     private long rtcOffsetNs;
     private long fwnmiResetAddr = -1;
     private long fwnmiMceAddr = -1;
@@ -51,6 +52,7 @@ final class Rtas {
     Rtas(Machine m) {
         this.m = m;
         this.mem = m.memory();
+        this.log = m.log();
     }
 
     void reset() {
@@ -85,13 +87,13 @@ final class Rtas {
         long args = buf + 12;
         long rets = args + 4L * nargs;
         int idx = token - TOKEN_BASE;
-        if (idx < 0 || idx >= DeviceTree.RTAS_TOKENS.length) {
+        if (idx < 0 || idx >= DeviceTree.RTAS_TOKENS.size()) {
             if (token == 0xa) {
                 // Linux early debug code assumes display-character is token 0xa.
                 displayCharacter(args, rets);
                 return H.SUCCESS;
             }
-            PaprLog.unimplemented("rtas-token-0x" + Integer.toHexString(token), "unknown RTAS token");
+            log.unimplemented("rtas-token-0x" + Integer.toHexString(token), "unknown RTAS token");
             st(rets, 0, PARAM_ERROR);
             return H.PARAMETER;
         }
@@ -167,11 +169,11 @@ final class Rtas {
             case 0x14, 0x15, 0x16, 0x17 -> {
                 // PCI config space: the PHB has no devices, so every access fails like an access
                 // to a missing device does in QEMU.
-                PaprLog.once("rtas-pci-config", "config access to the empty PHB");
+                log.once("rtas-pci-config", "config access to the empty PHB");
                 st(rets, 0, HW_ERROR);
             }
             case 0x18, 0x19 -> {
-                PaprLog.once("rtas-pci-msi", DeviceTree.RTAS_TOKENS[idx] + " on the empty PHB");
+                log.once("rtas-pci-msi", DeviceTree.RTAS_TOKENS.get(idx) + " on the empty PHB");
                 st(rets, 0, PARAM_ERROR);
             }
             case 0x1a -> setIndicator(nargs, nret, args, rets);
@@ -182,7 +184,7 @@ final class Rtas {
             case 0x1f -> osTerm(args, rets);
             case 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29 -> {
                 // EEH and DDW calls all address a PE; there are no PCI devices, hence no PEs.
-                PaprLog.once("rtas-eeh-ddw", DeviceTree.RTAS_TOKENS[idx] + " on the empty PHB");
+                log.once("rtas-eeh-ddw", DeviceTree.RTAS_TOKENS.get(idx) + " on the empty PHB");
                 st(rets, 0, PARAM_ERROR);
             }
             case 0x2a -> {
@@ -190,7 +192,7 @@ final class Rtas {
                     st(rets, 0, PARAM_ERROR);
                     break;
                 }
-                PaprLog.unimplemented("rtas-suspend-me", "guest suspend is not supported");
+                log.unimplemented("rtas-suspend-me", "guest suspend is not supported");
                 st(rets, 0, HW_ERROR);
             }
             case 0x2b -> nmiRegister(args, rets);
@@ -527,7 +529,7 @@ final class Rtas {
             }
             sb.append((char) c);
         }
-        PaprLog.warn("OS terminated: " + sb);
+        log.warn("OS terminated: " + sb);
         m.requestStop(Machine.ShutdownReason.PANIC, sb.toString());
         st(rets, 0, SUCCESS);
     }
@@ -562,7 +564,7 @@ final class Rtas {
         }
         switch (ld(args, 0)) {
             case 1 -> {
-                PaprLog.unimplemented("fadump-register", "firmware-assisted dump is not supported");
+                log.unimplemented("fadump-register", "firmware-assisted dump is not supported");
                 st(rets, 0, HW_ERROR);
             }
             case 2, 3 -> st(rets, 0, SUCCESS);

@@ -5,12 +5,18 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.function.Consumer;
 
 /**
  * Configuration of a {@link Machine}: the equivalent of QEMU's
  * {@code -M pseries,ic-mode=xics -cpu power9 -smp <cpus> -m <ram> -nodefaults} plus one spapr-vty, one
  * spapr-vscsi and its SCSI devices. Plain mutable fields with fluent setters; read once when the
  * machine is constructed.
+ *
+ * <p>What an embedder usually sets: {@link #ram}, {@link #cpus}, the {@link #console} backend
+ * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk})
+ * and the {@link #logSink} for diagnostics (default: the {@link System.Logger}
+ * {@value PaprLog#LOGGER_NAME}). The firmware defaults to {@link #DEFAULT_FIRMWARE}.
  */
 public final class MachineConfig {
     /** Default firmware location (the stock SLOF image QEMU ships). */
@@ -110,6 +116,7 @@ public final class MachineConfig {
     boolean rng;
     Random random;
     Clock clock = Clock.systemUTC();
+    Consumer<PaprLog.Entry> logSink;
 
     /** Guest RAM in bytes (a multiple of 256 MiB; the reference uses 2 GiB). */
     public MachineConfig ram(long bytes) {
@@ -227,6 +234,17 @@ public final class MachineConfig {
     /** Clock behind get-time-of-day; defaults to the host UTC clock. */
     public MachineConfig clock(Clock c) {
         this.clock = c;
+        return this;
+    }
+
+    /**
+     * Where the machine's diagnostics go (see {@link PaprLog}); null, the default, forwards them to
+     * the {@link System.Logger} named {@value PaprLog#LOGGER_NAME}. Use
+     * {@link PaprLog#printTo PaprLog.printTo(System.err)} for plain lines on stderr. The sink is
+     * called from emulator threads and must be thread-safe.
+     */
+    public MachineConfig logSink(Consumer<PaprLog.Entry> sink) {
+        this.logSink = sink;
         return this;
     }
 }

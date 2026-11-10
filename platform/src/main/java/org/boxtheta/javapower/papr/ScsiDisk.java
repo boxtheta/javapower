@@ -95,6 +95,7 @@ public final class ScsiDisk implements ScsiTarget {
     private boolean senseIsUa;
     private boolean trayOpen;
     private boolean trayLocked;
+    private volatile PaprLog log = new PaprLog();
 
     /**
      * @param blockSize logical block size (512 or 4096 for disks; CDs normally 2048)
@@ -127,6 +128,11 @@ public final class ScsiDisk implements ScsiTarget {
         this.product = type == Type.DISK ? "QEMU HARDDISK" : "QEMU CD-ROM";
         this.version = "2.5+";
         reset();
+    }
+
+    /** Report through {@code l} from now on (the machine passes its log when it creates the disk). */
+    void setLog(PaprLog l) {
+        this.log = l;
     }
 
     public static ScsiDisk disk(BlockBackend b, int blockSize, String deviceId) {
@@ -228,7 +234,7 @@ public final class ScsiDisk implements ScsiTarget {
                 default -> emulate(req);
             }
         } catch (IOException e) {
-            PaprLog.once("scsi-io-error", e.toString());
+            log.once("scsi-io-error", e.toString());
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_MEDIUM_ERROR, 0x11, 0x00), false);
         }
     }
@@ -423,7 +429,7 @@ public final class ScsiDisk implements ScsiTarget {
             try {
                 backend.write(off, buf, 0, got);
             } catch (IOException e) {
-                PaprLog.once("scsi-write-error", e.toString());
+                log.once("scsi-write-error", e.toString());
                 checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_HARDWARE_ERROR, 0x44, 0), false);
                 return;
             }
@@ -605,7 +611,7 @@ public final class ScsiDisk implements ScsiTarget {
                 try {
                     backend.flush();
                 } catch (IOException e) {
-                    PaprLog.once("scsi-flush-error", e.toString());
+                    log.once("scsi-flush-error", e.toString());
                     checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_HARDWARE_ERROR, 0x44, 0), false);
                     return;
                 }
@@ -629,7 +635,7 @@ public final class ScsiDisk implements ScsiTarget {
                     req.complete(ScsiRequest.TRANSFER_ERROR, null, -xfer);
                     return;
                 }
-                PaprLog.once("scsi-mode-select", "MODE SELECT ignored");
+                log.once("scsi-mode-select", "MODE SELECT ignored");
                 good(req, -xfer);
                 return;
             }
@@ -650,7 +656,7 @@ public final class ScsiDisk implements ScsiTarget {
                 }
             }
             default -> {
-                PaprLog.once("scsi-unknown-opcode-" + Integer.toHexString(op),
+                log.once("scsi-unknown-opcode-" + Integer.toHexString(op),
                         String.format("%s: opcode 0x%02x", product, op));
                 illegal(req, 0x20);
                 return;
@@ -765,7 +771,7 @@ public final class ScsiDisk implements ScsiTarget {
                 left -= n;
             }
         } catch (IOException e) {
-            PaprLog.once("scsi-write-error", e.toString());
+            log.once("scsi-write-error", e.toString());
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_HARDWARE_ERROR, 0x44, 0), false);
             return;
         }

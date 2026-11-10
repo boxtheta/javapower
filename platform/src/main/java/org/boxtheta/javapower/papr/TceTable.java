@@ -23,7 +23,15 @@ public final class TceTable {
     private final long[] table;
     private volatile boolean bypass;
 
+    private final PaprLog log;
+
+    /** A table with a log of its own (tests); a machine passes its log. */
     public TceTable(int liobn, long busOffset, long windowSize) {
+        this(liobn, busOffset, windowSize, new PaprLog());
+    }
+
+    TceTable(int liobn, long busOffset, long windowSize, PaprLog log) {
+        this.log = log;
         this.liobn = liobn;
         this.busOffset = busOffset;
         this.table = new long[(int) (windowSize >>> PAGE_SHIFT)];
@@ -72,7 +80,7 @@ public final class TceTable {
     public synchronized long put(long ioba, long tce) {
         long idx = index(ioba & PAGE_MASK);
         if (ioba < busOffset || idx >= table.length) {
-            PaprLog.once("tce-put-out-of-bounds", String.format("liobn 0x%x ioba 0x%x", liobn, ioba));
+            log.once("tce-put-out-of-bounds", String.format("liobn 0x%x ioba 0x%x", liobn, ioba));
             return H.PARAMETER;
         }
         table[(int) idx] = tce;

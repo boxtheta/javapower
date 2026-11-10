@@ -12,6 +12,7 @@ import org.boxtheta.javapower.core.Spr;
 import org.boxtheta.javapower.cpu.Interpreter;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
+import org.boxtheta.javapower.papr.PaprLog;
 import org.boxtheta.javapower.papr.StdioCharBackend;
 
 /** Command-line front end: boots a pseries guest with the console on stdin/stdout. */
@@ -27,7 +28,8 @@ public final class Main {
             + " [--max-insns n] [--log-interrupts] [--status-secs n]";
 
     public static void main(String[] args) throws Exception {
-        MachineConfig cfg = new MachineConfig().console(new StdioCharBackend());
+        MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
+                .logSink(PaprLog.printTo(System.err));
         Interpreter.Clock clock = Interpreter.Clock.WALL;
         long maxInsns = Long.MAX_VALUE;
         int icountShift = 0;
@@ -103,6 +105,10 @@ public final class Main {
                         emu.domain().tlbShootdownWaitNanos() / 1_000_000);
             }
             for (Map.Entry<String, Long> e : emu.unimplementedInstructions().entrySet()) {
+                System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());
+            }
+            // Hypercalls, RTAS tokens and other platform requests the guest made that we lack.
+            for (Map.Entry<String, Long> e : emu.log().unimplementedCounts().entrySet()) {
                 System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());
             }
         }

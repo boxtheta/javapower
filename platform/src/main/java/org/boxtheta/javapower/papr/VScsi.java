@@ -173,10 +173,10 @@ public final class VScsi extends VioDevice {
                 if (format == FORMAT_SRP || format == FORMAT_MAD) {
                     gotPayload(crq);
                 } else {
-                    PaprLog.once("vscsi-payload-format-" + format, "unsupported payload format");
+                    log().once("vscsi-payload-format-" + format, "unsupported payload format");
                 }
             }
-            default -> PaprLog.once("vscsi-crq-" + Integer.toHexString(valid), "unknown CRQ");
+            default -> log().once("vscsi-crq-" + Integer.toHexString(valid), "unknown CRQ");
         }
         return H.SUCCESS;
     }
@@ -185,11 +185,11 @@ public final class VScsi extends VioDevice {
         Req req = new Req(crq);
         int len = ((crq[6] & 0xff) << 8) | (crq[7] & 0xff);
         if (len > SRP_MAX_IU_LEN) {
-            PaprLog.once("vscsi-iu-too-long", "SRP IU of " + len + " bytes");
+            log().once("vscsi-iu-too-long", "SRP IU of " + len + " bytes");
             return;
         }
         if (!dmaRead(req.ioba(), req.iu, 0, len)) {
-            PaprLog.once("vscsi-iu-dma", "DMA read failure");
+            log().once("vscsi-iu-dma", "DMA read failure");
             return;
         }
         if ((crq[1] & 0xff) == FORMAT_MAD) {
@@ -203,7 +203,7 @@ public final class VScsi extends VioDevice {
     private void sendIu(Req req, int length, int format) {
         boolean ok = dmaWrite(req.ioba(), req.iu, 0, length);
         if (!ok) {
-            PaprLog.once("vscsi-send-iu", "DMA write failure");
+            log().once("vscsi-send-iu", "DMA write failure");
         }
         byte[] r = new byte[16];
         r[0] = (byte) 0x80;
@@ -213,7 +213,7 @@ public final class VScsi extends VioDevice {
         r[7] = (byte) length;
         System.arraycopy(req.iu, 8, r, 8, 8); // the SRP/MAD tag, in its memory byte order
         if (sendCrq(r) != 0) {
-            PaprLog.once("vscsi-send-crq", "error sending response");
+            log().once("vscsi-send-crq", "error sending response");
         }
     }
 
@@ -235,7 +235,7 @@ public final class VScsi extends VioDevice {
             case MAD_EMPTY_IU -> retlen = 32;
             case MAD_ERROR_LOG, MAD_HOST_CONFIG -> retlen = 24;
             default -> {
-                PaprLog.once("vscsi-mad-" + type, "unknown MAD type");
+                log().once("vscsi-mad-" + type, "unknown MAD type");
                 retlen = 0;
             }
         }
@@ -258,7 +258,7 @@ public final class VScsi extends VioDevice {
         ib.putInt(112, 2); // os_type
         ib.putInt(116, MAX_SECTORS << 9); // port_max_txu[0]
         if (!dmaWrite(buffer, info, 0, length)) {
-            PaprLog.once("vscsi-adapter-info", "DMA write failure");
+            log().once("vscsi-adapter-info", "DMA write failure");
         }
         // QEMU stores a 32-bit status into the 16-bit field; on a little-endian host that is 0.
         bb.putShort(4, (short) 0);
@@ -272,7 +272,7 @@ public final class VScsi extends VioDevice {
         long buffer = bb.getLong(16);
         byte[] cap = new byte[CAPABILITIES_SIZE];
         if (!dmaRead(buffer, cap, 0, len)) {
-            PaprLog.once("vscsi-capabilities", "DMA read failure");
+            log().once("vscsi-capabilities", "DMA read failure");
         }
         ByteBuffer cb = ByteBuffer.wrap(cap);
         cb.putInt(0, 0); // flags
@@ -281,7 +281,7 @@ public final class VScsi extends VioDevice {
         cb.putShort(86, (short) 0); // reserve.common.server_support
         cb.putInt(88, 0); // reserve.type
         if (!dmaWrite(buffer, cap, 0, len)) {
-            PaprLog.once("vscsi-capabilities", "DMA write failure");
+            log().once("vscsi-capabilities", "DMA write failure");
         }
         if (reqLen > len) {
             dmaFill(buffer + len, 0, reqLen - len);
@@ -298,7 +298,7 @@ public final class VScsi extends VioDevice {
             case SRP_LOGIN_REQ -> login(req);
             case SRP_TSK_MGMT -> taskManagement(req);
             case SRP_CMD -> command(req);
-            default -> PaprLog.once("vscsi-srp-" + Integer.toHexString(opcode), "unsupported SRP opcode");
+            default -> log().once("vscsi-srp-" + Integer.toHexString(opcode), "unsupported SRP opcode");
         }
     }
 
@@ -454,7 +454,7 @@ public final class VScsi extends VioDevice {
 
     private void complete(Req req, int status, byte[] sense, int xferLen) {
         if (status == ScsiRequest.TRANSFER_ERROR) {
-            PaprLog.once("vscsi-rdma", "RDMA error");
+            log().once("vscsi-rdma", "RDMA error");
             makeupSense(req, ScsiRequest.KEY_HARDWARE_ERROR, 0, 0);
             sendRsp(req, ScsiRequest.CHECK_CONDITION, 0, 0);
             return;
@@ -612,7 +612,7 @@ public final class VScsi extends VioDevice {
                 req.localDesc = writing ? iu[6] & 0xff : iu[7] & 0xff;
             }
             default -> {
-                PaprLog.once("vscsi-desc-fmt-" + req.dmaFmt, "unknown descriptor format");
+                log().once("vscsi-desc-fmt-" + req.dmaFmt, "unknown descriptor format");
                 return false;
             }
         }

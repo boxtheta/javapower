@@ -50,7 +50,17 @@ public final class Vty extends VioDevice {
     }
 
     void start() {
-        backend.start(this::receive);
+        backend.start(new CharBackend.InputSink() {
+            @Override
+            public void receive(byte[] b, int off, int len) {
+                Vty.this.receive(b, off, len);
+            }
+
+            @Override
+            public void error(String key, String detail) {
+                log().once(key, detail);
+            }
+        });
     }
 
     /** Host-to-guest input (any thread). */
@@ -58,7 +68,7 @@ public final class Vty extends VioDevice {
         synchronized (inLock) {
             for (int i = 0; i < len; i++) {
                 if (backlog.size() >= MAX_BACKLOG) {
-                    PaprLog.once("vty-input-overflow", "console input dropped");
+                    log().once("vty-input-overflow", "console input dropped");
                     break;
                 }
                 backlog.add(b[off + i]);

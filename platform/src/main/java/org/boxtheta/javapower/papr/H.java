@@ -1,7 +1,7 @@
 package org.boxtheta.javapower.papr;
 
 /** PAPR hypercall opcodes and return codes (values as in PAPR / QEMU's spapr.h). */
-public final class H {
+final class H {
     private H() {}
 
     // Return codes.

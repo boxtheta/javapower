@@ -21,7 +21,9 @@ import org.boxtheta.javapower.core.Spr;
  * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp N -nodefaults} closely enough for the
  * stock SLOF binary.
  *
- * <p>Typical use from {@code app}:
+ * <p>Most embedders should use {@code org.boxtheta.javapower.Emulator} (module {@code emulator}),
+ * which creates the CPUs and runs them; this class is the machine model it drives, for embedders
+ * that bring their own CPU loop:
  * <pre>{@code
  * MachineConfig cfg = new MachineConfig().ram(2L << 30).cpus(4).console(new StdioCharBackend());
  * cfg.addDisk(Path.of("disk.raw")).blockSize(4096);
@@ -34,6 +36,10 @@ import org.boxtheta.javapower.core.Spr;
  * // REBOOT -> stop and join every CPU thread, m.reset(), run again; anything else -> m.close().
  * }</pre>
  * A single-CPU machine can still use {@code attachCpu(cpu)} and {@code reset(cpu)}.
+ *
+ * <p>Each machine has its own {@link #log() log} (sink and once-per-key counts) and owns the host
+ * resources its configuration names (disk images, NVRAM file, console backend), which
+ * {@link #close} releases. Machines are independent: several may live in one JVM.
  *
  * <h2>Threading and locking</h2>
  * Every CPU runs on its own host thread and calls {@link #hcall} on that thread; console input
@@ -126,7 +132,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final Object lock = new Object();
     private final MachineConfig config;
     private final PhysicalMemory mem;
-    private final Xics xics = new Xics();
+    private final PaprLog log;
+    private final Xics xics;
     private final Random random;
     private final byte[] firmware;
 
@@ -135,7 +142,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final VScsi vscsi;
     private final List<VioDevice> vio = new ArrayList<>();
     private final List<TceTable> tceTables = new ArrayList<>();
-    private final TceTable phbTce;
+    private TceTable phbTce;
     private final List<Drc> drcs = new ArrayList<>();
     private final Rtas rtas;
 
@@ -157,6 +164,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private int fdtInitialSize;
     private volatile long fdtAddr;
     private final Watchdog[] watchdogs = {new Watchdog(), new Watchdog(), new Watchdog(), new Watchdog()};
+    private boolean closed;
 
     /**
      * What the hypervisor keeps per vCPU (QEMU's SpaprCpuState). The registrations are written
@@ -190,11 +198,20 @@ public final class Machine implements Hypervisor, AutoCloseable {
         boolean leaveOthers;
     }
 
+    /**
+     * Build the machine described by {@code config}: allocate guest RAM, load the firmware, open
+     * the disk images and the NVRAM file, and start the console backend. If this fails, everything
+     * opened so far is closed again before the exception propagates.
+     *
+     * @throws IOException if the firmware, a disk image or the NVRAM file cannot be read
+     */
     public Machine(MachineConfig config) throws IOException {
         this.config = config;
+        this.log = new PaprLog(config.logSink);
         if (config.ramSize < (256L << 20) || config.ramSize % (256L << 20) != 0) {
             throw new IllegalArgumentException("RAM size must be a non-zero multiple of 256 MiB");
         }
+        this.xics = new Xics(log);
         this.mem = new PhysicalMemory(config.ramSize);
         this.random = config.random != null ? config.random : new SecureRandom();
         byte[] fw = config.firmwareImage;
@@ -239,6 +256,18 @@ public final class Machine implements Hypervisor, AutoCloseable {
         CharBackend console = config.console != null ? config.console : new BufferCharBackend();
         vty = new Vty(console);
         vscsi = new VScsi();
+        try {
+            buildDevices();
+        } catch (IOException | RuntimeException | Error e) {
+            closeBackends(e, false);
+            throw e;
+        }
+        rtas = new Rtas(this);
+        vty.start();
+    }
+
+    /** The rest of the constructor: everything that may fail after the NVRAM file is open. */
+    private void buildDevices() throws IOException {
         int reg = VioDevice.REG_BASE;
         for (VioDevice d : List.of(nvram, vty, vscsi)) {
             d.attach(this, reg++);
@@ -249,10 +278,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             }
         }
         if (config.phb) {
-            phbTce = new TceTable(DeviceTree.PHB0_LIOBN, 0, DeviceTree.PHB0_DMA_WINDOW);
-            tceTables.add(phbTce);
-        } else {
-            phbTce = null;
+            TceTable t = new TceTable(DeviceTree.PHB0_LIOBN, 0, DeviceTree.PHB0_DMA_WINDOW, log);
+            tceTables.add(t);
+            phbTce = t;
         }
 
         // SCSI devices on the v-scsi bus.
@@ -278,7 +306,15 @@ public final class Machine implements Hypervisor, AutoCloseable {
             }
             String devId = d.deviceId != null ? d.deviceId : "d" + n;
             int pbs = d.physicalBlockSize > 0 ? d.physicalBlockSize : d.blockSize;
-            vscsi.addTarget(new ScsiDisk(d.type, b, d.blockSize, pbs, devId, d.serial, 0, id, d.lun));
+            ScsiDisk disk;
+            try {
+                disk = new ScsiDisk(d.type, b, d.blockSize, pbs, devId, d.serial, 0, id, d.lun);
+            } catch (RuntimeException e) {
+                closeQuietly(b, e);
+                throw e;
+            }
+            disk.setLog(log);
+            vscsi.addTarget(disk);
             n++;
         }
 
@@ -295,14 +331,25 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 drcs.add(new Drc(Drc.Kind.PCI, i, null));
             }
         }
-        rtas = new Rtas(this);
-        vty.start();
+    }
+
+    private static void closeQuietly(AutoCloseable c, Throwable primary) {
+        try {
+            c.close();
+        } catch (Exception e) {
+            primary.addSuppressed(e);
+        }
     }
 
     // ---- accessors ---------------------------------------------------------------------------
 
     public MachineConfig config() {
         return config;
+    }
+
+    /** This machine's diagnostics: messages go to the configured sink, once-per-key counts stay here. */
+    public PaprLog log() {
+        return log;
     }
 
     public PhysicalMemory memory() {
@@ -742,7 +789,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 Watchdog w = watchdogs[i];
                 if (w.armed && now - w.deadline >= 0) {
                     w.armed = false;
-                    PaprLog.warn("watchdog " + (i + 1) + " expired, action " + w.action);
+                    log.warn("watchdog " + (i + 1) + " expired, action " + w.action);
                     switch (w.action) {
                         case 1 -> requestStop(ShutdownReason.POWER_OFF, "watchdog");
                         case 2 -> requestStop(ShutdownReason.REBOOT, "watchdog");
@@ -790,30 +837,59 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
     }
 
-    /** Close the backends (disk images, NVRAM file, console). */
+    /**
+     * Release the host resources: close the disk backends (deleting snapshot overlays), the NVRAM
+     * file and the console backend. Idempotent. The CPUs must not be running. Guest RAM is
+     * off-heap memory the JVM reclaims once the machine is unreachable.
+     *
+     * @throws IOException the first failure to close a backend (the others are still closed and
+     *     their failures added as suppressed exceptions)
+     */
     @Override
     public void close() throws IOException {
         synchronized (lock) {
-            IOException first = null;
-            for (ScsiTarget t : vscsi.targets()) {
-                if (t instanceof ScsiDisk d) {
-                    try {
-                        d.backend().close();
-                    } catch (IOException e) {
-                        first = first == null ? e : first;
-                    }
-                }
+            if (closed) {
+                return;
             }
-            try {
-                nvram.close();
-            } catch (IOException e) {
-                first = first == null ? e : first;
-            }
-            vty.backend().close();
-            if (first != null) {
-                throw first;
+            closed = true;
+            IOException e = closeBackends(null, true);
+            if (e != null) {
+                throw e;
             }
         }
+    }
+
+    /**
+     * Close every backend, collecting failures: into {@code primary} if given, otherwise into the
+     * returned exception. The console is left alone when construction fails, since it was never
+     * started.
+     */
+    private IOException closeBackends(Throwable primary, boolean console) {
+        IOException first = null;
+        List<AutoCloseable> all = new ArrayList<>();
+        for (ScsiTarget t : vscsi.targets()) {
+            if (t instanceof ScsiDisk d) {
+                all.add(d.backend());
+            }
+        }
+        all.add(nvram::close);
+        if (console) {
+            all.add(vty.backend()::close);
+        }
+        for (AutoCloseable c : all) {
+            try {
+                c.close();
+            } catch (Exception e) {
+                if (primary != null) {
+                    primary.addSuppressed(e);
+                } else if (first == null) {
+                    first = e instanceof IOException io ? io : new IOException(e);
+                } else {
+                    first.addSuppressed(e);
+                }
+            }
+        }
+        return first;
     }
 
     // ---- hypercalls --------------------------------------------------------------------------
@@ -853,7 +929,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         int d = mem.read32be(vpa + VPA_DISPATCH_COUNTER) + 1;
         if ((d & 1) != parity) {
-            PaprLog.once("vpa-dispatch-parity", "VPA: incorrect dispatch counter value, correcting");
+            log.once("vpa-dispatch-parity", "VPA: incorrect dispatch counter value, correcting");
             d++;
         }
         mem.write32be(vpa + VPA_DISPATCH_COUNTER, d);
@@ -921,7 +997,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 }
             }
             case H.CLEAN_SLB, H.INVALIDATE_PID -> {
-                PaprLog.unimplemented("hcall-0x" + Long.toHexString(op), "");
+                log.unimplemented("hcall-0x" + Long.toHexString(op), "");
                 yield H.FUNCTION;
             }
             case H.REGISTER_PROC_TBL -> {
@@ -1055,8 +1131,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
         };
     }
 
-    private static long unknown(long op) {
-        PaprLog.unimplemented("hcall-0x" + Long.toHexString(op), "unimplemented hypercall, returning H_FUNCTION");
+    private long unknown(long op) {
+        log.unimplemented("hcall-0x" + Long.toHexString(op), "unimplemented hypercall, returning H_FUNCTION");
         return H.FUNCTION;
     }
 
@@ -1094,12 +1170,12 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private long hashMmu(CpuState s, int op) {
         // Only radix is modelled. QEMU validates the PTE index against the HPT first; there is
         // none here, so every index is out of range.
-        PaprLog.unimplemented("hash-mmu-hcall", String.format("hcall 0x%x (hash MMU not supported)", op));
+        log.unimplemented("hash-mmu-hcall", String.format("hcall 0x%x (hash MMU not supported)", op));
         return H.PARAMETER;
     }
 
     private long hptResize(long op) {
-        PaprLog.unimplemented("hpt-resize", String.format("hcall 0x%x", op));
+        log.unimplemented("hpt-resize", String.format("hcall 0x%x", op));
         return H.HARDWARE;
     }
 
@@ -1319,7 +1395,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 default -> mem.read64be(addr);
             };
         } else {
-            PaprLog.once("logical-load-unassigned", String.format("addr 0x%x", addr));
+            log.once("logical-load-unassigned", String.format("addr 0x%x", addr));
         }
         ret(s, 0, v);
         return H.SUCCESS;
@@ -1340,7 +1416,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 default -> mem.write64be(addr, val);
             }
         } else {
-            PaprLog.once("logical-store-unassigned", String.format("addr 0x%x", addr));
+            log.once("logical-store-unassigned", String.format("addr 0x%x", addr));
         }
         return H.SUCCESS;
     }
@@ -1479,7 +1555,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if ((flags & register) != 0) {
                 long bytes = 1L << (Math.min(tableSize, 50) + 12);
                 if ((procTbl & (bytes - 1)) != 0) {
-                    PaprLog.once("proc-tbl-unaligned", String.format("proc_tbl 0x%x size 0x%x", procTbl, bytes));
+                    log.once("proc-tbl-unaligned", String.format("proc_tbl 0x%x size 0x%x", procTbl, bytes));
                 }
                 if ((flags & radix) != 0) {
                     if ((procTbl & 0xfff) != 0 || (procTbl >>> 60) != 0) {
@@ -1502,7 +1578,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                         return H.P4;
                     }
                     cproc = (procTbl << 25) | pageSize << 5 | tableSize;
-                    PaprLog.warn("guest registered a hash MMU process table; only radix is supported");
+                    log.warn("guest registered a hash MMU process table; only radix is supported");
                 }
             } else {
                 cproc = patbEntry & PATE1_GR;
@@ -1574,7 +1650,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         Consumer<CpuState> h = systemResetHandler;
         if (h == null) {
-            PaprLog.unimplemented("signal-sys-reset", "no system reset handler installed");
+            log.unimplemented("signal-sys-reset", "no system reset handler installed");
             return H.HARDWARE;
         }
         for (CpuState c : targets) {
@@ -1792,7 +1868,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         long buf = arg(s, 1);
         long bufSize = arg(s, 2);
         if (Long.compareUnsigned(bufSize, 4) < 0) {
-            PaprLog.warn("SLOF provided insufficient CAS buffer " + bufSize);
+            log.warn("SLOF provided insufficient CAS buffer " + bufSize);
             requestStop(ShutdownReason.FATAL, "insufficient CAS buffer");
             return H.PARAMETER;
         }
@@ -1802,7 +1878,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         for (VCpu v : vcpus) {
             CpuState c = v.cpu;
             if (c != null && c != s && !(c.halted || c.ceded)) {
-                PaprLog.warn("guest has multiple active vCPUs at CAS, which is not allowed");
+                log.warn("guest has multiple active vCPUs at CAS, which is not allowed");
                 return H.MULTI_THREADS_ACTIVE;
             }
         }
@@ -1826,10 +1902,10 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 best = pvr;
             }
         }
-        PaprLog.info(String.format("spapr_cas_pvr current=0x%x, explicit_match=%d, new=0x%x", compatPvr,
+        log.info(String.format("spapr_cas_pvr current=0x%x, explicit_match=%d, new=0x%x", compatPvr,
                 explicit ? 1 : 0, best));
         if (best == 0 && !explicit) {
-            PaprLog.warn("Couldn't negotiate a suitable PVR during CAS");
+            log.warn("Couldn't negotiate a suitable PVR during CAS");
             return H.HARDWARE;
         }
         if (compatPvr != best) {
@@ -1840,12 +1916,12 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
         OptionVector ov1 = OptionVector.parse(mem, vec, 1);
         if (ov1 == null) {
-            PaprLog.warn("guest didn't provide option vector 1");
+            log.warn("guest didn't provide option vector 1");
             return H.PARAMETER;
         }
         OptionVector guest5 = OptionVector.parse(mem, vec, 5);
         if (guest5 == null) {
-            PaprLog.warn("guest didn't provide option vector 5");
+            log.warn("guest didn't provide option vector 5");
             return H.PARAMETER;
         }
         if (guest5.test(OptionVector.OV5_MMU_BOTH)) {
@@ -1861,14 +1937,14 @@ public final class Machine implements Hypervisor, AutoCloseable {
             return H.PARAMETER;
         }
         if (!guest5.test(OptionVector.OV5_MMU_RADIX_300)) {
-            PaprLog.warn("guest chose the hash MMU at CAS; only radix is implemented");
+            log.warn("guest chose the hash MMU at CAS; only radix is implemented");
         }
         ov5Cas = ov5.intersect(guest5);
         casPreIsa3 = !ov1.test(OptionVector.OV1_PPC_3_00);
 
         byte[] blob = DeviceTree.blob(DeviceTree.build(this, false));
         if (blob.length > bufSize) {
-            PaprLog.warn("CAS device tree does not fit in the guest buffer");
+            log.warn("CAS device tree does not fit in the guest buffer");
             requestStop(ShutdownReason.FATAL, "CAS buffer too small");
             return H.NO_MEM;
         }
@@ -1879,7 +1955,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         fdtInitialSize = blob.length;
         mem.write32be(buf, 1); // SpaprDeviceTreeUpdateHeader.version_id
         mem.write(buf + 4, blob, 0, blob.length);
-        PaprLog.info("spapr_cas_continue Copy changes to the guest: " + (blob.length + 4) + " bytes");
+        log.info("spapr_cas_continue Copy changes to the guest: " + (blob.length + 4) + " bytes");
         return H.SUCCESS;
     }
 
@@ -1892,7 +1968,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         mem.read(dt, hdr, 0, hdr.length);
         int cb = ByteBuffer.wrap(hdr).getInt(4);
         if (cb < 0 || cb > fdtInitialSize * 2L || !mem.contains(dt, cb)) {
-            PaprLog.once("update-dt-size", "rejected device tree of " + cb + " bytes");
+            log.once("update-dt-size", "rejected device tree of " + cb + " bytes");
             return H.PARAMETER;
         }
         byte[] blob = new byte[cb];
@@ -1900,7 +1976,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         try {
             Fdt.parse(blob);
         } catch (Fdt.FdtException e) {
-            PaprLog.once("update-dt-check", e.getMessage());
+            log.once("update-dt-check", e.getMessage());
             return H.PARAMETER;
         }
         fdtBlob = blob;

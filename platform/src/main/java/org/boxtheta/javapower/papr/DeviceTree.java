@@ -28,7 +28,7 @@ final class DeviceTree {
     static final int CLOCK_FREQ = 1000000000;
 
     /** RTAS token names, indexed by token - 0x2000 (QEMU's RTAS_* numbering). */
-    static final String[] RTAS_TOKENS = {
+    static final List<String> RTAS_TOKENS = List.of(
         "display-character", "get-time-of-day", "set-time-of-day", "power-off", "system-reboot",
         "query-cpu-stopped-state", "start-cpu", "stop-self", "ibm,get-system-parameter",
         "ibm,set-system-parameter", "ibm,set-xive", "ibm,get-xive", "ibm,int-off", "ibm,int-on",
@@ -39,10 +39,10 @@ final class DeviceTree {
         "ibm,set-eeh-option", "ibm,get-config-addr-info2", "ibm,read-slot-reset-state2",
         "ibm,set-slot-reset", "ibm,configure-pe", "ibm,slot-error-detail", "ibm,query-pe-dma-window",
         "ibm,create-pe-dma-window", "ibm,remove-pe-dma-window", "ibm,reset-pe-dma-window",
-        "ibm,suspend-me", "ibm,nmi-register", "ibm,nmi-interlock", "ibm,configure-kernel-dump",
-    };
+        "ibm,suspend-me", "ibm,nmi-register", "ibm,nmi-interlock", "ibm,configure-kernel-dump");
 
-    // ibm,pa-features tables (QEMU spapr_dt_pa_features), including the 2-byte header.
+    // ibm,pa-features tables (QEMU spapr_dt_pa_features), including the 2-byte header. Constant:
+    // only read, by paFeatures, which copies them.
     private static final int[] PA_206 = {6, 0, 0xf6, 0x1f, 0xc7, 0x00, 0x00, 0xc0};
     private static final int[] PA_207 = {24, 0,
         0xf6, 0x1f, 0xc7, 0xc0, 0x00, 0xf0, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -191,8 +191,8 @@ final class DeviceTree {
     }
 
     private static void rtas(Machine m, Fdt.Node r) {
-        for (int i = RTAS_TOKENS.length - 1; i >= 0; i--) {
-            r.setCell(RTAS_TOKENS[i], Rtas.TOKEN_BASE + i);
+        for (int i = RTAS_TOKENS.size() - 1; i >= 0; i--) {
+            r.setCell(RTAS_TOKENS.get(i), Rtas.TOKEN_BASE + i);
         }
         // FADump: CPU state data region sized for max_cpus (QEMU spapr_dt_rtas_fadump): a 16-byte
         // header, 12 bytes of padding, the CPU count, then 79 16-byte register entries per CPU.

@@ -6,7 +6,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.cpu.CpuDomain;
@@ -15,6 +17,7 @@ import org.boxtheta.javapower.cpu.Interpreter;
 import org.boxtheta.javapower.fpvec.FpuSets;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
+import org.boxtheta.javapower.papr.PaprLog;
 
 /**
  * A complete POWER9 PAPR ({@code pseries}) virtual machine: {@link MachineConfig#cpus} CPUs with
@@ -22,20 +25,32 @@ import org.boxtheta.javapower.papr.MachineConfig;
  * embedding the emulator.
  *
  * <pre>{@code
- * MachineConfig cfg = new MachineConfig().cpus(4).console(myConsole);
+ * MachineConfig cfg = new MachineConfig().cpus(4).console(myConsole)
+ *         .logSink(PaprLog.printTo(System.err));        // default: System.Logger
  * cfg.addCdrom(Path.of("freebsd-disc1.iso"));
  * try (Emulator emu = new Emulator(cfg)) {
  *     Machine.ShutdownReason why = emu.run();   // blocks until the guest powers off
+ *     System.out.println(emu.log().unimplementedCounts());
  * }
  * }</pre>
+ *
+ * <h2>Host resources</h2>
+ * A machine owns host resources: open disk images (and their temporary copy-on-write overlays),
+ * the NVRAM file, the console backend and its threads, and off-heap guest RAM. {@link #close}
+ * releases all of them except the RAM, which the JVM frees once the emulator is unreachable. The
+ * emulator never writes to {@code System.out} or {@code System.err} itself: guest console output
+ * goes to the {@link MachineConfig#console console backend} and diagnostics to the
+ * {@linkplain MachineConfig#logSink log sink}.
  *
  * <h2>Threads</h2>
  * {@link #run} executes CPU 0 on the calling thread and every other CPU on a host thread of its
  * own ({@code javapower-cpu-N}), all in parallel over the one guest memory; it starts those
  * threads and joins them before it returns, so no emulator thread outlives a {@code run} call. A
  * guest reboot stops and joins every CPU thread, resets the machine and starts them again.
- * {@link #stop} may be called from any thread; everything else belongs to the thread that calls
- * {@code run}, or to any thread while the guest is not running. Instances are independent.
+ * The CPU threads are daemon threads. {@link #stop} and {@link #close} may be called from any
+ * thread except the emulator's own; everything else belongs to the thread that calls
+ * {@code run}, or to any thread while the guest is not running. Only one {@code run} call may be
+ * active at a time. Instances are independent: several may run in one JVM, each with its own log.
  *
  * <h2>Time</h2>
  * With {@link Interpreter.Clock#WALL} (the default) all CPUs share one timebase that follows the
@@ -52,6 +67,9 @@ public final class Emulator implements AutoCloseable {
     private final List<Interpreter> interpreters;
     private boolean needsReset = true;
     private volatile boolean stopAsked;
+    /** Held for the duration of {@link #run}; {@link #close} takes it to wait for a run to end. */
+    private final ReentrantLock runLock = new ReentrantLock();
+    private volatile boolean closed;
 
     /** A machine driven by the host's wall clock at real time. */
     public Emulator(MachineConfig config) throws IOException {
@@ -105,8 +123,12 @@ public final class Emulator implements AutoCloseable {
             interpreters = Collections.unmodifiableList(is);
             machine.attachCpus(cpus);
             machine.setSystemResetHandler(c -> interpreters.get(c.index).systemReset());
-        } catch (RuntimeException e) {
-            machine.close();
+        } catch (RuntimeException | Error e) {
+            try {
+                machine.close();
+            } catch (IOException ce) {
+                e.addSuppressed(ce);
+            }
             throw e;
         }
     }
@@ -114,6 +136,14 @@ public final class Emulator implements AutoCloseable {
     /** The machine model: devices, guest memory, shutdown state. */
     public Machine machine() {
         return machine;
+    }
+
+    /**
+     * The machine's diagnostics ({@link Machine#log()}): change the sink, or read the
+     * unimplemented hypercalls and RTAS calls the guest made.
+     */
+    public PaprLog log() {
+        return machine.log();
     }
 
     /** What the CPUs share: timebase, TLB invalidation; statistics. */
@@ -179,10 +209,28 @@ public final class Emulator implements AutoCloseable {
      * Run until CPU 0 has executed at most {@code maxInsns} instructions (the other CPUs are then
      * stopped at their next instruction boundary). Returns why the guest stopped, or
      * {@link Machine.ShutdownReason#NONE} if it was interrupted by the limit or by {@link #stop};
-     * in that case calling {@code run} again resumes where it left off. If a CPU thread fails
-     * with an exception, every CPU is stopped and the exception is rethrown here.
+     * in that case calling {@code run} again resumes where it left off. If a CPU thread or the
+     * device timer thread fails with an exception, every CPU is stopped and the exception is
+     * rethrown here. Every thread {@code run} starts has ended when it returns or throws.
+     *
+     * @throws IllegalStateException if the emulator is closed or another {@code run} is active
      */
     public Machine.ShutdownReason run(long maxInsns) {
+        if (!runLock.tryLock()) {
+            throw new IllegalStateException("the emulator is already running");
+        }
+        try {
+            if (closed) {
+                throw new IllegalStateException("the emulator is closed");
+            }
+            return runLocked(maxInsns);
+        } finally {
+            runLock.unlock();
+        }
+    }
+
+    private Machine.ShutdownReason runLocked(long maxInsns) {
+        AtomicReference<Throwable> pumpFailure = new AtomicReference<>();
         Thread pump = Thread.ofPlatform().daemon().name("javapower-pump").start(() -> {
             try {
                 while (true) {
@@ -191,40 +239,82 @@ public final class Emulator implements AutoCloseable {
                 }
             } catch (InterruptedException e) {
                 // run() is returning
+            } catch (Throwable e) {
+                pumpFailure.set(e);
+                requestStopAll();
             }
         });
         try {
-            long remaining = maxInsns;
-            while (true) {
-                if (stopAsked) {
-                    stopAsked = false;
-                    clearStopRequests();
-                    return Machine.ShutdownReason.NONE;
-                }
-                if (needsReset) {
-                    for (Interpreter in : interpreters) {
-                        in.resetPapr();
-                    }
-                    machine.reset();
-                    needsReset = false;
-                }
-                remaining -= runAllCpus(remaining);
-                Machine.ShutdownReason why = machine.shutdownReason();
-                clearStopRequests();
-                if (why != Machine.ShutdownReason.NONE) {
-                    needsReset = true;
-                    if (why == Machine.ShutdownReason.REBOOT && remaining > 0 && !stopAsked) {
-                        continue;
-                    }
-                    stopAsked = false;
-                    return why;
-                }
-                // Instruction limit or stop().
-                stopAsked = false;
-                return Machine.ShutdownReason.NONE;
-            }
+            return runLoop(maxInsns, pumpFailure);
         } finally {
             pump.interrupt();
+            joinUninterruptibly(pump);
+        }
+    }
+
+    private void rethrowPumpFailure(AtomicReference<Throwable> pumpFailure) {
+        Throwable f = pumpFailure.get();
+        if (f != null) {
+            needsReset = false;
+            rethrow(f, "device timer thread failed");
+        }
+    }
+
+    private static void rethrow(Throwable f, String what) {
+        if (f instanceof RuntimeException r) {
+            throw r;
+        }
+        if (f instanceof Error err) {
+            throw err;
+        }
+        throw new IllegalStateException(what, f);
+    }
+
+    private static void joinUninterruptibly(Thread t) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                t.join();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private Machine.ShutdownReason runLoop(long maxInsns, AtomicReference<Throwable> pumpFailure) {
+        long remaining = maxInsns;
+        while (true) {
+            if (stopAsked) {
+                stopAsked = false;
+                clearStopRequests();
+                return Machine.ShutdownReason.NONE;
+            }
+            if (needsReset) {
+                for (Interpreter in : interpreters) {
+                    in.resetPapr();
+                }
+                machine.reset();
+                needsReset = false;
+            }
+            remaining -= runAllCpus(remaining);
+            rethrowPumpFailure(pumpFailure);
+            Machine.ShutdownReason why = machine.shutdownReason();
+            clearStopRequests();
+            if (why != Machine.ShutdownReason.NONE) {
+                needsReset = true;
+                if (why == Machine.ShutdownReason.REBOOT && remaining > 0 && !stopAsked) {
+                    continue;
+                }
+                stopAsked = false;
+                return why;
+            }
+            // Instruction limit or stop().
+            stopAsked = false;
+            return Machine.ShutdownReason.NONE;
         }
     }
 
@@ -239,7 +329,7 @@ public final class Emulator implements AutoCloseable {
         try {
             for (int i = 1; i < interpreters.size(); i++) {
                 Interpreter in = interpreters.get(i);
-                threads.add(Thread.ofPlatform().name("javapower-cpu-" + i).start(() -> {
+                threads.add(Thread.ofPlatform().daemon().name("javapower-cpu-" + i).start(() -> {
                     try {
                         in.run();
                     } catch (Throwable e) {
@@ -253,31 +343,14 @@ public final class Emulator implements AutoCloseable {
             failure.compareAndSet(null, e);
         } finally {
             requestStopAll();
-            boolean interrupted = false;
             for (Thread t : threads) {
-                while (true) {
-                    try {
-                        t.join();
-                        break;
-                    } catch (InterruptedException e) {
-                        interrupted = true;
-                    }
-                }
-            }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
+                joinUninterruptibly(t);
             }
         }
         Throwable f = failure.get();
         if (f != null) {
             needsReset = false; // keep the state for inspection; reset() starts over
-            if (f instanceof RuntimeException r) {
-                throw r;
-            }
-            if (f instanceof Error err) {
-                throw err;
-            }
-            throw new IllegalStateException("CPU thread failed", f);
+            rethrow(f, "CPU thread failed");
         }
         return done;
     }
@@ -301,9 +374,39 @@ public final class Emulator implements AutoCloseable {
         requestStopAll();
     }
 
-    /** Release guest memory, disk images and the console. The guest must not be running. */
+    /**
+     * Release the machine's host resources (see {@link Machine#close}). If the guest is running on
+     * another thread, it is stopped first and this waits for {@link #run} to return. Idempotent;
+     * after it, {@code run} throws.
+     *
+     * @throws IllegalStateException if called from inside {@code run} (a hook on CPU 0's thread)
+     */
     @Override
     public void close() throws IOException {
-        machine.close();
+        if (runLock.isHeldByCurrentThread()) {
+            throw new IllegalStateException("close() called from inside run()");
+        }
+        closed = true;
+        boolean interrupted = false;
+        while (true) {
+            stop();
+            try {
+                if (runLock.tryLock(10, TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        try {
+            stopAsked = false;
+            clearStopRequests();
+            machine.close();
+        } finally {
+            runLock.unlock();
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

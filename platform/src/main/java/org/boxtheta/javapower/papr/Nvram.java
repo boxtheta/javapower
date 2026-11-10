@@ -94,7 +94,7 @@ public final class Nvram extends VioDevice {
                     pos += file.write(bb, pos);
                 }
             } catch (IOException e) {
-                PaprLog.once("nvram-write-failed", e.toString());
+                log().once("nvram-write-failed", e.toString());
                 return 0;
             }
         }

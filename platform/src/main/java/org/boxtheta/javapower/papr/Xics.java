@@ -98,7 +98,15 @@ public final class Xics {
      */
     private final BitSet resendable = new BitSet(NR_IRQS);
 
+    private final PaprLog log;
+
+    /** A controller with a log of its own (tests); a machine passes its log. */
     public Xics() {
+        this(new PaprLog());
+    }
+
+    Xics(PaprLog log) {
+        this.log = log;
         reset();
     }
 
@@ -266,7 +274,7 @@ public final class Xics {
     private void icpIrq(int srv, int nr, int prio) {
         Icp icp = icps.get(srv);
         if (icp == null) {
-            PaprLog.once("xics-invalid-server", String.format("invalid server %d for IRQ 0x%x", srv, nr));
+            log.once("xics-invalid-server", String.format("invalid server %d for IRQ 0x%x", srv, nr));
             icsReject(nr);
             return;
         }

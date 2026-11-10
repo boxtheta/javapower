@@ -119,8 +119,8 @@ final class Rig {
     }
 
     static int token(String name) {
-        for (int i = 0; i < DeviceTree.RTAS_TOKENS.length; i++) {
-            if (DeviceTree.RTAS_TOKENS[i].equals(name)) {
+        for (int i = 0; i < DeviceTree.RTAS_TOKENS.size(); i++) {
+            if (DeviceTree.RTAS_TOKENS.get(i).equals(name)) {
                 return Rtas.TOKEN_BASE + i;
             }
         }

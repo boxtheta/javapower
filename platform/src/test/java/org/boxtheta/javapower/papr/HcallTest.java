@@ -13,11 +13,10 @@ class HcallTest {
     @Test
     void unknownHcallIsHFunctionAndLogged() {
         Rig r = new Rig();
-        PaprLog.resetOnce();
         assertEquals(H.FUNCTION, r.hcall(0x1234 & ~3));
         assertEquals(H.FUNCTION, r.hcall(0x3));
         assertEquals(H.FUNCTION, r.hcall(0xf00c));
-        assertTrue(PaprLog.touchedKeys().contains("hcall-0x1234"));
+        assertTrue(r.m.log().unimplementedCounts().containsKey("hcall-0x1234"));
         // H_RANDOM is only registered with an spapr-rng device, as in QEMU.
         assertEquals(H.FUNCTION, r.hcall(H.RANDOM));
         Rig rng = new Rig(new MachineConfig().ram(256L << 20).rng(true));

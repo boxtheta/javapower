@@ -20,6 +20,7 @@ public abstract class VioDevice {
 
     protected Machine machine;
     private final Object lock = new Object();
+    private PaprLog log = new PaprLog();
     private int reg;
     private int irq;
     private TceTable tce;
@@ -67,12 +68,18 @@ public abstract class VioDevice {
 
     final void attach(Machine m, int unitAddress) {
         this.machine = m;
+        this.log = m.log();
         this.reg = unitAddress;
         this.irq = regToIrq(unitAddress);
         if (dmaWindowSize() > 0) {
             // LIOBN of a VIO device is its unit address (QEMU's SPAPR_VIO_LIOBN).
-            this.tce = new TceTable(unitAddress, 0, dmaWindowSize());
+            this.tce = new TceTable(unitAddress, 0, dmaWindowSize(), log);
         }
+    }
+
+    /** The machine's log once attached; before that, a log of the device's own. */
+    final PaprLog log() {
+        return log;
     }
 
     /** QEMU's spapr_vio_reg_to_irq for the address ranges it allocates. */
@@ -159,7 +166,7 @@ public abstract class VioDevice {
             int chunk = (int) Math.min(len, TceTable.PAGE_SIZE - (ioba & ~TceTable.PAGE_MASK));
             long ra = tce == null ? ioba : tce.translate(ioba, false);
             if (ra < 0 || !m.contains(ra, chunk)) {
-                PaprLog.once("vio-dma-read-fault", String.format("%s ioba 0x%x", nodeName(), ioba));
+                log.once("vio-dma-read-fault", String.format("%s ioba 0x%x", nodeName(), ioba));
                 return false;
             }
             m.read(ra, buf, off, chunk);
@@ -178,7 +185,7 @@ public abstract class VioDevice {
             int chunk = (int) Math.min(len, TceTable.PAGE_SIZE - (ioba & ~TceTable.PAGE_MASK));
             long ra = tce == null ? ioba : tce.translate(ioba, true);
             if (ra < 0 || !m.contains(ra, chunk)) {
-                PaprLog.once("vio-dma-write-fault", String.format("%s ioba 0x%x", nodeName(), ioba));
+                log.once("vio-dma-write-fault", String.format("%s ioba 0x%x", nodeName(), ioba));
                 return false;
             }
             m.write(ra, buf, off, chunk);
@@ -212,11 +219,11 @@ public abstract class VioDevice {
 
     long registerCrq(long addr, long len) {
         if (len < 0x1000 || len > 0x10000000) {
-            PaprLog.once("crq-bad-size", String.format("%s size 0x%x", nodeName(), len));
+            log.once("crq-bad-size", String.format("%s size 0x%x", nodeName(), len));
             return H.PARAMETER;
         }
         if ((addr & 0xfff) != 0) {
-            PaprLog.once("crq-unaligned", String.format("%s addr 0x%x", nodeName(), addr));
+            log.once("crq-unaligned", String.format("%s addr 0x%x", nodeName(), addr));
             return H.PARAMETER;
         }
         if (!supportsCrq()) {
@@ -245,7 +252,7 @@ public abstract class VioDevice {
      */
     protected final int sendCrq(byte[] crq) {
         if (crqSize == 0) {
-            PaprLog.once("crq-send-uninitialized", nodeName());
+            log.once("crq-send-uninitialized", nodeName());
             return -1;
         }
         byte[] valid = new byte[1];
@@ -253,7 +260,7 @@ public abstract class VioDevice {
             return (int) H.DEST_PARM;
         }
         if (valid[0] != 0) {
-            PaprLog.once("crq-full", nodeName());
+            log.once("crq-full", nodeName());
             return 1;
         }
         if (!dmaWrite(crqAddr + crqNext + 8, crq, 8, 8)) {

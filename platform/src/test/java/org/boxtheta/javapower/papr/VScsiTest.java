@@ -109,7 +109,7 @@ class VScsiTest {
             b.put(out ? 6 : 7, (byte) 1);
         }
         b.putLong(8, tag);
-        b.putLong(16, lun);
+        b.putLong(20, lun);
         b.put(32, cdb);
         if (len > 0) {
             b.putLong(48, va);
@@ -128,7 +128,7 @@ class VScsiTest {
         b.put(5, (byte) (out ? 0x20 : 0x02));
         b.put(out ? 6 : 7, (byte) n);
         b.putLong(8, tag);
-        b.putLong(16, lun);
+        b.putLong(20, lun);
         b.put(32, cdb);
         int total = 0;
         for (int l : lens) {
@@ -327,7 +327,7 @@ class VScsiTest {
     void taskManagement() {
         bringUp();
         ByteBuffer t = ByteBuffer.allocate(48);
-        t.put(0, (byte) 1).put(1, (byte) 0x06).putLong(8, 9).putLong(16, LUN0).put(26, (byte) 0x08);
+        t.put(0, (byte) 1).put(1, (byte) 0x06).putLong(8, 9).putLong(20, LUN0).put(30, (byte) 0x08);
         byte[] crq = sendIu(t.array(), VScsi.FORMAT_SRP);
         assertEquals(40, crq[7]);
         byte[] rsp = responseIu(crq);
@@ -338,9 +338,9 @@ class VScsiTest {
         assertEquals(1, rsp[1]); // solicited notification for success requested
         // The LUN reset raises a unit attention.
         assertTrue(((ScsiDisk) r.m.vscsi().targets().get(0)).unitAttentionPending());
-        t.put(26, (byte) 0x40);
+        t.put(30, (byte) 0x40);
         assertEquals(4, responseIu(sendIu(t.array(), VScsi.FORMAT_SRP))[39]);
-        t.putLong(16, 0x8700000000000000L).put(26, (byte) 0x01);
+        t.putLong(20, 0x8700000000000000L).put(30, (byte) 0x01);
         assertEquals(2, responseIu(sendIu(t.array(), VScsi.FORMAT_SRP))[39]);
     }
 

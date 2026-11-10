@@ -418,7 +418,7 @@ public final class VScsi extends VioDevice {
 
     private void command(Req req) {
         ByteBuffer bb = req.bb();
-        long lun = bb.getLong(16);
+        long lun = bb.getLong(20); // srp_cmd/srp_tsk_mgmt: tag at 8, 4 reserved bytes, LUN at 20
         int addCdbLen = req.iu[31] & 0xff;
         int cdbLen = 16 + (addCdbLen & ~3);
         byte[] cdb = new byte[cdbLen];
@@ -538,8 +538,8 @@ public final class VScsi extends VioDevice {
         ByteBuffer bb = req.bb();
         long tag = bb.getLong(8);
         int solNot = req.iu[1] & 0xff;
-        long lun = bb.getLong(16);
-        int func = req.iu[26] & 0xff;
+        long lun = bb.getLong(20); // srp_cmd/srp_tsk_mgmt: tag at 8, 4 reserved bytes, LUN at 20
+        int func = req.iu[30] & 0xff;
         Address a = decodeLun(lun);
         ScsiTarget t = find(a);
         int resp = TSK_MGMT_COMPLETE;

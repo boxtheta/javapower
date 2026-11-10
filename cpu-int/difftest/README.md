@@ -1,6 +1,6 @@
 # cpu-int differential tests
 
-Golden vectors for `javapower.cpu` come from QEMU, not from the spec. Unlike cpu-fpvec (user
+Golden vectors for `org.boxtheta.javapower.cpu` come from QEMU, not from the spec. Unlike cpu-fpvec (user
 mode), this harness runs **bare metal under `qemu-system-ppc64 -M pseries -cpu power9`** with our
 own firmware in place of SLOF, so it can cover 32-bit mode, both endiannesses, problem and
 supervisor state, privileged instructions, SPR access rules, interrupt delivery (SRR0/SRR1,

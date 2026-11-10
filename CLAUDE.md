@@ -17,11 +17,11 @@ Tumbleweed ppc64le to an interactive console.
 
 | Module | Package | Contents |
 |---|---|---|
-| `core` | `javapower.core` | Shared contracts: `CpuState`, `Op`, `DecodeTable`, `GuestMemory`, `PhysicalMemory`, `Hypervisor`, `PpcException`, `Msr`, `Spr`. Change only with the lead's agreement. |
-| `cpu-int` | `javapower.cpu` | Integer/branch/system instructions, run loop, interrupt delivery, timebase/decrementer, radix MMU. |
-| `cpu-fpvec` | `javapower.fpvec` | Software float, FP, VMX (Altivec), VSX, DFP instructions. |
-| `platform` | `javapower.papr` | Machine, device tree, hcalls, RTAS, XICS, VIO devices, disk backends. |
-| `app` | `javapower.app` | CLI and integration wiring. |
+| `core` | `org.boxtheta.javapower.core` | Shared contracts: `CpuState`, `Op`, `DecodeTable`, `GuestMemory`, `PhysicalMemory`, `Hypervisor`, `PpcException`, `Msr`, `Spr`. Change only with the lead's agreement. |
+| `cpu-int` | `org.boxtheta.javapower.cpu` | Integer/branch/system instructions, run loop, interrupt delivery, timebase/decrementer, radix MMU. |
+| `cpu-fpvec` | `org.boxtheta.javapower.fpvec` | Software float, FP, VMX (Altivec), VSX, DFP instructions. |
+| `platform` | `org.boxtheta.javapower.papr` | Machine, device tree, hcalls, RTAS, XICS, VIO devices, disk backends. |
+| `app` | `org.boxtheta.javapower.app` | CLI and integration wiring. |
 
 Modules other than `core` depend only on `core`, never on each other (`app` depends on all).
 
@@ -30,8 +30,7 @@ Modules other than `core` depend only on `core`, never on each other (`app` depe
 The emulator is published as a library as well as a CLI. Maven coordinates are
 `org.boxtheta.javapower:javapower-<module>` (`maven-publish` is applied to every module).
 
-- Java packages will move from `javapower.*` to `org.boxtheta.javapower.*`. The lead does this
-  rename in one pass once the in-flight module work has landed; do not rename packages yourself.
+- Java packages are `org.boxtheta.javapower.<module package>`.
 - Treat public types as library API: embedders construct and drive the machine from their own
   code, so no `System.exit`, no reliance on stdin/stdout outside the backends meant for it, no
   global mutable state, and host resources (threads, files) must be closeable.

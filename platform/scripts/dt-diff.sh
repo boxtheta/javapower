@@ -6,8 +6,8 @@
 # expected differences are rng-seed (random) and the order of the ibm,drc-* arrays (QEMU emits them
 # in GLib hash-table order, we emit them sorted by DRC index).
 set -e
-R=platform/src/test/resources/javapower/papr
-gradle -q :platform:test --tests javapower.papr.DeviceTreeTest
+R=platform/src/test/resources/org/boxtheta/javapower/papr
+gradle -q :platform:test --tests org.boxtheta.javapower.papr.DeviceTreeTest
 for t in reset:pseries-min cas-linux:cas-linux cas-freebsd:cas-freebsd; do
     ours=${t%%:*}; ref=${t##*:}
     dtc -q -I dtb -O dts -o platform/build/dt/$ours.dts platform/build/dt/$ours.dtb

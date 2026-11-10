@@ -5,7 +5,7 @@
 
 Disassembles every ELF (and raw big-endian blobs named *.bin) with llvm-objdump, collects the
 distinct instruction words with their mnemonics and execution-independent counts, and asks
-javapower.cpu.DecodeScan which ones the integer decode table does not handle. Floating-point
+org.boxtheta.javapower.cpu.DecodeScan which ones the integer decode table does not handle. Floating-point
 and vector instructions (the cpu-fpvec module) are listed separately.
 """
 import collections
@@ -67,7 +67,7 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     cp = ":".join(os.path.join(root, d) for d in ["core/build/classes/java/main", "cpu-int/build/classes/java/main",
                                                   "cpu-int/build/classes/java/test"])
-    res = subprocess.run(["java", "-cp", cp, "javapower.cpu.DecodeScan", tmp], stdout=subprocess.PIPE, text=True,
+    res = subprocess.run(["java", "-cp", cp, "org.boxtheta.javapower.cpu.DecodeScan", tmp], stdout=subprocess.PIPE, text=True,
                          check=True).stdout
     by = collections.defaultdict(lambda: [0, 0, set(), ""])
     for line in res.splitlines():

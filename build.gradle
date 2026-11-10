@@ -49,5 +49,5 @@ project(':app') {
         implementation project(':cpu-fpvec')
         implementation project(':platform')
     }
-    application { mainClass = 'javapower.app.Main' }
+    application { mainClass = 'org.boxtheta.javapower.app.Main' }
 }

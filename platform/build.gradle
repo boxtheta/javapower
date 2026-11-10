@@ -1,0 +1,4 @@
+// Guest RAM is off-heap; several machines may be alive at once in a test JVM.
+test {
+    jvmArgs '-XX:MaxDirectMemorySize=16g'
+}

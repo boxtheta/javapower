@@ -115,3 +115,7 @@ project the builds run on the shared dev server through `scripts/remote.sh <work
 Modules: `core` (shared contracts), `cpu-int` (integer, branch, system instructions, MMU, run
 loop), `cpu-fpvec` (floating point, VMX, VSX), `platform` (machine model, hypercalls, RTAS,
 devices), `emulator` (the embedding entry point), `app` (the CLI).
+
+## License
+
+Apache License, Version 2.0. See [LICENSE](LICENSE).

@@ -11,6 +11,10 @@ subprojects {
     }
     // Published as org.boxtheta.javapower:javapower-<module>.
     base { archivesName = "javapower-${project.name}" }
+    // Every published jar (classes, sources, javadoc) carries the license.
+    tasks.withType(Jar).configureEach {
+        from(rootProject.file('LICENSE')) { into 'META-INF' }
+    }
     tasks.withType(Javadoc).configureEach {
         options.encoding = 'UTF-8'
         options.addStringOption('Xdoclint:none', '-quiet')
@@ -20,6 +24,17 @@ subprojects {
             maven(MavenPublication) {
                 artifactId = "javapower-${project.name}"
                 from components.java
+                pom {
+                    name = "javapower-${project.name}"
+                    description = 'A JVM-based Power ISA (POWER9 pseries) emulator'
+                    licenses {
+                        license {
+                            name = 'Apache License, Version 2.0'
+                            url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                            distribution = 'repo'
+                        }
+                    }
+                }
             }
         }
     }

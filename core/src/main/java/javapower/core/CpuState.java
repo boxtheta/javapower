@@ -63,8 +63,13 @@ public final class CpuState {
      */
     public long procTable;
 
-    /** External interrupt line from the interrupt presentation controller. Set/cleared by any thread. */
+    /**
+     * External interrupt line from the interrupt presentation controller. Any thread may change it,
+     * but only through {@link #setExternalIrq} so an idle CPU is woken.
+     */
     public volatile boolean extIrq;
+    /** The thread currently inside the run loop, or null. Written by the run loop only. */
+    public volatile Thread runner;
     /** Set by H_CEDE / H_CONFER; the run loop idles until an interrupt is pending, then clears it. */
     public boolean ceded;
     /** Asks the run loop to return to its caller at the next instruction boundary. */
@@ -72,6 +77,25 @@ public final class CpuState {
 
     /** Instructions retired since reset; the basis for virtual time. */
     public long icount;
+
+    /** Drive the external interrupt line; wakes the CPU if it is idle in H_CEDE. */
+    public void setExternalIrq(boolean level) {
+        extIrq = level;
+        if (level) {
+            wake();
+        }
+    }
+
+    /**
+     * Wake the run loop if it is parked (idle or waiting for a timer). The run loop parks with
+     * {@link java.util.concurrent.locks.LockSupport#parkNanos} and re-checks its conditions on return.
+     */
+    public void wake() {
+        Thread t = runner;
+        if (t != null) {
+            java.util.concurrent.locks.LockSupport.unpark(t);
+        }
+    }
 
     public long getXer() {
         return ((long) so << 31) | ((long) ov << 30) | ((long) ca << 29)

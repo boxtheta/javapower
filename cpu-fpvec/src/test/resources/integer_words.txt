@@ -1,0 +1,175 @@
+106429b0|maddhd 3, 4, 5, 6
+106429b1|maddhdu 3, 4, 5, 6
+106429b3|maddld 3, 4, 5, 6
+7c642a14|add 3, 4, 5
+7c642a15|add. 3, 4, 5
+7c642e14|addo 3, 4, 5
+7c642814|addc 3, 4, 5
+7c642914|adde 3, 4, 5
+7c6401d4|addme 3, 4
+7c640194|addze 3, 4
+7c642850|subf 3, 4, 5
+7c642810|subfc 3, 4, 5
+7c642910|subfe 3, 4, 5
+7c6401d0|subfme 3, 4
+7c640190|subfze 3, 4
+7c6400d0|neg 3, 4
+7c6429d6|mullw 3, 4, 5
+7c642896|mulhw 3, 4, 5
+7c642816|mulhwu 3, 4, 5
+7c6429d2|mulld 3, 4, 5
+7c642892|mulhd 3, 4, 5
+7c642812|mulhdu 3, 4, 5
+7c642bd6|divw 3, 4, 5
+7c642b96|divwu 3, 4, 5
+7c642bd2|divd 3, 4, 5
+7c642b92|divdu 3, 4, 5
+7c642b56|divwe 3, 4, 5
+7c642b16|divweu 3, 4, 5
+7c642b52|divde 3, 4, 5
+7c642b12|divdeu 3, 4, 5
+7c642e16|modsw 3, 4, 5
+7c642a16|moduw 3, 4, 5
+7c642e12|modsd 3, 4, 5
+7c642a12|modud 3, 4, 5
+7c832838|and 3, 4, 5
+7c832878|andc 3, 4, 5
+7c832b78|or 3, 4, 5
+7c832b38|orc 3, 4, 5
+7c8328f8|nor 3, 4, 5
+7c832bb8|nand 3, 4, 5
+7c832a78|xor 3, 4, 5
+7c832a38|eqv 3, 4, 5
+7c832830|slw 3, 4, 5
+7c832c30|srw 3, 4, 5
+7c832e30|sraw 3, 4, 5
+7c832e70|srawi 3, 4, 5
+7c832836|sld 3, 4, 5
+7c832c36|srd 3, 4, 5
+7c832e34|srad 3, 4, 5
+7c830e76|sradi 3, 4, 33
+7c830034|cntlzw 3, 4
+7c830074|cntlzd 3, 4
+7c830434|cnttzw 3, 4
+7c830474|cnttzd 3, 4
+7c8300f4|popcntb 3, 4
+7c8302f4|popcntw 3, 4
+7c8303f4|popcntd 3, 4
+7c830134|.long 0x7c830134 # prtyw 3, 4
+7c830174|.long 0x7c830174 # prtyd 3, 4
+7c832bf8|cmpb 3, 4, 5
+7c8329f8|bpermd 3, 4, 5
+7c830774|extsb 3, 4
+7c830734|extsh 3, 4
+7c8307b4|extsw 3, 4
+7c832ef4|extswsli 3, 4, 5
+7d842800|cmpw 3, 4, 5
+7da42800|cmpd 3, 4, 5
+7d842840|cmplw 3, 4, 5
+7da42840|cmpld 3, 4, 5
+7da42980|cmprb 3, 1, 4, 5
+7d8429c0|cmpeqb 3, 4, 5
+7c64299e|isel 3, 4, 5, 6
+7c600026|mfcr 3
+7c710026|mfocrf 3, 16
+7c6ff120|mtcrf 255, 3
+7c710120|mtocrf 16, 3
+7c6802a6|mfspr 3, 8
+7c6803a6|mtspr 8, 3
+7c6c42a6|mftb 3
+7c6000a6|mfmsr 3
+7c600124|mtmsr 3
+7c600164|mtmsrd 3
+7c6428ae|lbzx 3, 4, 5
+7c6428ee|lbzux 3, 4, 5
+7c642a2e|lhzx 3, 4, 5
+7c642a6e|lhzux 3, 4, 5
+7c642aae|lhax 3, 4, 5
+7c642aee|lhaux 3, 4, 5
+7c64282e|lwzx 3, 4, 5
+7c64286e|lwzux 3, 4, 5
+7c642aaa|lwax 3, 4, 5
+7c642aea|lwaux 3, 4, 5
+7c64282a|ldx 3, 4, 5
+7c64286a|ldux 3, 4, 5
+7c6429ae|stbx 3, 4, 5
+7c6429ee|stbux 3, 4, 5
+7c642b2e|sthx 3, 4, 5
+7c642b6e|sthux 3, 4, 5
+7c64292e|stwx 3, 4, 5
+7c64296e|stwux 3, 4, 5
+7c64292a|stdx 3, 4, 5
+7c64296a|stdux 3, 4, 5
+7c642e2c|lhbrx 3, 4, 5
+7c642c2c|lwbrx 3, 4, 5
+7c642c28|ldbrx 3, 4, 5
+7c642f2c|sthbrx 3, 4, 5
+7c642d2c|stwbrx 3, 4, 5
+7c642d28|stdbrx 3, 4, 5
+7c642828|lwarx 3, 4, 5
+7c6428a8|ldarx 3, 4, 5
+7c642868|lbarx 3, 4, 5
+7c6428e8|lharx 3, 4, 5
+7cc42a28|lqarx 6, 4, 5
+7c64292d|stwcx. 3, 4, 5
+7c6429ad|stdcx. 3, 4, 5
+7c642d6d|stbcx. 3, 4, 5
+7c642dad|sthcx. 3, 4, 5
+7cc4296d|stqcx. 6, 4, 5
+7c042fec|dcbz 4, 5
+7c0428ac|dcbf 4, 5
+7c04286c|dcbst 4, 5
+7c042a2c|dcbt 4, 5
+7c0429ec|dcbtst 4, 5
+7c042bac|dcbi 4, 5
+7c042fac|icbi 4, 5
+7c04282c|icbt 0, 4, 5
+7c0004ac|sync
+7c2004ac|lwsync
+7c4004ac|ptesync
+7c0006ac|eieio
+7c832808|tw 4, 3, 5
+7c832888|td 4, 3, 5
+7c6444aa|lswi 3, 4, 8
+7c642c2a|.long 0x7c642c2a # lswx 3, 4, 5
+7c6445aa|stswi 3, 4, 8
+7c642d2a|.long 0x7c642d2a # stswx 3, 4, 5
+7c6105e6|darn 3, 1
+7c642954|addex 3, 4, 5, 0
+7c680100|setb 3, 2
+7d000480|mcrxrx 2
+7c242e0c|copy 4, 5
+7c242f0d|paste. 4, 5
+7c00068c|cpabort
+7c00291c|msgsndp 5
+7c00295c|.long 0x7c00295c # msgclrp 5
+7cc02a64|tlbie 5, 6
+7c002a24|tlbiel 5
+7c00046c|tlbsync
+7c0003e4|slbia
+7c002b64|slbie 5
+7c602b24|slbmte 3, 5
+7c602f26|slbmfee 3, 5
+7c602ea6|slbmfev 3, 5
+7c00003c|wait
+7c64048c|.long 0x7c64048c # lwat 3, 4, 0
+7c6404cc|.long 0x7c6404cc # ldat 3, 4, 0
+7c64058c|.long 0x7c64058c # stwat 3, 4, 0
+7c6405cc|.long 0x7c6405cc # stdat 3, 4, 0
+4c880000|mcrf 1, 2
+4c00012c|isync
+4c000024|rfid
+4c000224|hrfid
+44000002|sc
+60000000|nop
+7c00051d|tbegin. 0
+7c00055d|tend. 0
+e0c40010|lq 6, 16(4)
+f8c40012|stq 6, 16(4)
+a0640008|lhz 3, 8(4)
+80640008|lwz 3, 8(4)
+e8640008|ld 3, 8(4)
+f8640008|std 3, 8(4)
+e864000a|lwa 3, 8(4)
+e8640009|ldu 3, 8(4)
+f8640009|stdu 3, 8(4)

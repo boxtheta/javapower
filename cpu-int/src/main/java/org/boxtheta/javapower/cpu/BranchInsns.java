@@ -5,7 +5,6 @@ import static org.boxtheta.javapower.cpu.Fields.rb;
 import static org.boxtheta.javapower.cpu.Fields.rt;
 
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PpcException;
 import org.boxtheta.javapower.core.Spr;
@@ -14,7 +13,7 @@ import org.boxtheta.javapower.core.Spr;
 final class BranchInsns {
     private BranchInsns() {}
 
-    static void register(DecodeTable t) {
+    static void register(Reg t) {
         t.addPrimary(18, "b", BranchInsns::b);
         t.addPrimary(16, "bc", BranchInsns::bc);
         t.addX(19, 16, "bclr", BranchInsns::bclr);

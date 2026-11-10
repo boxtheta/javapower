@@ -98,6 +98,15 @@ public final class RadixMmu implements GuestMemory {
     /** Interpreter owning this MMU, if any; used by instruction handlers to reach timers etc. */
     Interpreter owner;
 
+    /**
+     * Store guard for the interpreter's compiled blocks: the real address range [guardLo,
+     * guardHi) of the block being run (empty otherwise). A store into it sets guardHit, and the
+     * block stops after that instruction so the rest is fetched again.
+     */
+    long guardLo;
+    long guardHi;
+    boolean guardHit;
+
     /** Statistics, for tests and tuning. */
     long walks;
 
@@ -394,7 +403,9 @@ public final class RadixMmu implements GuestMemory {
 
     @Override
     public void write8(long ea, int v) {
-        pm.write8(xlate(eaMode(ea), STORE, 1), v);
+        long pa = xlate(eaMode(ea), STORE, 1);
+        guard(pa, 1);
+        pm.write8(pa, v);
     }
 
     @Override
@@ -405,6 +416,7 @@ public final class RadixMmu implements GuestMemory {
             return;
         }
         long pa = xlate(ea, STORE, 2);
+        guard(pa, 2);
         if ((s.msr & Msr.LE) != 0) {
             pm.write16le(pa, v);
         } else {
@@ -420,6 +432,7 @@ public final class RadixMmu implements GuestMemory {
             return;
         }
         long pa = xlate(ea, STORE, 4);
+        guard(pa, 4);
         if ((s.msr & Msr.LE) != 0) {
             pm.write32le(pa, v);
         } else {
@@ -435,10 +448,18 @@ public final class RadixMmu implements GuestMemory {
             return;
         }
         long pa = xlate(ea, STORE, 8);
+        guard(pa, 8);
         if ((s.msr & Msr.LE) != 0) {
             pm.write64le(pa, v);
         } else {
             pm.write64be(pa, v);
+        }
+    }
+
+    /** Note a store of {@code size} bytes at real address {@code pa} against the store guard. */
+    private void guard(long pa, int size) {
+        if (pa < guardHi && pa + size > guardLo) {
+            guardHit = true;
         }
     }
 
@@ -468,6 +489,8 @@ public final class RadixMmu implements GuestMemory {
         int n1 = (int) (0x1000 - (ea & 0xfff));
         long pa1 = xlate(ea, STORE, n1);
         long pa2 = xlate(ea2, STORE, size - n1);
+        guard(pa1, n1);
+        guard(pa2, size - n1);
         boolean le = (s.msr & Msr.LE) != 0;
         for (int k = 0; k < size; k++) {
             int b = (int) (le ? v >>> (8 * k) : v >>> (8 * (size - 1 - k))) & 0xff;

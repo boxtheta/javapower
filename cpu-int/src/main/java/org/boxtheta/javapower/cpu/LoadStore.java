@@ -8,7 +8,6 @@ import static org.boxtheta.javapower.cpu.Fields.rt;
 import static org.boxtheta.javapower.cpu.Fields.si;
 
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.GuestMemory;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PpcException;
@@ -18,7 +17,7 @@ import org.boxtheta.javapower.core.Spr;
 final class LoadStore {
     private LoadStore() {}
 
-    static void register(DecodeTable t) {
+    static void register(Reg t) {
         // D-form.
         t.addPrimary(34, "lbz", LoadStore::lbz);
         t.addPrimary(35, "lbzu", LoadStore::lbzu);

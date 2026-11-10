@@ -24,9 +24,24 @@ class GoldenTest {
 
     @TestFactory
     Stream<DynamicNode> golden() throws IOException {
+        return replay(false);
+    }
+
+    /** The same vectors with every block compiled (see BlockCompiler) before it first runs. */
+    @TestFactory
+    Stream<DynamicNode> goldenCompiled() throws IOException {
+        return replay(true);
+    }
+
+    private Stream<DynamicNode> replay(boolean compiled) throws IOException {
         DecodeTable t = new DecodeTable();
         t.addAll(new IntInsns());
         Golden.Machine m = new Golden.Machine(t);
+        if (compiled) {
+            m.cpu.blockThreshold = 1;
+        } else {
+            m.cpu.compileBlocks = false;
+        }
         List<DynamicNode> groups = new ArrayList<>();
         for (String g : GROUPS) {
             List<Golden.Case> cases;

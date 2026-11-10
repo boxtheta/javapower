@@ -1,7 +1,6 @@
 package org.boxtheta.javapower.cpu;
 
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.Op;
 import org.boxtheta.javapower.core.PpcException;
 
@@ -99,15 +98,15 @@ final class Fields {
      * Register an instruction whose encodings with any of the {@code inval} bits set are invalid
      * forms, as in QEMU's opcode table (reserved fields must be zero there).
      */
-    static void add(DecodeTable t, int mask, int match, int inval, String name, Op op) {
+    static void add(Reg t, int mask, int match, int inval, String name, Op op) {
         t.add(mask | inval, match, name, op);
         if (inval != 0) {
             t.add(mask, match, name + " (invalid form)", INVALID);
         }
     }
 
-    /** X-form variant of {@link #add(DecodeTable, int, int, int, String, Op)}. */
-    static void addX(DecodeTable t, int po, int xo, int inval, String name, Op op) {
+    /** X-form variant of {@link #add(Reg, int, int, int, String, Op)}. */
+    static void addX(Reg t, int po, int xo, int inval, String name, Op op) {
         add(t, 0xfc000000 | (0x3ff << 1), (po << 26) | (xo << 1), inval, name, op);
     }
 }

@@ -12,14 +12,13 @@ import static org.boxtheta.javapower.cpu.Fields.si;
 import static org.boxtheta.javapower.cpu.Fields.ui;
 
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.PpcException;
 
 /** Fixed-point arithmetic, logical, compare, rotate/shift and trap instructions. */
 final class Alu {
     private Alu() {}
 
-    static void register(DecodeTable t) {
+    static void register(Reg t) {
         // D-form arithmetic / logical / compare / trap.
         t.addPrimary(14, "addi", Alu::addi);
         t.addPrimary(15, "addis", Alu::addis);

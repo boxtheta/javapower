@@ -1,0 +1,9 @@
+ld std addi bc or add cmpi ori rlwinm b lwz bcctr xor rldicl bclr addis mtspr mfspr stw andi.
+lbz stdu and cmpl cmpli subf rldicr cmp extsw ldx mulld stb stbu mtcrf sync srd lhz neg stdx rldic
+sld andc subfe subfc rldimi lwzx lbzx stwu sth mfcr isel nor extsb extsh lwa lha lhzx
+cror crxor stwx stbx ldu lwzu lbzu sradi srad srawi sraw slw srw cntlzd cntlzw mullw mulli divd
+divdu divw divwu xori oris xoris andis. subfic addic addze adde addc addme subfme crand crandc
+crnor crnand creqv crorc mcrf mfmsr mtmsrd isync dcbt dcbtst eieio ldarx stdcx. lwarx stwcx.
+lwbrx stwbrx ldbrx stdbrx lhbrx sthbrx ldux lwzux lbzux stdux stwux stbux lhzu lhau sthu sthx
+lhax lwax lwaux popcntd cnttzd cnttzw mulhd mulhdu mulhw mulhwu eqv orc nand extswsli rldcl
+rlwnm dcbz dcbf dcbst icbi sc rfid tw td twi tdi mftb setb cmpb modud moduw modsd modsw dss

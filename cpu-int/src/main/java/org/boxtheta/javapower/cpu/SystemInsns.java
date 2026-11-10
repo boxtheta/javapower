@@ -5,7 +5,6 @@ import static org.boxtheta.javapower.cpu.Fields.rb;
 import static org.boxtheta.javapower.cpu.Fields.rt;
 
 import org.boxtheta.javapower.core.CpuState;
-import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PpcException;
 import org.boxtheta.javapower.core.Spr;
@@ -29,7 +28,7 @@ final class SystemInsns {
     static final int IC_TAR = 8;
     static final int IC_SCV = 12;
 
-    static void register(DecodeTable t) {
+    static void register(Reg t) {
         // Reserved-field masks ("inval") are QEMU's: encodings with those bits set are illegal.
         Fields.add(t, 0xfc000002, (17 << 26) | 2, 0x03FFF01D, "sc", SystemInsns::sc);
         Fields.add(t, 0xfc000003, (17 << 26) | 1, 0x03FFF01C, "scv", SystemInsns::scv);

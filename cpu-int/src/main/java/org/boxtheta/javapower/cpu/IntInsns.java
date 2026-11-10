@@ -15,9 +15,13 @@ import org.boxtheta.javapower.core.InsnSet;
 public final class IntInsns implements InsnSet {
     @Override
     public void register(DecodeTable table) {
-        Alu.register(table);
-        LoadStore.register(table);
-        BranchInsns.register(table);
-        SystemInsns.register(table);
+        register(new Reg(table));
+    }
+
+    static void register(Reg r) {
+        Alu.register(r);
+        LoadStore.register(r);
+        BranchInsns.register(r);
+        SystemInsns.register(r);
     }
 }

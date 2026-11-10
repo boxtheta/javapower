@@ -59,6 +59,10 @@ final class SystemInsns {
         Fields.addX(t, 31, 1014, 0x03C00001, "dcbz", SystemInsns::dcbz);
         Fields.addX(t, 31, 278, 0x00000001, "dcbt", SystemInsns::nop);
         Fields.addX(t, 31, 246, 0x00000001, "dcbtst", SystemInsns::nop);
+        // Altivec data-stream hints: no-ops, as in QEMU. Linux issues dssall on every mm switch.
+        Fields.addX(t, 31, 342, 0x00000001, "dst", SystemInsns::nop);
+        Fields.addX(t, 31, 374, 0x00000001, "dstst", SystemInsns::nop);
+        Fields.addX(t, 31, 822, 0x00000001, "dss", SystemInsns::nop);
         Fields.addX(t, 31, 86, 0x03C00001, "dcbf", SystemInsns::dcbfst);
         Fields.addX(t, 31, 54, 0x03E00001, "dcbst", SystemInsns::dcbfst);
         Fields.addX(t, 31, 982, 0x03E00001, "icbi", SystemInsns::icbi);

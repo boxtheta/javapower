@@ -3,8 +3,8 @@
 #
 #   build.sh [--install] [outdir]
 #
-# Writes slof.bin, slof.bin.gz and slof.properties (provenance: SLOF tag and commit, toolchain,
-# base image, sizes and SHA-256 of both files) to outdir (default: ./out next to this script) and
+# Writes slof.bin, slof.bin.gz and slof.properties (provenance: SLOF tag and commit, the patches
+# applied, toolchain, base image, sizes and SHA-256 of both files) to outdir (default: ./out next to this script) and
 # prints the SHA-256 of both images. With --install it also copies slof.bin.gz and
 # slof.properties into the module's resources, replacing the committed image.
 #

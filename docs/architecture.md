@@ -8,7 +8,8 @@ console.
 
 - PAPR `pseries` guest, mirroring QEMU's `-M pseries,ic-mode=xics -cpu power9` closely enough to
   run the stock SLOF firmware unmodified. We build SLOF ourselves from the same tag and toolchain as
-  QEMU's `/usr/share/qemu/slof.bin` and ship it in the `firmware-slof` module.
+  QEMU's `/usr/share/qemu/slof.bin` and ship it in the `firmware-slof` module; the only change is
+  the product name in its boot banner (`Javapower Starting`).
 - The emulator is the hypervisor: the guest runs with MSR[HV]=0 and `sc 1` in supervisor state is a
   direct call into `Hypervisor.hcall` (QEMU's "virtual hypervisor" arrangement).
 - POWER9 DD2.2 (PVR 0x004e1202), ISA 3.0B, big- and little-endian: SLOF is BE; the FreeBSD

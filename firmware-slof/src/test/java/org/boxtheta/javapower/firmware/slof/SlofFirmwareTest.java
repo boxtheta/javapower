@@ -2,6 +2,7 @@ package org.boxtheta.javapower.firmware.slof;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -63,6 +64,17 @@ class SlofFirmwareTest {
         assertTrue(v.startsWith("qemu-slof-"), v);
         String banner = new String(SlofFirmware.image(), StandardCharsets.ISO_8859_1);
         assertTrue(banner.contains("FW Version = " + v), "version string not in the image");
+    }
+
+    /** The boot banner names this project (firmware-build/product-name.patch), and the record says so. */
+    @Test
+    void bannerSaysJavapower() {
+        String image = new String(SlofFirmware.image(), StandardCharsets.ISO_8859_1);
+        assertTrue(image.contains("Javapower Starting\r\n"), "product name not in the image");
+        assertFalse(image.contains("QEMU Starting"), "upstream product name still in the image");
+        Properties p = SlofFirmware.provenance();
+        assertEquals("Javapower", p.getProperty("slof.product-name"));
+        assertEquals("product-name.patch", p.getProperty("slof.patches"));
     }
 
     @Test

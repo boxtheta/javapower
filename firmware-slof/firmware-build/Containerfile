@@ -6,7 +6,8 @@
 #
 # Debian 12 (bookworm) because its cross toolchain (GCC 12.2.0-13cross1, binutils 2.40-2) is the one
 # QEMU's own pc-bios/slof.bin was built with (its .comment and build_info.img say so). The result
-# differs from QEMU's image only in the build date.
+# differs from QEMU's image only in the build date and in the product name of the boot banner,
+# which product-name.patch changes from QEMU to Javapower.
 
 FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
@@ -33,13 +34,19 @@ RUN git init -q . \
  && git checkout -q --detach FETCH_HEAD \
  && test "$(git rev-parse HEAD)" = "$SLOF_COMMIT"
 
+# The one change to the upstream source: the product name in the boot banner.
+COPY product-name.patch /src/product-name.patch
+RUN git apply /src/product-name.patch \
+ && grep -q '^#define PRODUCT_NAME "Javapower"$' board-qemu/include/product.h
+
 # Reproducibility:
 # - SOURCE_DATE_EPOCH (the commit time) fixes GCC's __DATE__/__TIME__ in the "Build Date" banner
 #   and the date create_crc writes into the ROM header; TZ=UTC because create_crc formats it with
 #   localtime().
 # - RELEASE is the version string SLOF prints ("FW Version") and puts in the device tree; set it to
 #   the tag, as QEMU's image does. Without it SLOF uses git-<hash>, or USER@HOSTNAME for a tree
-#   without .git. The ROM header's DRIVER_NAME comes from the .git above (git-<12 hex digits>).
+#   without .git. The ROM header's DRIVER_NAME comes from the .git above (git-<12 hex digits>);
+#   both name the upstream commit, patch or no patch.
 # - The board config keeps SNK_BIOSEMU_APPS (the x86 BIOS emulator) commented out.
 # - zopfli writes a gzip member with no file name and a zero timestamp, and is deterministic.
 RUN grep -q '^#export SNK_BIOSEMU_APPS' board-qemu/config \
@@ -51,6 +58,8 @@ RUN grep -q '^#export SNK_BIOSEMU_APPS' board-qemu/config \
  && { echo "slof.tag=$SLOF_TAG"; \
       echo "slof.commit=$SLOF_COMMIT"; \
       echo "slof.repository=$SLOF_REPO"; \
+      echo "slof.patches=product-name.patch"; \
+      echo "slof.product-name=$(sed -n 's/^#define PRODUCT_NAME "\(.*\)"$/\1/p' board-qemu/include/product.h)"; \
       echo "build.board=qemu"; \
       echo "build.source-date-epoch=$SOURCE_DATE_EPOCH"; \
       echo "build.apt-snapshot=$APT_SNAPSHOT"; \

@@ -1,0 +1,13 @@
+The product name SLOF prints in its boot banner ("<name> Starting"): Javapower, not QEMU.
+
+--- a/board-qemu/include/product.h
++++ b/board-qemu/include/product.h
+@@ -15,7 +15,7 @@
+
+ /* This is also the name which is also put in the flash and should
+  * therefore not excedd the length of 32 bytes */
+-#define PRODUCT_NAME "QEMU"
++#define PRODUCT_NAME "Javapower"
+
+ /* Generic identifier used in the flash */
+ #define FLASHFS_MAGIC "magic123"

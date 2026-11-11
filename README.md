@@ -249,9 +249,10 @@ conventions for changes are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The SLOF image is committed, compressed, as
 `firmware-slof/src/main/resources/org/boxtheta/javapower/firmware/slof/slof.bin.gz`, next to
-`slof.properties`, which records its provenance (SLOF tag and commit, toolchain versions, base
-image digest, size and SHA-256 of the raw and compressed image). A normal Gradle build needs
-neither a cross compiler nor podman. To rebuild it (Linux with podman, rootless is fine):
+`slof.properties`, which records its provenance (SLOF tag and commit, the patch applied, toolchain
+versions, base image digest, size and SHA-256 of the raw and compressed image). A normal Gradle
+build needs neither a cross compiler nor podman. To rebuild it (Linux with podman, rootless is
+fine):
 
 ```
 firmware-slof/firmware-build/build.sh [--install] [outdir]
@@ -262,9 +263,11 @@ pinned snapshot.debian.org date, SLOF pinned by commit), with `SOURCE_DATE_EPOCH
 commit time, and compresses it with zopfli (standard gzip with no name or timestamp, about 6%
 smaller than `gzip -9`), so the output is bit-for-bit reproducible. The cross toolchain (GCC 12.2, binutils
 2.40) is the one QEMU's own image was built with, so the result differs from
-`/usr/share/qemu/slof.bin` only in its build date. It prints the SHA-256 of both files;
-`--install` copies the result into the resources. To move to a new SLOF release, change the tag
-and commit (and if needed the snapshot date) in `firmware-build/Containerfile`.
+`/usr/share/qemu/slof.bin` only in its build date and in the product name of the boot banner:
+`firmware-build/product-name.patch` makes it read `Javapower Starting` instead of `QEMU Starting`.
+It prints the SHA-256 of both files; `--install` copies the result into the resources. To move to
+a new SLOF release, change the tag and commit (and if needed the snapshot date) in
+`firmware-build/Containerfile`.
 
 ### Releasing
 
@@ -292,8 +295,9 @@ Copyright 2026 Box Theta. Apache License, Version 2.0. See [LICENSE](LICENSE) an
 ## Third-party notes
 
 **SLOF.** The `javapower-firmware-slof` artifact contains a binary image of SLOF (Slimline Open
-Firmware, https://gitlab.com/slof/slof), built by this project from the unmodified upstream tag
-`qemu-slof-20260627`. SLOF is copyright IBM Corporation and contributors and is distributed under
+Firmware, https://gitlab.com/slof/slof), built by this project from the upstream tag
+`qemu-slof-20260627` with one change: the product name in the boot banner is `Javapower` instead
+of `QEMU` ([product-name.patch](firmware-slof/firmware-build/product-name.patch)). SLOF is copyright IBM Corporation and contributors and is distributed under
 the 3-clause BSD license; the jar carries it as `META-INF/LICENSE-SLOF` (source:
 [firmware-slof/LICENSE-SLOF](firmware-slof/LICENSE-SLOF)) and its POM lists both licenses. The
 x86 BIOS emulator, which SLOF keeps under a different license, is not built into the image. The

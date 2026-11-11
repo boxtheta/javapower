@@ -11,8 +11,9 @@ import java.util.zip.GZIPInputStream;
 
 /**
  * The SLOF (Slimline Open Firmware) image for the javapower {@code pseries} machine, built from
- * the SLOF sources (board {@code qemu}) by this artifact's reproducible build. SLOF is BSD
- * licensed; see {@code META-INF/LICENSE-SLOF} in this jar.
+ * the SLOF sources (board {@code qemu}) by this artifact's reproducible build. The one change to
+ * the upstream source is the product name in the boot banner, which reads
+ * {@code Javapower Starting}. SLOF is BSD licensed; see {@code META-INF/LICENSE-SLOF} in this jar.
  *
  * <p>Pass the image to the machine configuration:
  * <pre>{@code

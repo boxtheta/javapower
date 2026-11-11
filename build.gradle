@@ -9,7 +9,7 @@ subprojects {
     apply plugin: 'maven-publish'
     group = 'org.boxtheta.javapower'
     // scripts/release.sh passes the release version; everything else builds a snapshot.
-    version = providers.gradleProperty('releaseVersion').getOrElse('0.1.0-SNAPSHOT')
+    version = providers.gradleProperty('releaseVersion').getOrElse('0.3.0-SNAPSHOT')
     repositories { mavenCentral() }
     java {
         // Compiled and tested with JDK 21, the oldest supported runtime; `test27` also runs the

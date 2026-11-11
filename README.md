@@ -17,12 +17,12 @@ Add the `emulator` artifact, which pulls in the CPU, FPU/vector and platform mod
 <dependency>
   <groupId>org.boxtheta.javapower</groupId>
   <artifactId>javapower-emulator</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.2.0</version>
 </dependency>
 <dependency>
   <groupId>org.boxtheta.javapower</groupId>
   <artifactId>javapower-firmware-slof</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 

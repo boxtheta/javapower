@@ -5,3 +5,4 @@ build/
 # Local setup for scripts/remote.sh (see docs/development.md).
 /local.env
 *.iml
+__pycache__/

@@ -1074,19 +1074,71 @@ public final class Machine implements Hypervisor, AutoCloseable {
             d.writeLong(disk.backend().size());
             d.writeBoolean(disk.backend().readOnly());
         }
-        // Absent (not even a count) without MMIO regions, so such states are as before.
+        // Optional sections: absent without the devices they describe, so that a machine
+        // without any writes the description it always did.
         if (!mmioDevices.isEmpty()) {
-            d.writeInt(mmioDevices.size());
-            for (MmioDevice m : mmioDevices) {
-                MmioRegion r = m.region();
-                d.writeUTF(r.name());
-                d.writeLong(r.base());
-                d.writeLong(r.size());
-                d.writeBoolean(r.order() == java.nio.ByteOrder.BIG_ENDIAN);
-                d.writeInt(m.irq());
-                d.writeByte(m.config().interrupt);
+            hardwareSection(d, "MMIO", o -> {
+                o.writeInt(mmioDevices.size());
+                for (MmioDevice m : mmioDevices) {
+                    MmioRegion r = m.region();
+                    o.writeUTF(r.name());
+                    o.writeLong(r.base());
+                    o.writeLong(r.size());
+                    o.writeBoolean(r.order() == java.nio.ByteOrder.BIG_ENDIAN);
+                    o.writeInt(m.irq());
+                    o.writeByte(m.config().interrupt);
+                }
+            });
+        }
+    }
+
+    /** Writes the body of one section of the hardware description. */
+    private interface HardwareWriter {
+        void write(java.io.DataOutput o) throws IOException;
+    }
+
+    /**
+     * Append an optional section to the hardware description: a tag of four ASCII characters and
+     * the body with its length. Sections follow the SCSI devices in a fixed order, each written
+     * only by a machine that has such devices; {@link #checkHardware} compares them by tag, a
+     * missing section standing for none of its devices.
+     */
+    private static void hardwareSection(java.io.DataOutput d, String tag, HardwareWriter w) throws IOException {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream o = new java.io.DataOutputStream(b);
+        w.write(o);
+        o.flush();
+        if (tag.length() != 4) {
+            throw new IllegalArgumentException(tag);
+        }
+        d.writeBytes(tag);
+        d.writeInt(b.size());
+        d.write(b.toByteArray());
+    }
+
+    /**
+     * The optional sections in the rest of a hardware description, by tag, in the order written.
+     *
+     * @throws java.io.EOFException if a section is cut short or malformed
+     */
+    private static java.util.Map<String, java.io.DataInputStream> hardwareSections(byte[] rest) throws IOException {
+        java.util.Map<String, java.io.DataInputStream> m = new java.util.LinkedHashMap<>();
+        java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(rest));
+        while (in.available() > 0) {
+            byte[] t = new byte[4];
+            in.readFully(t);
+            int len = in.readInt();
+            if (len < 0 || len > in.available()) {
+                throw new java.io.EOFException();
+            }
+            byte[] body = new byte[len];
+            in.readFully(body);
+            String tag = new String(t, java.nio.charset.StandardCharsets.US_ASCII);
+            if (m.put(tag, new java.io.DataInputStream(new java.io.ByteArrayInputStream(body))) != null) {
+                throw new java.io.EOFException();
             }
         }
+        return m;
     }
 
     /**
@@ -1227,9 +1279,32 @@ public final class Machine implements Hypervisor, AutoCloseable {
             compare(diff, what + "bytes", r.readLong(), cur.readLong());
             compare(diff, what + "read-only", r.readBoolean(), cur.readBoolean());
         }
-        // The MMIO regions follow the disks; with another disk count they cannot be found.
-        int sm = n != m ? 0 : r.remaining() > 0 ? r.readInt("MMIO region count", 0, 1 << 16) : 0;
-        int mm = n != m ? 0 : cur.available() > 0 ? cur.readInt() : 0;
+        // The optional sections follow the disks; with another disk count they cannot be found.
+        if (n == m) {
+            byte[] rest = new byte[r.remaining()];
+            r.readFully(rest);
+            try {
+                java.util.Map<String, java.io.DataInputStream> saved = hardwareSections(rest);
+                java.util.Map<String, java.io.DataInputStream> now = hardwareSections(cur.readAllBytes());
+                compareMmio(diff, saved.remove("MMIO"), now.remove("MMIO"));
+                for (String tag : saved.keySet()) {
+                    diff.add("hardware this version of javapower does not know: section " + tag.trim());
+                }
+            } catch (java.io.EOFException e) {
+                throw r.corrupt("a hardware section ends early");
+            }
+        }
+        if (!diff.isEmpty()) {
+            throw new org.boxtheta.javapower.core.StateMismatchException(
+                    "the machine state was saved from different hardware: " + String.join("; ", diff));
+        }
+    }
+
+    /** Compare the MMIO sections of two hardware descriptions; null stands for no regions. */
+    private static void compareMmio(List<String> diff, java.io.DataInputStream r, java.io.DataInputStream cur)
+            throws IOException {
+        int sm = r == null ? 0 : r.readInt();
+        int mm = cur == null ? 0 : cur.readInt();
         compare(diff, "MMIO regions", sm, mm);
         for (int i = 0; i < Math.min(sm, mm); i++) {
             String name = cur.readUTF();
@@ -1240,10 +1315,6 @@ public final class Machine implements Hypervisor, AutoCloseable {
             compare(diff, what + "byte order", order(r.readBoolean()), order(cur.readBoolean()));
             compare(diff, what + "interrupt", hex(r.readInt()), hex(cur.readInt()));
             compare(diff, what + "interrupt type", r.readUnsignedByte(), cur.readUnsignedByte());
-        }
-        if (!diff.isEmpty()) {
-            throw new org.boxtheta.javapower.core.StateMismatchException(
-                    "the machine state was saved from different hardware: " + String.join("; ", diff));
         }
     }
 

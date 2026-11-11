@@ -13,6 +13,7 @@ patterns and types input (`console.py`, stdlib only). Everything runs on the mac
 | `shell` | BE ISO to the installer's shell (vt100, then Shell), then each `--cmd` |
 | `kyua` | BE ISO: shell, tmpfs+unionfs layers over `/usr`, `/etc`, `/libexec`, the tests, kyua and atf packages from the disc's offline repo, `kyua test` for each `--tests` path; writes `test_program:case result` lines to `--out` |
 | `progs` | BE ISO plus a second disc (`--cdrom2`): installs the lib32 runtime and runs the disc's `RUN` script; output to `--out` |
+| `resume` | `--guest le`, `be` or `suse` (default `be`): boot to a shell (openSUSE: GRUB entry edited to skip the first-boot wizard and open a root shell on the console), write a file to a disk, stop with SIGTERM so the CLI saves the machine (`--save-state`), resume it in a new process (`--load-state`), check the file, write another, show the clock and uptime, run a loop pinned to each CPU, and for FreeBSD check the file system with `fsck` |
 | `regress` | `prompt-le`, `prompt-be`, `kyua` (short subset), `suse`; exit status 1 if any fails, or if `--baseline` (QEMU's kyua results) passed a test that ours did not |
 
 Examples:

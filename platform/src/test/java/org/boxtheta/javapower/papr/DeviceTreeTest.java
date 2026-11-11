@@ -79,6 +79,24 @@ class DeviceTreeTest {
         }
     }
 
+    /**
+     * Reset trees for other RAM sizes against QEMU 11.1 with the reference command line and
+     * {@code -m 256M} (the least QEMU accepts) or {@code -m 1792M} (not a power of two, so the RMA
+     * is 1 GiB and the rest is described by {@code memory@40000000} and {@code memory@60000000}),
+     * dumped with the monitor's {@code dumpdtb} before the first instruction.
+     */
+    @Test
+    void resetTreesForOtherRamSizesMatchQemu() throws IOException {
+        for (int mib : new int[] {256, 1792}) {
+            Rig r = new Rig(new MachineConfig().ram((long) mib << 20));
+            long fdt = r.m.fdtAddress();
+            assertEquals(Math.min(Long.highestOneBit((long) mib << 20), 0x80000000L) - Machine.FDT_MAX_SIZE, fdt);
+            byte[] blob = r.readBytes(fdt, r.mem.read32be(fdt + 4));
+            dump("reset-" + mib + "m.dtb", blob);
+            compare("", Fdt.parse(Rig.resource("pseries-" + mib + "m.dtb")), Fdt.parse(blob));
+        }
+    }
+
     @Test
     void casTreesForSmpMatchQemu() throws IOException {
         for (int n : new int[] {2, 4}) {

@@ -2,6 +2,7 @@ package org.boxtheta.javapower.papr;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -100,24 +101,15 @@ final class DeviceTree {
         }
         vdevice(m, root.addChild("vdevice"));
 
-        Fdt.Node mem = root.addChild("memory@0");
-        mem.set("ibm,associativity", associativity(m));
-        mem.setU64s("reg", 0, m.rmaSize());
-        mem.setString("device_type", "memory");
-        // Memory beyond the RMA (only with more than 1 TiB of RAM) in power-of-two aligned chunks.
-        long start = m.rmaSize();
-        long left = c.ramSize - start;
-        while (left > 0) {
-            long sz = Long.highestOneBit(left);
-            if (Long.numberOfTrailingZeros(start) < Long.numberOfTrailingZeros(sz)) {
-                sz = 1L << Long.numberOfTrailingZeros(start);
-            }
-            Fdt.Node n = root.addChild(String.format("memory@%x", start));
+        // QEMU creates memory@0 first, so in the blob the other memory nodes come first, highest
+        // address first.
+        List<long[]> ranges = memoryRanges(c.ramSize);
+        for (int i = ranges.size() - 1; i >= 0; i--) {
+            long[] range = ranges.get(i);
+            Fdt.Node n = root.addChild(String.format("memory@%x", range[0]));
             n.set("ibm,associativity", associativity(m));
-            n.setU64s("reg", start, sz);
+            n.setU64s("reg", range[0], range[1]);
             n.setString("device_type", "memory");
-            start += sz;
-            left -= sz;
         }
 
         Fdt.Node ic = root.addChild("interrupt-controller");
@@ -188,6 +180,24 @@ final class DeviceTree {
         if (c.kernelCmdline != null && !c.kernelCmdline.isEmpty()) {
             ch.setString("bootargs", c.kernelCmdline);
         }
+    }
+
+    /**
+     * The {base, size} of each memory node, in address order: the RMA at 0, then the rest (when
+     * the RAM size is not a power of two, or above 1 TiB) in naturally aligned power-of-two
+     * chunks, as QEMU's {@code spapr_dt_memory} lays out its single NUMA node.
+     */
+    static List<long[]> memoryRanges(long ramSize) {
+        List<long[]> ranges = new ArrayList<>();
+        long start = Machine.rmaSize(ramSize);
+        ranges.add(new long[] {0, start});
+        for (long left = ramSize - start; left > 0; ) {
+            long sz = Math.min(Long.highestOneBit(left), Long.lowestOneBit(start));
+            ranges.add(new long[] {start, sz});
+            start += sz;
+            left -= sz;
+        }
+        return ranges;
     }
 
     private static void rtas(Machine m, Fdt.Node r) {

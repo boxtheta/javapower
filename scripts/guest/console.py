@@ -20,7 +20,9 @@ import subprocess
 import time
 import tty
 
-ANSI = re.compile(rb"\x1b(\[[0-9;?]*[ -/]*[@-~]|[()][0-9A-Za-z]|[=>78DEHMc])|\x0f|\x0e")
+# CSI and the short escapes, and OSC strings (BEL or ST terminated), e.g. systemd's OSC 3008
+# context markers.
+ANSI = re.compile(rb"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[()][0-9A-Za-z]|[=>78DEHMc\\])|\x0f|\x0e")
 
 
 class Timeout(Exception):
@@ -69,8 +71,9 @@ class Console:
             self.log.write(b)
             self.log.flush()
         data = self._pending + b
+        # Hold back a tail that may be an incomplete escape sequence (an OSC string may be long).
         cut = data.rfind(b"\x1b")
-        if cut >= 0 and len(data) - cut < 16:
+        if cut >= 0 and not ANSI.match(data, cut) and len(data) - cut < (4096 if data[cut + 1:cut + 2] == b"]" else 16):
             self._pending = data[cut:]
             data = data[:cut]
         else:

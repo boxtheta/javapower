@@ -101,6 +101,29 @@ public final class Nvram extends VioDevice {
         return 1;
     }
 
+    /** The NVRAM contents. */
+    @Override
+    protected void saveDevice(java.io.DataOutput out) throws IOException {
+        org.boxtheta.javapower.core.StateOutput.writeBytes(out, data);
+    }
+
+    /** Restore the contents, and write them to the backing file if there is one. */
+    @Override
+    protected void loadDevice(org.boxtheta.javapower.core.StateInput.Record in) throws IOException {
+        byte[] d = in.readBytes(MAX_SIZE);
+        if (d == null || d.length != data.length) {
+            throw in.corrupt("NVRAM of " + (d == null ? "no" : d.length) + " bytes, expected " + data.length);
+        }
+        System.arraycopy(d, 0, data, 0, d.length);
+        if (file != null) {
+            ByteBuffer bb = ByteBuffer.wrap(data);
+            long pos = 0;
+            while (bb.hasRemaining()) {
+                pos += file.write(bb, pos);
+            }
+        }
+    }
+
     void close() throws IOException {
         if (file != null) {
             file.close();

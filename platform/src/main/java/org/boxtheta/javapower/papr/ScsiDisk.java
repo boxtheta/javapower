@@ -200,6 +200,30 @@ public final class ScsiDisk implements ScsiTarget {
         trayOpen = false;
     }
 
+    /** Sense and unit-attention state and the tray; the medium is the embedder's (not saved). */
+    void saveState(java.io.DataOutput out) throws java.io.IOException {
+        out.writeInt(id);
+        out.writeInt(lun);
+        org.boxtheta.javapower.core.StateOutput.writeBytes(out, unitAttention);
+        org.boxtheta.javapower.core.StateOutput.writeBytes(out, lastSense);
+        out.writeBoolean(senseIsUa);
+        out.writeBoolean(trayOpen);
+        out.writeBoolean(trayLocked);
+    }
+
+    void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        int i = in.readInt();
+        int l = in.readInt();
+        if (i != id || l != lun) {
+            throw in.corrupt("SCSI target " + i + ":" + l + " where " + id + ":" + lun + " was expected");
+        }
+        unitAttention = in.readBytes(252);
+        lastSense = in.readBytes(252);
+        senseIsUa = in.readBoolean();
+        trayOpen = in.readBoolean();
+        trayLocked = in.readBoolean();
+    }
+
     /** Whether a unit attention condition is pending (tests). */
     public boolean unitAttentionPending() {
         return unitAttention != null;

@@ -151,6 +151,33 @@ public final class VScsi extends VioDevice {
         }
     }
 
+    /**
+     * The state of every target. Commands complete inside H_SEND_CRQ, so between run slices no
+     * request is in flight and there is no queue to save beyond the CRQ itself (guest memory).
+     */
+    @Override
+    protected void saveDevice(java.io.DataOutput out) throws java.io.IOException {
+        out.writeInt(targets.size());
+        for (ScsiTarget t : targets) {
+            if (t instanceof ScsiDisk d) {
+                d.saveState(out);
+            }
+        }
+    }
+
+    @Override
+    protected void loadDevice(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        int n = in.readInt();
+        if (n != targets.size()) {
+            throw in.corrupt(n + " SCSI targets, expected " + targets.size());
+        }
+        for (ScsiTarget t : targets) {
+            if (t instanceof ScsiDisk d) {
+                d.loadState(in);
+            }
+        }
+    }
+
     // ---- CRQ entry point ---------------------------------------------------------------------
 
     @Override

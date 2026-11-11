@@ -1,0 +1,186 @@
+package org.boxtheta.javapower.papr;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import org.boxtheta.javapower.core.StateFormatException;
+import org.boxtheta.javapower.core.StateInput;
+import org.boxtheta.javapower.core.StateMismatchException;
+import org.boxtheta.javapower.core.StateOutput;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/** Saving and loading the platform part of a machine: hypervisor, XICS, RTAS and devices. */
+class MachineStateTest {
+    static final int VTY = XicsVtyTest.VTY;
+    static final int VTY_IRQ = XicsVtyTest.VTY_IRQ;
+    static final int VSCSI = VioDevice.REG_BASE + 2;
+
+    static MachineConfig cfg() {
+        MachineConfig c = new MachineConfig().ram(256L << 20)
+                .clock(Clock.fixed(Instant.parse("2026-11-10T12:34:56Z"), ZoneOffset.UTC));
+        c.addDisk(ScsiDisk.Type.DISK, new MemoryBackend(1 << 20));
+        c.addDisk(ScsiDisk.Type.CDROM, new MemoryBackend(new byte[4096], true)).scsiId(3);
+        return c;
+    }
+
+    static byte[] save(Machine m) throws IOException {
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        StateOutput out = new StateOutput(bo);
+        m.saveState(out);
+        out.finish();
+        return bo.toByteArray();
+    }
+
+    static void load(Machine m, byte[] b) throws IOException {
+        StateInput in = new StateInput(new ByteArrayInputStream(b));
+        m.loadState(in);
+        in.finish();
+    }
+
+    /** Put something into every part of the platform state a guest can change. */
+    static void dirty(Rig r) {
+        // XICS: the vty interrupt unmasked and pending, an IPI queued behind it at a lower priority.
+        assertArrayEquals(new int[] {0}, r.rtas("ibm,set-xive", 1, VTY_IRQ, 0, 5));
+        assertEquals(H.SUCCESS, r.hcall(H.CPPR, 0xff));
+        assertEquals(H.SUCCESS, r.hcall(H.IPI, 0, 7));
+        // vty: 16 bytes in the device buffer, more in the backlog.
+        r.console.type("0123456789abcdefghijklmnopqrstuvwxyz");
+        // v-scsi: TCEs, a CRQ, interrupts on.
+        assertEquals(H.SUCCESS, r.hcall(H.PUT_TCE, VSCSI, 0x3000, 0x123000 | 3));
+        assertEquals(H.SUCCESS, r.hcall(H.REG_CRQ, VSCSI, 0x0, 0x1000));
+        assertEquals(H.SUCCESS, r.hcall(H.VIO_SIGNAL, VSCSI, 1));
+        // NVRAM, time of day, VPA, process table.
+        r.writeBytes(0x30000, "nvram!".getBytes());
+        assertEquals(0, r.rtas("nvram-store", 2, 100, 0x30000, 6)[0]);
+        assertArrayEquals(new int[] {0}, r.rtas("set-time-of-day", 1, 2001, 2, 3, 4, 5, 6, 0));
+        long vpa = 0x40000;
+        r.mem.write16be(vpa + 4, 640);
+        assertEquals(H.SUCCESS, r.hcall(H.REGISTER_VPA, 0x0000200000000000L, 0, vpa));
+        assertEquals(H.SUCCESS, r.hcall(H.REGISTER_PROC_TBL, 0x1c, 0x50000, 0, 0));
+    }
+
+    @Test
+    void everyPartRoundTrips() throws IOException {
+        Rig a = new Rig(cfg());
+        dirty(a);
+        byte[] state = save(a.m);
+
+        Rig b = new Rig(cfg());
+        load(b.m, state);
+        assertArrayEquals(state, save(b.m), "saved again, the state is unchanged");
+
+        // The restored machine behaves like the original.
+        for (Rig r : new Rig[] {a, b}) {
+            assertTrue(r.cpu.extIrq, "the pending interrupt drives the CPU's input");
+            assertEquals(H.SUCCESS, r.hcall(H.XIRR));
+            assertEquals(0xff000000L | VTY_IRQ, r.r(4));
+            assertEquals(H.SUCCESS, r.hcall(H.GET_TERM_CHAR, VTY));
+            assertEquals("0123456789abcdef", XicsVtyTest.chars(r));
+            assertEquals(H.SUCCESS, r.hcall(H.GET_TERM_CHAR, VTY));
+            assertEquals("ghijklmnopqrstuv", XicsVtyTest.chars(r));
+            assertEquals(H.SUCCESS, r.hcall(H.GET_TCE, VSCSI, 0x3000));
+            assertEquals(0x123003L, r.r(4));
+            assertEquals(0x50000L | Machine.PATE1_GR, r.m.patbEntry());
+            assertEquals(0x40000, r.m.vpaAddress());
+            assertArrayEquals(new int[] {0, 2001, 2, 3, 4, 5, 6, 0}, r.rtas("get-time-of-day", 8));
+            // The refilled buffer raised the (rejected) vty interrupt again: resent at the EOI,
+            // and only after its own EOI does the less favoured IPI come through.
+            assertEquals(H.SUCCESS, r.hcall(H.EOI, 0xff000000L | VTY_IRQ));
+            assertEquals(H.SUCCESS, r.hcall(H.XIRR));
+            assertEquals(0xff000000L | VTY_IRQ, r.r(4));
+            assertEquals(H.SUCCESS, r.hcall(H.EOI, 0xff000000L | VTY_IRQ));
+            assertTrue(r.cpu.extIrq, "the IPI is presented after the EOI");
+            assertEquals(H.SUCCESS, r.hcall(H.XIRR));
+            assertEquals(0xff000000L | Xics.IPI, r.r(4));
+        }
+        assertEquals("nvram!", new String(b.m.nvram().contents(), 100, 6));
+        assertArrayEquals(a.m.fdtBlob(), b.m.fdtBlob());
+        assertArrayEquals(save(a.m), save(b.m), "both behaved the same");
+    }
+
+    @Test
+    void inputTypedBeforeTheLoadFollowsTheSavedInput() throws IOException {
+        Rig a = new Rig(cfg());
+        a.console.type("saved");
+        byte[] state = save(a.m);
+        Rig b = new Rig(cfg());
+        b.console.type("+new");
+        load(b.m, state);
+        assertEquals(H.SUCCESS, b.hcall(H.GET_TERM_CHAR, VTY));
+        assertEquals("saved+new", XicsVtyTest.chars(b));
+    }
+
+    @Test
+    void armedWatchdogsKeepTheirTimeLeft() throws IOException {
+        Rig a = new Rig(cfg());
+        assertEquals(H.SUCCESS, a.hcall(H.WATCHDOG, (1 << 8) | 1, 2, 60_000)); // start #2: power off in 60 s
+        byte[] state = save(a.m);
+        Rig b = new Rig(cfg());
+        load(b.m, state);
+        b.m.pump();
+        assertEquals(Machine.ShutdownReason.NONE, b.m.shutdownReason());
+        assertEquals(H.SUCCESS, b.hcall(H.WATCHDOG, 2 << 8, 2), "watchdog 2 is armed");
+        assertEquals(H.NOOP, b.hcall(H.WATCHDOG, 2 << 8, 1), "watchdog 1 is not");
+    }
+
+    @Test
+    void nvramFileIsRewrittenFromTheState(@TempDir Path dir) throws IOException {
+        Path f = dir.resolve("nvram.bin");
+        Files.write(f, new byte[16384]);
+        Rig a = new Rig(new MachineConfig().ram(256L << 20).nvram(f));
+        a.writeBytes(0x30000, "saved".getBytes());
+        a.rtas("nvram-store", 2, 0, 0x30000, 5);
+        byte[] state = save(a.m);
+        a.m.close();
+        Path g = dir.resolve("other.bin");
+        Files.write(g, new byte[16384]);
+        Rig b = new Rig(new MachineConfig().ram(256L << 20).nvram(g));
+        load(b.m, state);
+        b.m.close();
+        assertEquals("saved", new String(Files.readAllBytes(g), 0, 5));
+    }
+
+    @Test
+    void otherHardwareIsRefusedBeforeAnythingChanges() throws IOException {
+        Rig a = new Rig(cfg());
+        dirty(a);
+        byte[] state = save(a.m);
+
+        MachineConfig other = new MachineConfig().ram(512L << 20).cpus(2).rng(true);
+        other.addDisk(ScsiDisk.Type.DISK, new MemoryBackend(2 << 20)).blockSize(4096);
+        Rig b = new Rig(other);
+        byte[] before = save(b.m);
+        StateMismatchException e = assertThrows(StateMismatchException.class, () -> load(b.m, state));
+        String m = e.getMessage();
+        for (String want : new String[] {"CPUs: saved 1, this machine 2", "bytes of RAM: saved 268435456",
+                "spapr-rng: saved false, this machine true", "SCSI devices: saved 2, this machine 1",
+                "SCSI device 0: block size: saved 512, this machine 4096", "SCSI device 0: bytes: saved 1048576"}) {
+            assertTrue(m.contains(want), want + " in: " + m);
+        }
+        assertArrayEquals(before, save(b.m));
+        assertFalse(b.cpu.extIrq);
+    }
+
+    @Test
+    void corruptPlatformRecordsAreRefused() throws IOException {
+        Rig a = new Rig(cfg());
+        dirty(a);
+        byte[] state = save(a.m);
+        for (int cut : new int[] {20, state.length / 2, state.length - 5}) {
+            byte[] c = java.util.Arrays.copyOf(state, cut);
+            assertThrows(StateFormatException.class, () -> load(new Rig(cfg()).m, c));
+        }
+    }
+}

@@ -88,6 +88,38 @@ final class Drc {
         ccsPos = 0;
     }
 
+    void saveState(java.io.DataOutput out) throws java.io.IOException {
+        out.writeInt(index());
+        out.writeInt(state);
+        out.writeInt(drIndicator);
+        out.writeBoolean(ccsEvents != null);
+        out.writeInt(ccsPos);
+    }
+
+    /** Read what {@link #saveState} wrote; a configure-connector walk in progress is rebuilt. */
+    void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        int idx = in.readInt();
+        if (idx != index()) {
+            throw in.corrupt(String.format("DR connector 0x%x where 0x%x was expected", idx, index()));
+        }
+        int st = in.readInt("DR connector state", STATE_PHYSICAL_POWERON, STATE_LOGICAL_CONFIGURED);
+        int ind = in.readInt();
+        boolean walk = in.readBoolean();
+        int pos = in.readInt();
+        state = st;
+        drIndicator = ind;
+        ccsEvents = null;
+        ccsPos = 0;
+        if (walk && populated()) {
+            ccsEvents = new ArrayList<>();
+            flatten(fragment.get(), ccsEvents);
+            if (pos < 0 || pos >= ccsEvents.size()) {
+                throw in.corrupt("configure-connector position " + pos);
+            }
+            ccsPos = pos;
+        }
+    }
+
     int entitySense() {
         if (kind.physical) {
             return populated() ? SENSE_PRESENT : SENSE_EMPTY;

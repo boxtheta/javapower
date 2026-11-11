@@ -72,6 +72,45 @@ public final class TceTable {
         bypass = false;
     }
 
+    /** Write the bypass flag and the non-zero entries. */
+    synchronized void saveState(java.io.DataOutput out) throws java.io.IOException {
+        out.writeInt(liobn);
+        out.writeInt(table.length);
+        out.writeBoolean(bypass);
+        int n = 0;
+        for (long t : table) {
+            if (t != 0) {
+                n++;
+            }
+        }
+        out.writeInt(n);
+        for (int i = 0; i < table.length; i++) {
+            if (table[i] != 0) {
+                out.writeInt(i);
+                out.writeLong(table[i]);
+            }
+        }
+    }
+
+    /** Read the state written by {@link #saveState}; the table must have the same LIOBN and size. */
+    synchronized void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        int l = in.readInt();
+        int size = in.readInt();
+        if (l != liobn || size != table.length) {
+            throw in.corrupt(String.format("TCE table 0x%x of %d entries where 0x%x of %d was expected", l, size,
+                    liobn, table.length));
+        }
+        boolean b = in.readBoolean();
+        int n = in.readInt("TCE count", 0, table.length);
+        long[] t = new long[table.length];
+        for (int k = 0; k < n; k++) {
+            int i = in.readInt("TCE index", 0, table.length - 1);
+            t[i] = in.readLong();
+        }
+        System.arraycopy(t, 0, table, 0, t.length);
+        bypass = b;
+    }
+
     private long index(long ioba) {
         return (ioba - busOffset) >>> PAGE_SHIFT;
     }

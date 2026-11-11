@@ -61,6 +61,25 @@ final class Rtas {
         ccsDepth = 0;
     }
 
+    void saveState(java.io.DataOutput out) throws java.io.IOException {
+        out.writeLong(rtcOffsetNs);
+        out.writeLong(fwnmiResetAddr);
+        out.writeLong(fwnmiMceAddr);
+        out.writeInt(ccsDepth);
+    }
+
+    /**
+     * Read what {@link #saveState} wrote. The time of day keeps following the configured clock
+     * with the offset the guest set, so it reads host time, not the time at which the state was
+     * saved.
+     */
+    void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        rtcOffsetNs = in.readLong();
+        fwnmiResetAddr = in.readLong();
+        fwnmiMceAddr = in.readLong();
+        ccsDepth = in.readInt();
+    }
+
     // ---- argument block access ---------------------------------------------------------------
 
     private int ld(long base, int n) {

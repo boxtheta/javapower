@@ -25,7 +25,8 @@ import org.boxtheta.javapower.core.Spr;
  * which creates the CPUs and runs them; this class is the machine model it drives, for embedders
  * that bring their own CPU loop:
  * <pre>{@code
- * MachineConfig cfg = new MachineConfig().ram(2L << 30).cpus(4).console(new StdioCharBackend());
+ * MachineConfig cfg = new MachineConfig().ram(2L << 30).cpus(4).console(new StdioCharBackend())
+ *         .firmware(SlofFirmware.image());   // javapower-firmware-slof
  * cfg.addDisk(Path.of("disk.raw")).blockSize(4096);
  * Machine m = new Machine(cfg);
  * List<CpuState> cpus = ...;      // m.cpuCount() CpuStates, each with an interpreter on m.memory()
@@ -204,6 +205,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * opened so far is closed again before the exception propagates.
      *
      * @throws IOException if the firmware, a disk image or the NVRAM file cannot be read
+     * @throws IllegalArgumentException if the configuration is invalid, e.g. no firmware is set
      */
     public Machine(MachineConfig config) throws IOException {
         this.config = config;
@@ -211,17 +213,22 @@ public final class Machine implements Hypervisor, AutoCloseable {
         if (config.ramSize < (256L << 20) || config.ramSize % (256L << 20) != 0) {
             throw new IllegalArgumentException("RAM size must be a non-zero multiple of 256 MiB");
         }
-        this.xics = new Xics(log);
-        this.mem = new PhysicalMemory(config.ramSize);
-        this.random = config.random != null ? config.random : new SecureRandom();
-        byte[] fw = config.firmwareImage;
-        if (fw == null && config.firmware != null) {
+        byte[] fw;
+        if (config.firmwareImage != null) {
+            fw = config.firmwareImage.clone();
+        } else if (config.firmware != null) {
             fw = Files.readAllBytes(config.firmware);
+        } else {
+            throw new IllegalArgumentException("no firmware configured: set MachineConfig.firmware(bytes) or"
+                    + " firmware(path); the SLOF image is SlofFirmware.image() in " + MachineConfig.SLOF_ARTIFACT);
         }
-        if (fw != null && fw.length > FW_MAX_SIZE) {
+        if (fw.length > FW_MAX_SIZE) {
             throw new IOException("firmware image larger than " + FW_MAX_SIZE + " bytes");
         }
         this.firmware = fw;
+        this.xics = new Xics(log);
+        this.mem = new PhysicalMemory(config.ramSize);
+        this.random = config.random != null ? config.random : new SecureRandom();
 
         // One presentation controller per CPU; its output drives whichever CpuState is attached.
         vcpus = new VCpu[config.cpus];

@@ -71,7 +71,7 @@ subprojects {
         shouldRunAfter tasks.named('test')
     }
     tasks.named('check') { dependsOn test27 }
-    if (name != 'core') {
+    if (name != 'core' && name != 'firmware-slof') {
         dependencies { api project(':core') }
     }
 }

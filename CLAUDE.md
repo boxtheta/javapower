@@ -6,7 +6,8 @@ powerpc64 (big-endian) and openSUSE Tumbleweed ppc64le to an interactive console
 ## Machine model
 
 - PAPR `pseries` guest, mirroring QEMU's `-M pseries,ic-mode=xics -cpu power9` closely enough to
-  run the stock SLOF firmware binary (`/usr/share/qemu/slof.bin`) unmodified.
+  run the stock SLOF firmware unmodified. We build SLOF ourselves from the same tag and toolchain as
+  QEMU's `/usr/share/qemu/slof.bin` and ship it in the `firmware-slof` module.
 - The emulator is the hypervisor: guest runs with MSR[HV]=0 and `sc 1` in supervisor state is a
   direct call into `Hypervisor.hcall` (QEMU's "virtual hypervisor" arrangement).
 - POWER9 DD2.2 (PVR 0x004e1202), ISA 3.0B, big- and little-endian: SLOF is BE; the FreeBSD
@@ -24,8 +25,12 @@ powerpc64 (big-endian) and openSUSE Tumbleweed ppc64le to an interactive console
 | `cpu-fpvec` | `org.boxtheta.javapower.fpvec` | Software float, FP, VMX (Altivec), VSX, DFP instructions. |
 | `platform` | `org.boxtheta.javapower.papr` | Machine, device tree, hcalls, RTAS, XICS, VIO devices, disk backends. |
 | `app` | `org.boxtheta.javapower.app` | CLI and integration wiring. |
+| `firmware-slof` | `org.boxtheta.javapower.firmware.slof` | The SLOF image (gzip resource, built by `firmware-build/`) and `SlofFirmware`. Compiled for Java 21. |
 
 Modules other than `core` depend only on `core`, never on each other (`app` depends on all).
+`firmware-slof` has no dependencies at all (the JDK decompresses the image), and no library module
+depends on it: only `app` and tests do. Embedders pass `SlofFirmware.image()` to
+`MachineConfig.firmware`; there is no default firmware.
 
 ## Publishing
 
@@ -76,3 +81,7 @@ PowerPC targets, gdb, dtc). Nothing is built locally.
   prompt, installer shell, kyua, test programs); `drive.py regress` boots all three guests. See its
   docstring and `scripts/guest/README.md`.
 - Scratch files on the server go under `~/javapower/work/<workspace>-scratch/`.
+- Firmware: the CLI and tests use the bundled SLOF image, not `/usr/share/qemu/slof.bin` (still
+  there for running real QEMU). To rebuild it, run `firmware-slof/firmware-build/build.sh
+  [--install] [outdir]` on the server (rootless podman); it is reproducible bit for bit, and
+  `--install` replaces the committed `slof.bin.gz` and `slof.properties`.

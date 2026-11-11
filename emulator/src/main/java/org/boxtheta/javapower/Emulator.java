@@ -26,6 +26,7 @@ import org.boxtheta.javapower.papr.PaprLog;
  *
  * <pre>{@code
  * MachineConfig cfg = new MachineConfig().cpus(4).console(myConsole)
+ *         .firmware(SlofFirmware.image())               // from javapower-firmware-slof
  *         .logSink(PaprLog.printTo(System.err));        // default: System.Logger
  * cfg.addCdrom(Path.of("freebsd-disc1.iso"));
  * try (Emulator emu = new Emulator(cfg)) {

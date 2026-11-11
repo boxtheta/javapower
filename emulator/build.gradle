@@ -1,0 +1,4 @@
+// The SLOF boot test uses the bundled firmware image; the library itself does not depend on it.
+dependencies {
+    testImplementation project(':firmware-slof')
+}

@@ -1,0 +1,63 @@
+# Reproducible build of the SLOF firmware image (board "qemu") shipped in javapower-firmware-slof.
+# Driven by build.sh in this directory; see there for usage.
+#
+# Everything that goes into the image is pinned: the base image by digest, the Debian packages
+# through a snapshot.debian.org timestamp, and the SLOF source by commit hash.
+#
+# Debian 12 (bookworm) because its cross toolchain (GCC 12.2.0-13cross1, binutils 2.40-2) is the one
+# QEMU's own pc-bios/slof.bin was built with (its .comment and build_info.img say so). The result
+# differs from QEMU's image only in the build date.
+
+FROM docker.io/library/debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+
+# Debian archive state the toolchain is installed from.
+ARG APT_SNAPSHOT=20261101T000000Z
+
+# Plain http: the slim image has no CA certificates yet; apt checks the archive signatures.
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+ && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s bookworm-security main\n' \
+        "$APT_SNAPSHOT" "$APT_SNAPSHOT" > /etc/apt/sources.list \
+ && apt-get -o Acquire::Retries=5 update \
+ && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        ca-certificates git make gcc libc6-dev gcc-powerpc64-linux-gnu binutils-powerpc64-linux-gnu zopfli \
+ && rm -rf /var/lib/apt/lists/*
+
+# SLOF tag qemu-slof-20260627 (the source of QEMU 11.1's pc-bios/slof.bin).
+ARG SLOF_REPO=https://gitlab.com/slof/slof.git
+ARG SLOF_TAG=qemu-slof-20260627
+ARG SLOF_COMMIT=47457c9078a217150aa1634f2657e6804fbde467
+
+WORKDIR /src/slof
+RUN git init -q . \
+ && git fetch -q --depth 1 "$SLOF_REPO" "refs/tags/$SLOF_TAG" \
+ && git checkout -q --detach FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$SLOF_COMMIT"
+
+# Reproducibility:
+# - SOURCE_DATE_EPOCH (the commit time) fixes GCC's __DATE__/__TIME__ in the "Build Date" banner
+#   and the date create_crc writes into the ROM header; TZ=UTC because create_crc formats it with
+#   localtime().
+# - RELEASE is the version string SLOF prints ("FW Version") and puts in the device tree; set it to
+#   the tag, as QEMU's image does. Without it SLOF uses git-<hash>, or USER@HOSTNAME for a tree
+#   without .git. The ROM header's DRIVER_NAME comes from the .git above (git-<12 hex digits>).
+# - The board config keeps SNK_BIOSEMU_APPS (the x86 BIOS emulator) commented out.
+# - zopfli writes a gzip member with no file name and a zero timestamp, and is deterministic.
+RUN grep -q '^#export SNK_BIOSEMU_APPS' board-qemu/config \
+ && export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" TZ=UTC \
+ && make -j"$(nproc)" CROSS=powerpc64-linux-gnu- RELEASE="$SLOF_TAG" qemu \
+ && mkdir /out \
+ && cp boot_rom.bin /out/slof.bin \
+ && zopfli -c /out/slof.bin > /out/slof.bin.gz \
+ && { echo "slof.tag=$SLOF_TAG"; \
+      echo "slof.commit=$SLOF_COMMIT"; \
+      echo "slof.repository=$SLOF_REPO"; \
+      echo "build.board=qemu"; \
+      echo "build.source-date-epoch=$SOURCE_DATE_EPOCH"; \
+      echo "build.apt-snapshot=$APT_SNAPSHOT"; \
+      echo "toolchain.gcc=gcc-12-powerpc64-linux-gnu $(dpkg-query -W -f '${Version}' gcc-12-powerpc64-linux-gnu)"; \
+      echo "toolchain.binutils=binutils-powerpc64-linux-gnu $(dpkg-query -W -f '${Version}' binutils-powerpc64-linux-gnu)"; \
+      echo "toolchain.host-gcc=gcc-12 $(dpkg-query -W -f '${Version}' gcc-12)"; \
+      echo "toolchain.make=$(dpkg-query -W -f '${Version}' make)"; \
+      echo "toolchain.zopfli=$(dpkg-query -W -f '${Version}' zopfli)"; \
+      echo "compression=gzip by zopfli (default 15 iterations)"; \
+    } > /out/build.properties

@@ -10,6 +10,7 @@ import org.boxtheta.javapower.Emulator;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Spr;
 import org.boxtheta.javapower.cpu.Interpreter;
+import org.boxtheta.javapower.firmware.slof.SlofFirmware;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
 import org.boxtheta.javapower.papr.PaprLog;
@@ -39,12 +40,13 @@ public final class Main {
         int statusSecs = 0;
         String jit = "regions";
         boolean shareCode = true;
+        Path firmware = null;
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
                     case "--ram" -> cfg.ram(Long.parseLong(args[++i]) << 20);
                     case "--smp" -> smp = Integer.parseInt(args[++i]);
-                    case "--firmware" -> cfg.firmware(Path.of(args[++i]));
+                    case "--firmware" -> firmware = Path.of(args[++i]);
                     case "--disk" -> cfg.addDisk(Path.of(args[++i]));
                     case "--disk4k" -> cfg.addDisk(Path.of(args[++i])).blockSize(4096).physicalBlockSize(4096);
                     case "--cdrom" -> cfg.addCdrom(Path.of(args[++i]));
@@ -72,6 +74,12 @@ public final class Main {
             System.err.println("javapower: " + e.getMessage());
             System.err.println(USAGE);
             return;
+        }
+        // The SLOF image bundled with the CLI unless --firmware names another.
+        if (firmware != null) {
+            cfg.firmware(firmware);
+        } else {
+            cfg.firmware(SlofFirmware.image());
         }
         Long seed = null;
         if (clock == Interpreter.Clock.DETERMINISTIC) {

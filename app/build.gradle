@@ -1,0 +1,4 @@
+// The CLI boots the bundled SLOF image unless --firmware names another one.
+dependencies {
+    implementation project(':firmware-slof')
+}

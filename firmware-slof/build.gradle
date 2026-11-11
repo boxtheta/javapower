@@ -1,0 +1,24 @@
+// The SLOF firmware image, built from source (see firmware-build/) and stored gzip-compressed.
+// Stands alone: no dependencies (the JDK decompresses it), and no library module depends on it.
+description = 'SLOF firmware image for the javapower pseries machine'
+
+// Usable by embedders on Java 21.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+}
+
+// SLOF's license travels with every jar of this artifact, next to the Apache license.
+tasks.withType(Jar).configureEach {
+    from(file('LICENSE-SLOF')) { into 'META-INF' }
+}
+
+publishing.publications.maven.pom {
+    description = 'SLOF (Slimline Open Firmware) image for the javapower pseries machine'
+    licenses {
+        license {
+            name = 'BSD-3-Clause (SLOF firmware image)'
+            url = 'https://gitlab.com/slof/slof/-/blob/qemu-slof-20260627/LICENSE'
+            distribution = 'repo'
+        }
+    }
+}

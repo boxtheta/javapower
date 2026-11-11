@@ -16,11 +16,15 @@ import java.util.function.Consumer;
  * <p>What an embedder usually sets: {@link #ram}, {@link #cpus}, the {@link #console} backend
  * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk})
  * and the {@link #logSink} for diagnostics (default: the {@link System.Logger}
- * {@value PaprLog#LOGGER_NAME}). The firmware defaults to {@link #DEFAULT_FIRMWARE}.
+ * {@value PaprLog#LOGGER_NAME}).
+ *
+ * <p>There is no default firmware: set one with {@link #firmware(byte[])} or
+ * {@link #firmware(Path)}. The SLOF image the machine is built for ships in the separate artifact
+ * {@value #SLOF_ARTIFACT}: {@code cfg.firmware(SlofFirmware.image())}.
  */
 public final class MachineConfig {
-    /** Default firmware location (the stock SLOF image QEMU ships). */
-    public static final Path DEFAULT_FIRMWARE = Path.of("/usr/share/qemu/slof.bin");
+    /** Maven coordinates of the artifact with the SLOF firmware image ({@code SlofFirmware}). */
+    public static final String SLOF_ARTIFACT = "org.boxtheta.javapower:javapower-firmware-slof";
     /**
      * Most guest CPUs a machine may have. Each guest CPU is a host thread running in parallel, so
      * the real limit is the host's core count; 64 is an arbitrary bound well above that for the
@@ -102,7 +106,7 @@ public final class MachineConfig {
 
     long ramSize = 2L << 30;
     int cpus = 1;
-    Path firmware = DEFAULT_FIRMWARE;
+    Path firmware;
     byte[] firmwareImage;
     CharBackend console;
     final List<Disk> disks = new ArrayList<>();
@@ -136,16 +140,23 @@ public final class MachineConfig {
         return this;
     }
 
-    /** Firmware image file, loaded at real address 0 (QEMU's {@code -bios}). */
+    /**
+     * Firmware image file, loaded at real address 0 (QEMU's {@code -bios}); read when the machine
+     * is constructed. Replaces an image set with {@link #firmware(byte[])}.
+     */
     public MachineConfig firmware(Path p) {
         this.firmware = p;
         this.firmwareImage = null;
         return this;
     }
 
-    /** Firmware given as bytes (tests); takes precedence over the path. */
+    /**
+     * Firmware image given as bytes, e.g. {@code SlofFirmware.image()} from {@value #SLOF_ARTIFACT}.
+     * The machine copies it when it is constructed. Replaces a file set with {@link #firmware(Path)}.
+     */
     public MachineConfig firmware(byte[] image) {
         this.firmwareImage = image;
+        this.firmware = null;
         return this;
     }
 

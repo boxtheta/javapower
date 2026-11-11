@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import org.boxtheta.javapower.core.CpuState;
 import org.junit.jupiter.api.Test;
 
 /** Embedding concerns: per-machine logs, and host resources released by {@link Machine#close}. */
@@ -148,6 +149,27 @@ class LibraryTest {
         assertFalse(disk.closed);
         m.close();
         assertTrue(disk.closed);
+    }
+
+    @Test
+    void missingFirmwareNamesTheArtifact() {
+        MachineConfig cfg = new MachineConfig().ram(256L << 20).logSink(e -> { });
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> new Machine(cfg));
+        assertTrue(e.getMessage().contains(MachineConfig.SLOF_ARTIFACT), e.getMessage());
+    }
+
+    @Test
+    void firmwareBytesAreCopiedAndReplaceAPath() throws Exception {
+        byte[] fw = {0x48, 0, 0, 0};
+        MachineConfig cfg = new MachineConfig().ram(256L << 20).logSink(e -> { })
+                .firmware(Path.of("/nonexistent/javapower-firmware.bin")).firmware(fw);
+        try (Machine m = new Machine(cfg)) {
+            fw[0] = 0;
+            CpuState c = new CpuState();
+            m.attachCpu(c);
+            m.reset(c);
+            assertEquals(0x48000000, m.memory().read32be(0));
+        }
     }
 
     @Test

@@ -1,20 +1,27 @@
 # javapower
 
 A Power ISA emulator for the JVM. It models a PAPR `pseries` machine (POWER9, radix MMU, XICS,
-VIO console and v-scsi) closely enough to run QEMU's stock SLOF firmware and boot FreeBSD 15.1
-(ppc64le, and big-endian powerpc64 including its 32-bit compatibility layer) and openSUSE
-Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
+VIO console and v-scsi) closely enough to run the SLOF firmware QEMU uses, unmodified, and boot
+FreeBSD 15.1 (ppc64le, and big-endian powerpc64 including its 32-bit compatibility layer) and
+openSUSE Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
 as a library. Java 21 or later; no runtime dependencies (the JIT's bytecode library is bundled, see
-[Third-party code](#third-party-code)).
+[Third-party code](#third-party-code)). The SLOF image is built from source by this project and
+ships as its own artifact, so no QEMU installation is needed.
 
 ## Embedding
 
-Add the `emulator` artifact, which pulls in the CPU, FPU/vector and platform modules:
+Add the `emulator` artifact, which pulls in the CPU, FPU/vector and platform modules, and the
+`firmware-slof` artifact for the firmware image (or bring your own; see below):
 
 ```xml
 <dependency>
   <groupId>org.boxtheta.javapower</groupId>
   <artifactId>javapower-emulator</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+</dependency>
+<dependency>
+  <groupId>org.boxtheta.javapower</groupId>
+  <artifactId>javapower-firmware-slof</artifactId>
   <version>0.1.0-SNAPSHOT</version>
 </dependency>
 ```
@@ -25,6 +32,7 @@ Boot an ISO with your own console backend:
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import org.boxtheta.javapower.Emulator;
+import org.boxtheta.javapower.firmware.slof.SlofFirmware;
 import org.boxtheta.javapower.papr.CharBackend;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
@@ -43,6 +51,7 @@ class Boot {
         MachineConfig cfg = new MachineConfig()
                 .ram(2L << 30)
                 .cpus(4)
+                .firmware(SlofFirmware.image())          // the bundled SLOF image
                 .console(console)
                 .logSink(PaprLog.printTo(System.err));   // default: System.Logger "org.boxtheta.javapower.papr"
         cfg.addCdrom(Path.of("freebsd-15.1-disc1.iso"));
@@ -55,9 +64,13 @@ class Boot {
 }
 ```
 
-- `MachineConfig` configures the machine: RAM, CPU count, firmware (default
-  `/usr/share/qemu/slof.bin`), console, disks (`addCdrom`, `addDisk`, or `addDisk(type, backend)`
-  with your own `BlockBackend`), NVRAM file, kernel command line, log sink.
+- `MachineConfig` configures the machine: RAM, CPU count, firmware, console, disks (`addCdrom`,
+  `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), NVRAM file, kernel command
+  line, log sink.
+- Firmware has no default: pass the image as bytes (`firmware(SlofFirmware.image())` from
+  `javapower-firmware-slof`, which decompresses a fresh copy on each call) or as a file
+  (`firmware(Path)`, e.g. `/usr/share/qemu/slof.bin`). Without one, the `Machine` constructor throws
+  `IllegalArgumentException` naming the artifact. `SlofFirmware.version()` is the SLOF tag.
 - Disk images are opened as copy-on-write snapshots by default and never modified; call
   `persistent(true)` on a disk to write through.
 - `Emulator.run()` runs CPU 0 on the calling thread and every other CPU on a daemon thread of its
@@ -106,7 +119,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 |---|---|
 | `--ram MiB` | Guest RAM, a multiple of 256 (default 2048) |
 | `--smp n` | Guest CPUs (default 1) |
-| `--firmware file` | Firmware image (default `/usr/share/qemu/slof.bin`) |
+| `--firmware file` | Firmware image (default: the bundled SLOF image) |
 | `--disk img` / `--disk4k img` | Raw disk image, 512- or 4096-byte sectors (snapshot mode) |
 | `--cdrom iso` | ISO image as a SCSI CD-ROM |
 | `--clock-scale f` | Run guest time `f` times slower than the host clock |
@@ -152,13 +165,34 @@ gradle :app:installDist                           # CLI in app/build/install/app
 gradle publishToMavenLocal                        # library artifacts
 ```
 
-The SLOF test in `emulator` needs `/usr/share/qemu/slof.bin` and is skipped without it. In this
-project the builds run on the shared dev server through `scripts/remote.sh <workspace> <command>`
-(see `CLAUDE.md`).
+In this project the builds run on the shared dev server through
+`scripts/remote.sh <workspace> <command>` (see `CLAUDE.md`).
 
 Modules: `core` (shared contracts), `cpu-int` (integer, branch, system instructions, MMU, run
 loop), `cpu-fpvec` (floating point, VMX, VSX), `platform` (machine model, hypercalls, RTAS,
-devices), `emulator` (the embedding entry point), `app` (the CLI).
+devices), `emulator` (the embedding entry point), `app` (the CLI), `firmware-slof` (the SLOF
+image; depends on nothing else here, and only `app` and tests depend on it).
+
+### Rebuilding the firmware
+
+The SLOF image is committed, compressed, as
+`firmware-slof/src/main/resources/org/boxtheta/javapower/firmware/slof/slof.bin.gz`, next to
+`slof.properties`, which records its provenance (SLOF tag and commit, toolchain versions, base
+image digest, size and SHA-256 of the raw and compressed image). A normal Gradle build needs
+neither a cross compiler nor podman. To rebuild it (Linux with podman, rootless is fine):
+
+```
+firmware-slof/firmware-build/build.sh [--install] [outdir]
+```
+
+It builds SLOF board `qemu` in a container (Debian bookworm pinned by digest, packages from a
+pinned snapshot.debian.org date, SLOF pinned by commit), with `SOURCE_DATE_EPOCH` set to the
+commit time, and compresses it with zopfli (standard gzip with no name or timestamp, about 6%
+smaller than `gzip -9`), so the output is bit-for-bit reproducible. The cross toolchain (GCC 12.2, binutils
+2.40) is the one QEMU's own image was built with, so the result differs from
+`/usr/share/qemu/slof.bin` only in its build date. It prints the SHA-256 of both files;
+`--install` copies the result into the resources. To move to a new SLOF release, change the tag
+and commit (and if needed the snapshot date) in `firmware-build/Containerfile`.
 
 ## Third-party code
 
@@ -172,3 +206,13 @@ the class path. The relocated package is not part of javapower's API.
 ## License
 
 Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+## Third-party notes
+
+**SLOF.** The `javapower-firmware-slof` artifact contains a binary image of SLOF (Slimline Open
+Firmware, https://gitlab.com/slof/slof), built by this project from the unmodified upstream tag
+`qemu-slof-20260627`. SLOF is copyright IBM Corporation and contributors and is distributed under
+the 3-clause BSD license; the jar carries it as `META-INF/LICENSE-SLOF` (source:
+[firmware-slof/LICENSE-SLOF](firmware-slof/LICENSE-SLOF)) and its POM lists both licenses. The
+x86 BIOS emulator, which SLOF keeps under a different license, is not built into the image. The
+artifact has no dependencies; the JDK's `GZIPInputStream` decompresses the image.

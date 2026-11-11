@@ -25,6 +25,10 @@ Scenarios:
                  --net-mib MiB over TCP and compare checksums; --nics 2 adds a second device on
                  a second segment; --peer-guest le|be|suse also boots that guest under QEMU with
                  spapr-vlan on the same segment and pings between the two guests
+  consoles       --guest le, be or suse: two more consoles on TCP sockets (ours: named jp.one and
+                 jp.two); find their devices by name (QEMU: by node), write to and read from each,
+                 run a shell on one and a getty on the other; with --save (ours), save with unread
+                 input on one, resume in a new process, read it and use both consoles again
   regress        prompt-le, prompt-be + a short kyua subset, suse; non-zero exit on failure
   compare        compare kyua results: --baseline (QEMU) against --out (ours), per directory
 
@@ -220,6 +224,8 @@ def scenario(a):
         resume(a)
     elif a.scenario == "net":
         net(a)
+    elif a.scenario == "consoles":
+        consoles(a)
     elif a.scenario == "regress":
         return regress(a)
     elif a.scenario == "compare":
@@ -633,6 +639,233 @@ def net_with_qemu_guest(a, c, g, tag, local, remote):
         guest_ping(a, c, g, "-c 3 -s 4000 10.0.2.16", 3)
 
 
+class Port:
+    """The client end of a console on a TCP port: collects what the guest writes, sends input."""
+
+    def __init__(self, port, name):
+        self.name = name
+        end = time.time() + 120
+        while True:
+            try:
+                self.s = socket.create_connection(("127.0.0.1", port))
+                break
+            except OSError:
+                if time.time() > end:
+                    raise
+                time.sleep(0.5)
+        self.data = bytearray()
+        self.pos = 0
+        self.lock = threading.Lock()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while True:
+            try:
+                b = self.s.recv(4096)
+            except OSError:
+                return
+            if not b:
+                return
+            with self.lock:
+                self.data += b
+
+    def send(self, b):
+        self.s.sendall(b)
+
+    def expect(self, rx, timeout=120):
+        r = re.compile(rx)
+        end = time.time() + timeout
+        while True:
+            with self.lock:
+                m = r.search(bytes(self.data), self.pos)
+                if m:
+                    self.pos = m.end()
+                    return m
+            if time.time() > end:
+                raise Timeout("console %s: no %r within %ds; got %r" % (self.name, rx, timeout, bytes(self.data[-300:])))
+            time.sleep(0.2)
+
+    def close(self):
+        self.s.close()
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# Shell functions printing the device of the console whose vty node has the label $1 (or is
+# named $1, e.g. vty@71000003), as documented in the README.
+#
+# Linux: hvc0 is the vty of /chosen/linux,stdout-path; hvc_vio gives the others hvc1, hvc2, ... in
+# the order it bound them, which is unit address order, the order of the bound devices' names.
+HVC_BY_NAME = (
+    r'''hvc_by_name() { b=$(tr -d '\0' </proc/device-tree/chosen/linux,stdout-path); b=${b##*/}; n=1; '''
+    r'''for d in /sys/bus/vio/drivers/hvc_console/[0-9a-f]*; do o=$(readlink -f $d/of_node); '''
+    r'''if [ ${o##*/} = $b ]; then k=0; else k=$n; n=$((n+1)); fi; '''
+    r'''if [ ${o##*/} = "$1" ] || { [ -e $o/label ] && [ "$(tr -d '\0' <$o/label)" = "$1" ]; }; '''
+    r'''then echo /dev/hvc$k; return 0; fi; done; return 1; }''')
+# FreeBSD: uart_phyp attaches uart0, uart1, ... to the vty children of /vdevice in the order the
+# Open Firmware tree lists them, which is the order ofwdump prints them in.
+UART_AWK = "; ".join([
+    r'''function check() { if (v && (lab == want || ("vty@" reg) == want)) { print "/dev/cuau" (k - 1); found = 1; exit } }''',
+    r'''/^ *Node 0x[0-9a-f]*: / { check(); v = ($3 == "vty"); if (v) k++; lab = ""; reg = ""; prop = ""; next }''',
+    r'''/^ *[^ ]+:$/ { prop = $1; next }''',
+    r'''prop == "label:" && index($0, q) { lab = $0; gsub(q, "", lab); sub(/^ +/, "", lab) }''',
+    r'''prop == "reg:" && reg == "" { reg = $1 $2 $3 $4 }''',
+    r'''END { if (!found) check(); exit !found }''',
+])
+UART_BY_NAME = r'''uart_by_name() { ofwdump -p -r /vdevice | awk -v want="$1" -v q="'" '%s'; }''' % UART_AWK
+
+
+def readme_function(name):
+    """The shell function `name` as the README documents it, renamed doc_<name>."""
+    text = open(os.path.join(ROOT, "README.md")).read()
+    for block in re.findall(r"```sh\n(.*?)```", text, re.S):
+        if name + "() {" in block:
+            lines = [l[2:] if l.startswith("  ") else l for l in block.splitlines()]
+            body = "\n".join(l for l in lines if l.strip() and not l.startswith(name + " "))
+            return body.replace(name + "() {", "doc_" + name + "() {")
+    raise Exited("no %s in README.md" % name)
+
+
+def find_consoles(a, c, names, regs, linux):
+    """The guest's device for each extra console: by name with ours, by node name with QEMU.
+    With ours, the README's version of the lookup must give the same answer."""
+    fn = "hvc_by_name" if linux else "uart_by_name"
+    c.sh(HVC_BY_NAME if linux else UART_BY_NAME)
+    if a.vm == "ours":
+        for line in readme_function(fn).splitlines():
+            c.send(line + "\r")
+        st, o = c.sh("type doc_%s >/dev/null && echo defined" % fn)
+        if "defined" not in o:
+            raise Exited("the README's %s did not define: %r" % (fn, o))
+    run_cmds(a, c, ["ls /dev/hvc*; ls /sys/bus/vio/drivers/hvc_console" if linux else
+                    "ls /dev/ttyu* /dev/cuau*; sysctl kern.console; dmesg | grep uart"])
+    dev = {}
+    for n, reg in zip(names, regs):
+        key = n if a.vm == "ours" else "vty@%x" % reg
+        st, o = c.sh("%s %s" % ("hvc_by_name" if linux else "uart_by_name", key))
+        if st or not o.strip().startswith("/dev/"):
+            raise Exited("no device for console %s: %r" % (key, o))
+        dev[n] = o.strip()
+        if a.vm == "ours":
+            st, o = c.sh("doc_%s %s" % (fn, key))
+            if st or o.strip() != dev[n]:
+                raise Exited("the README's %s says %r for %s, not %s" % (fn, o, key, dev[n]))
+        say(a, "console %s (vty@%x) is %s" % (n, reg, dev[n]))
+    return dev
+
+
+def exchange(a, c, port, dev, n):
+    """Write a line to console n and read one from it; check both ends."""
+    c.sh("exec 3<>%s; printf 'to-host-%s\\n' >&3" % (dev, n))
+    port.expect(re.escape(b"to-host-" + n.encode()) + rb"\r?\n")
+    port.send(b"to-guest-" + n.encode() + b"\n")
+    st, o = c.sh("read -r line <&3; echo \"got:$line\"; exec 3<&-", timeout=120)
+    if "got:to-guest-" + n not in o:
+        raise Exited("%s did not read its input: %r" % (dev, o))
+    say(a, "console %s (%s): the host got to-host-%s, the guest read to-guest-%s" % (n, dev, n, n))
+
+
+def interactive(a, c, port, dev, names, linux):
+    """A shell on the first extra console and a getty on the second, used from the host side."""
+    one, two = names
+    if linux:
+        c.sh("setsid -f sh -c 'exec bash -i <>%s >&0 2>&1'" % dev[one])
+        c.sh("systemctl start serial-getty@%s.service" % dev[two][len("/dev/"):])
+    else:
+        c.sh("daemon sh -c 'exec sh -i <>%s >&0 2>&1'" % dev[one])
+        c.sh("daemon /usr/libexec/getty 3wire %s" % dev[two][len("/dev/"):])
+    p1, p2 = port
+    time.sleep(2)
+    p1.send(b"echo shell-on-$(uname -s)-$((6*7))\r")
+    m = p1.expect(rb"shell-on-(\w+)-42", timeout=120)
+    say(a, "shell on %s: %s" % (dev[one], m.group(0).decode()))
+    p2.expect(rb"login: ", timeout=120)
+    p2.send(b"root\r")
+    # FreeBSD refuses root on a tty /etc/ttys does not call secure: login answers that, which
+    # still shows the whole dialogue crossing the console.
+    m = p2.expect(rb"(Password:|Login incorrect|# |\$ )", timeout=120)
+    say(a, "getty on %s: login prompt, then %r after the user name" % (dev[two], m.group(1).decode()))
+
+
+def consoles(a):
+    """Two more consoles on TCP sockets: find them, use them, save and resume with input waiting."""
+    linux = a.guest == "suse"
+    names = ["jp.one", "jp.two"]
+    regs = [0x71000003, 0x71000004]
+    ports = [free_port() for _ in names]
+    save = a.save and a.vm == "ours"
+    extra = []
+    for k, (n, p) in enumerate(zip(names, ports)):
+        if a.vm == "ours":
+            extra += ["--console", "tcp:127.0.0.1:%d,name=%s" % (p, n)]
+        else:
+            extra += ["-chardev", "socket,id=x%d,host=127.0.0.1,port=%d,server=on,wait=off" % (k, p),
+                      "-device", "spapr-vty,chardev=x%d" % k]
+    os.makedirs(a.logdir, exist_ok=True)
+    state = os.path.join(a.logdir, "consoles-%s.state" % a.guest)
+    if linux:
+        disk = os.path.join(a.logdir, "consoles-suse.raw")
+        subprocess.check_call(["cp", "--sparse=always", SUSE, disk])
+        boot, cdroms = dict(disk4k=disk), []
+        if a.vm == "ours":
+            extra += ["--persistent"]
+    else:
+        boot, cdroms = {}, [ISO_BE if a.guest == "be" else ISO_LE]
+    if os.path.exists(state):
+        os.remove(state)
+    b = argparse.Namespace(**vars(a))
+    b.extra = list(a.extra) + extra + (["--save-state", state] if save else [])
+    b.name = "consoles-%s-1" % a.guest
+    with start(b, "consoles", cdroms, **boot) as c:
+        port = [Port(p, n) for p, n in zip(ports, names)]
+        guest_shell(a, c)
+        for p in port:
+            if p.data:
+                raise Exited("console %s got output before the guest used it: %r" % (p.name, bytes(p.data)))
+        st, o = c.sh("tr -d '\\0' </proc/device-tree/chosen/linux,stdout-path; echo" if linux
+                     else "sysctl -n kern.console")
+        say(a, "firmware and boot output came on the first console (%s); the others stayed silent" % o.strip())
+        dev = find_consoles(a, c, names, regs, linux)
+        for n, p in zip(names, port):
+            exchange(a, c, p, dev[n], n)
+        if not save:
+            interactive(a, c, port, dev, names, linux)
+            return
+        # Input nobody reads yet: Linux reads an hvc only while it is open, so it waits in the
+        # vty; FreeBSD's uart_phyp takes input at once, so it waits in the open tty's buffer.
+        if not linux:
+            c.sh("exec 4<>%s" % dev[names[1]])
+        msg = b"in-flight:" + bytes(range(0x41, 0x5b)) + b"0123456789"
+        port[1].send(msg + b"\n")
+        time.sleep(3)
+        for p in port:
+            p.close()
+        c.close(grace=1800)
+    if not os.path.exists(state):
+        raise Exited("no state saved")
+    say(a, "saved with %d bytes of unread input on %s: %s" % (len(msg) + 1, names[1], timings(
+        os.path.join(a.logdir, b.name + "-%s.stderr.log" % a.vm))))
+    b.extra = list(a.extra) + extra + ["--load-state", state]
+    b.name = "consoles-%s-2" % a.guest
+    with start(b, "consoles", cdroms, **boot) as c:
+        port = [Port(p, n) for p, n in zip(ports, names)]
+        time.sleep(2)
+        c.send("\r")
+        c.expect(r"# $", timeout=600)
+        say(a, "resumed: shell again after %.0fs" % c.elapsed())
+        st, o = c.sh("read -r line %s; echo \"got:$line\"" % ("<" + dev[names[1]] if linux else "<&4"), timeout=120)
+        if "got:" + msg.decode() not in o:
+            raise Exited("the input saved on %s did not arrive: %r" % (names[1], o))
+        say(a, "after the resume %s read the input saved with it: %s" % (dev[names[1]], o.strip()))
+        for n, p in zip(names, port):
+            exchange(a, c, p, dev[n], n)
+        interactive(a, c, port, dev, names, linux)
+
+
 def regress(a):
     failed = []
     for name in ["prompt-le", "prompt-be", "kyua", "suse"]:
@@ -723,12 +956,13 @@ def main():
     p.add_argument("--out", help="results file")
     p.add_argument("--name", help="log file prefix (default: the scenario)")
     p.add_argument("--baseline", help="regress: kyua results from QEMU to compare against")
-    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="shell, resume, net: which guest")
+    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="shell, resume, net, consoles: which guest")
     p.add_argument("--nics", type=int, default=1, choices=[1, 2], help="net: network devices")
     p.add_argument("--net-mib", type=int, default=4, help="net: MiB to download and upload")
     p.add_argument("--net-burst", type=int, default=500, help="net: pings in the burst")
     p.add_argument("--peer-guest", choices=["le", "be", "suse"], help="net: a QEMU guest on the same segment")
     p.add_argument("--gzip", action="store_true", help="resume: gzip the state file")
+    p.add_argument("--save", action="store_true", help="consoles (ours): also save and resume with input waiting")
     p.add_argument("--logdir", default=os.path.join(HOME, "javapower", "work", "guest-logs"))
     p.add_argument("--boot-timeout", type=int, default=1800)
     p.add_argument("--test-timeout", type=int, default=6 * 3600)

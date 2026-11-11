@@ -205,7 +205,7 @@ the class path. The relocated package is not part of javapower's API.
 
 ## License
 
-Apache License, Version 2.0. See [LICENSE](LICENSE).
+Copyright 2026 Box Theta. Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Third-party notes
 

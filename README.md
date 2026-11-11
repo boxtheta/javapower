@@ -166,12 +166,15 @@ gradle publishToMavenLocal                        # library artifacts
 ```
 
 In this project the builds run on the shared dev server through
-`scripts/remote.sh <workspace> <command>` (see `CLAUDE.md`).
+`scripts/remote.sh <workspace> <command>` (see [docs/development.md](docs/development.md)).
 
 Modules: `core` (shared contracts), `cpu-int` (integer, branch, system instructions, MMU, run
 loop), `cpu-fpvec` (floating point, VMX, VSX), `platform` (machine model, hypercalls, RTAS,
 devices), `emulator` (the embedding entry point), `app` (the CLI), `firmware-slof` (the SLOF
 image; depends on nothing else here, and only `app` and tests depend on it).
+
+The machine model and module layout are described in [docs/architecture.md](docs/architecture.md);
+conventions for changes are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Rebuilding the firmware
 

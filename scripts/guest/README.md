@@ -28,3 +28,12 @@ Arguments after `--` go to the emulator or QEMU unchanged, e.g. `-- --jit off`.
 threads, processes, hashing). `progs/build.sh` builds them statically and dynamically against
 sysroots taken from the install disc's `-dev` and `-lib32` packages and packs `progs.iso` with
 xorriso. Compare the `progs` output of both VMs with `diff`.
+
+`mmio/` is for testing MMIO regions with a guest: `mmio/build.sh` builds `mmiotest.c` for both
+FreeBSD guests and packs it with a `RUN` script into `mmio.iso`. It maps the CLI's testing-only
+`--test-mmio` device through `/dev/mem` and makes loads and stores of every size; the CLI prints
+each access the device sees on stderr (in the `--logdir` stderr log):
+
+    scripts/remote.sh be 'python3 scripts/guest/drive.py shell --cdrom2 <outdir>/mmio.iso
+        --cmd "mount -t cd9660 /dev/cd1 /mnt && sh /mnt/RUN"
+        --cmd "ofwdump -p /test-mmio@100000000000" -- --test-mmio 0x100000000000'

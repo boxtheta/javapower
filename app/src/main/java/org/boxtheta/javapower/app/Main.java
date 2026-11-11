@@ -38,7 +38,7 @@ public final class Main {
     private static final String USAGE = "usage: javapower [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]"
             + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
             + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
-            + " [--persistent] [--load-state file] [--save-state file]";
+            + " [--persistent] [--load-state file] [--save-state file] [--test-mmio addr]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
@@ -82,6 +82,10 @@ public final class Main {
                         }
                     }
                     case "--no-code-sharing" -> shareCode = false;
+                    case "--test-mmio" -> {
+                        long base = Long.decode(args[++i]);
+                        cfg.addMmio("test-mmio", base, TestMmio.SIZE, new TestMmio(base)).compatible("javapower,test-mmio");
+                    }
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
@@ -196,6 +200,52 @@ public final class Main {
             }
         } finally {
             saved.countDown(); // also when the run or the save failed
+        }
+    }
+
+    /**
+     * For testing only ({@code --test-mmio addr}): 4 KiB of big-endian scratch registers at
+     * {@code addr}, described in the device tree as {@code /test-mmio@addr}, compatible
+     * {@code javapower,test-mmio}. The word at offset 0 reads 0x4a504d4d ("JPMM") and ignores
+     * stores; the rest reads back what was stored. Every access is printed to stderr, so a guest
+     * check can see what reached the device.
+     */
+    static final class TestMmio implements org.boxtheta.javapower.core.MmioHandler {
+        static final int SIZE = 0x1000;
+        static final long ID = 0x4a504d4dL;
+        private final long base;
+        private final byte[] regs = new byte[SIZE];
+
+        TestMmio(long base) {
+            this.base = base;
+            for (int k = 0; k < 4; k++) {
+                regs[k] = (byte) (ID >>> (24 - 8 * k));
+            }
+        }
+
+        @Override
+        public synchronized long read(long offset, int size) {
+            long v = 0;
+            for (int k = 0; k < size; k++) {
+                v = (v << 8) | (regs[(int) offset + k] & 0xff);
+            }
+            log("load ", offset, size, v);
+            return v;
+        }
+
+        @Override
+        public synchronized void write(long offset, int size, long value) {
+            log("store", offset, size, value);
+            for (int k = size - 1; k >= 0; k--, value >>>= 8) {
+                if (offset + k >= 4) {
+                    regs[(int) offset + k] = (byte) value;
+                }
+            }
+        }
+
+        private void log(String what, long offset, int size, long v) {
+            System.err.printf("[javapower] test-mmio %s %d bytes at 0x%x: 0x%x (%s)%n", what, size, base + offset, v,
+                    Thread.currentThread().getName());
         }
     }
 

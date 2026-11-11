@@ -20,7 +20,8 @@ import org.boxtheta.javapower.core.Spr;
 
 /**
  * The PAPR {@code pseries} machine: guest RAM, the SLOF firmware image, the device tree, XICS,
- * the VIO devices (nvram, vty, v-scsi) and the hypervisor itself. Mirrors QEMU's
+ * the VIO devices (nvram, vty, v-scsi and those added with {@link MachineConfig#addVioDevice}) and
+ * the hypervisor itself. Mirrors QEMU's
  * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp N -nodefaults} closely enough for the
  * stock SLOF binary.
  *
@@ -42,8 +43,8 @@ import org.boxtheta.javapower.core.Spr;
  * A single-CPU machine can still use {@code attachCpu(cpu)} and {@code reset(cpu)}.
  *
  * <p>Each machine has its own {@link #log() log} (sink and once-per-key counts) and owns the host
- * resources its configuration names (disk images, NVRAM file, console backend), which
- * {@link #close} releases. Machines are independent: several may live in one JVM.
+ * resources its configuration names (disk images, NVRAM file, console backend, added VIO
+ * devices), which {@link #close} releases. Machines are independent: several may live in one JVM.
  *
  * <h2>Threading and locking</h2>
  * Every CPU runs on its own host thread and calls {@link #hcall} on that thread; console input
@@ -146,6 +147,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final Vty vty;
     private final VScsi vscsi;
     private final List<VioDevice> vio = new ArrayList<>();
+    /** The devices from {@code MachineConfig.addedVio} this machine attached, in that order. */
+    private final List<VioDevice> addedVio = new ArrayList<>();
     private final List<TceTable> tceTables = new ArrayList<>();
     private TceTable phbTce;
     private final List<Drc> drcs = new ArrayList<>();
@@ -213,7 +216,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
     /**
      * Build the machine described by {@code config}: allocate guest RAM, load the firmware, open
      * the disk images and the NVRAM file, and start the console backend. If this fails, everything
-     * opened so far is closed again before the exception propagates.
+     * opened so far is closed again before the exception propagates, including the added VIO
+     * devices created so far. Added devices are started ({@link VioDevice#startDevice}) last, in
+     * the order they were added.
      *
      * @throws IOException if the firmware, a disk image or the NVRAM file cannot be read
      * @throws IllegalArgumentException if the configuration is invalid, e.g. no firmware is set
@@ -281,6 +286,14 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         rtas = new Rtas(this);
         vty.start();
+        for (VioDevice d : addedVio) {
+            try {
+                d.startDevice();
+            } catch (RuntimeException | Error e) {
+                closeBackends(e, true);
+                throw e;
+            }
+        }
     }
 
     /**
@@ -313,6 +326,20 @@ public final class Machine implements Hypervisor, AutoCloseable {
         int reg = VioDevice.REG_BASE;
         for (VioDevice d : List.of(nvram, vty, vscsi)) {
             d.attach(this, reg++);
+            xics.claim(d.irq(), false);
+            vio.add(d);
+            if (d.tce() != null) {
+                tceTables.add(d.tce());
+            }
+        }
+        // Devices added through the configuration, in the order they were added.
+        for (java.util.function.Supplier<? extends VioDevice> f : config.addedVio) {
+            VioDevice d = f.get();
+            if (d == null) {
+                throw new IllegalArgumentException("a VIO device factory returned null");
+            }
+            d.attach(this, reg++);
+            addedVio.add(d);
             xics.claim(d.irq(), false);
             vio.add(d);
             if (d.tce() != null) {
@@ -453,8 +480,22 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return Collections.unmodifiableList(mmioDevices);
     }
 
-    List<VioDevice> vioDevices() {
+    /**
+     * Every VIO device in unit address order: nvram, vty, v-scsi, then the devices added through
+     * {@link MachineConfig#addVioDevice} in the order they were added. Fixed for the machine's life.
+     */
+    public List<VioDevice> vioDevices() {
         return Collections.unmodifiableList(vio);
+    }
+
+    /**
+     * The VIO device at {@code unitAddress} if it is a {@code type}, otherwise null. For example
+     * {@code m.vioDevice(reg, MyDevice.class)} with the address {@link MachineConfig#addVioDevice}
+     * returned. Safe from any thread.
+     */
+    public <T extends VioDevice> T vioDevice(int unitAddress, Class<T> type) {
+        VioDevice d = vioByReg(unitAddress & 0xffffffffL);
+        return type.isInstance(d) ? type.cast(d) : null;
     }
 
     List<Drc> drcs(Drc.Kind kind) {
@@ -928,7 +969,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Release the host resources: close the disk backends (deleting snapshot overlays), the NVRAM
-     * file and the console backend. Idempotent. The CPUs must not be running. Guest RAM is
+     * file, the console backend and the added VIO devices ({@link VioDevice#closeDevice}). Idempotent. The CPUs must not be running. Guest RAM is
      * off-heap memory the JVM reclaims once the machine is unreachable.
      *
      * @throws IOException the first failure to close a backend (the others are still closed and
@@ -964,6 +1005,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
         all.add(nvram::close);
         if (console) {
             all.add(vty.backend()::close);
+        }
+        for (VioDevice d : addedVio) {
+            all.add(d::closeDevice);
         }
         for (AutoCloseable c : all) {
             try {
@@ -1076,6 +1120,18 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         // Optional sections: absent without the devices they describe, so that a machine
         // without any writes the description it always did.
+        if (!addedVio.isEmpty()) {
+            hardwareSection(d, "VIO ", o -> {
+                o.writeInt(addedVio.size());
+                for (VioDevice v : addedVio) {
+                    o.writeUTF(v.nodeName());
+                    o.writeUTF(v.dtType());
+                    o.writeUTF(v.dtCompatible());
+                    o.writeLong(v.dmaWindowSize());
+                    org.boxtheta.javapower.core.StateOutput.writeString(o, v.hardwareIdentity());
+                }
+            });
+        }
         if (!mmioDevices.isEmpty()) {
             hardwareSection(d, "MMIO", o -> {
                 o.writeInt(mmioDevices.size());
@@ -1286,6 +1342,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             try {
                 java.util.Map<String, java.io.DataInputStream> saved = hardwareSections(rest);
                 java.util.Map<String, java.io.DataInputStream> now = hardwareSections(cur.readAllBytes());
+                compareVio(diff, saved.remove("VIO "), now.remove("VIO "));
                 compareMmio(diff, saved.remove("MMIO"), now.remove("MMIO"));
                 for (String tag : saved.keySet()) {
                     diff.add("hardware this version of javapower does not know: section " + tag.trim());
@@ -1297,6 +1354,26 @@ public final class Machine implements Hypervisor, AutoCloseable {
         if (!diff.isEmpty()) {
             throw new org.boxtheta.javapower.core.StateMismatchException(
                     "the machine state was saved from different hardware: " + String.join("; ", diff));
+        }
+    }
+
+    /** Compare the added VIO device sections of two hardware descriptions; null stands for none. */
+    private static void compareVio(List<String> diff, java.io.DataInputStream r, java.io.DataInputStream cur)
+            throws IOException {
+        int sn = r == null ? 0 : r.readInt();
+        int cn = cur == null ? 0 : cur.readInt();
+        compare(diff, "added VIO devices", sn, cn);
+        for (int i = 0; i < Math.min(sn, cn); i++) {
+            String sname = r.readUTF();
+            String cname = cur.readUTF();
+            String what = "VIO device " + cname + ": ";
+            compare(diff, "VIO device " + (i + 1 + 3) + " node", sname, cname);
+            compare(diff, what + "device_type", r.readUTF(), cur.readUTF());
+            compare(diff, what + "compatible", r.readUTF(), cur.readUTF());
+            compare(diff, what + "DMA window bytes", r.readLong(), cur.readLong());
+            String sid = r.readBoolean() ? r.readUTF() : null;
+            String cid = cur.readBoolean() ? cur.readUTF() : null;
+            compare(diff, what + "identity", quote(sid), quote(cid));
         }
     }
 
@@ -1324,6 +1401,10 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     private static String order(boolean big) {
         return big ? "big-endian" : "little-endian";
+    }
+
+    private static String quote(String s) {
+        return s == null ? "none" : "\"" + s + "\"";
     }
 
     private static void compare(List<String> diff, String what, Object saved, Object now) {

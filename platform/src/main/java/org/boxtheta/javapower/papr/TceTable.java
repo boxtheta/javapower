@@ -8,6 +8,9 @@ import java.util.Arrays;
  * ({@code tce & 1}: the device may read memory, {@code tce & 2}: the device may write memory).
  * In bypass mode (ibm,set-tce-bypass, used by SLOF) DMA addresses are real addresses.
  *
+ * <p>The guest maps the window with hypercalls (H_PUT_TCE and its relatives) and RTAS; devices
+ * only read it, normally through {@link VioDevice#dmaRead} and {@link VioDevice#dmaWrite}.
+ *
  * <p>Thread-safe: entries are updated by hypercalls on any CPU while devices translate DMA
  * addresses on other threads; the table's own monitor guards them (a leaf lock).
  */
@@ -26,7 +29,7 @@ public final class TceTable {
     private final PaprLog log;
 
     /** A table with a log of its own (tests); a machine passes its log. */
-    public TceTable(int liobn, long busOffset, long windowSize) {
+    TceTable(int liobn, long busOffset, long windowSize) {
         this(liobn, busOffset, windowSize, new PaprLog());
     }
 
@@ -57,17 +60,17 @@ public final class TceTable {
         return bypass;
     }
 
-    public void setBypass(boolean b) {
+    void setBypass(boolean b) {
         bypass = b;
     }
 
     /** Table reset (RTAS quiesce, QEMU's spapr_tce_reset): clear every entry; bypass is kept. */
-    public synchronized void clear() {
+    synchronized void clear() {
         Arrays.fill(table, 0);
     }
 
     /** Device reset: clear every entry and leave bypass. */
-    public synchronized void reset() {
+    synchronized void reset() {
         Arrays.fill(table, 0);
         bypass = false;
     }
@@ -116,7 +119,7 @@ public final class TceTable {
     }
 
     /** Store a TCE for the page containing {@code ioba}; H_PARAMETER if outside the window. */
-    public synchronized long put(long ioba, long tce) {
+    synchronized long put(long ioba, long tce) {
         long idx = index(ioba & PAGE_MASK);
         if (ioba < busOffset || idx >= table.length) {
             log.once("tce-put-out-of-bounds", String.format("liobn 0x%x ioba 0x%x", liobn, ioba));

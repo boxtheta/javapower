@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import org.boxtheta.javapower.core.MmioHandler;
 
 /**
@@ -49,6 +50,11 @@ public final class MachineConfig {
      * PowerVM offers, and Linux's memory section size on ppc64.
      */
     public static final long RAM_GRANULE = 16L << 20;
+    /**
+     * Most VIO devices a machine may have besides nvram, vty and v-scsi. A VIO device's interrupt
+     * source follows from the low byte of its unit address, so 256 devices in all fit.
+     */
+    public static final int MAX_ADDED_VIO_DEVICES = 256 - 3;
 
     /** One SCSI device on the v-scsi bus. */
     public static final class Disk {
@@ -227,6 +233,12 @@ public final class MachineConfig {
     Random random;
     Clock clock = Clock.systemUTC();
     Consumer<PaprLog.Entry> logSink;
+    /**
+     * VIO devices after nvram, vty and v-scsi, in the order they were added; entry {@code i} gets
+     * unit address {@code VioDevice.REG_BASE + 3 + i}. Every kind of added VIO device goes here,
+     * so that unit addresses follow the order of the calls that added them.
+     */
+    final List<Supplier<? extends VioDevice>> addedVio = new ArrayList<>();
 
     /**
      * Guest RAM in bytes: at least {@link #MIN_RAM} (64 MiB) and a multiple of
@@ -356,6 +368,35 @@ public final class MachineConfig {
         Mmio m = new Mmio(name, base, size, handler);
         mmios.add(m);
         return m;
+    }
+
+    /**
+     * Add a VIO device of your own (a {@link VioDevice} subclass; see its class comment for what it
+     * can do). {@code factory} is called once by every machine built from this configuration, while
+     * that machine is constructed, and must return a new device each time: an instance belongs to
+     * one machine, and attaching it to a second one fails with {@link IllegalStateException}. The
+     * machine owns the device from then on and closes it ({@link VioDevice#closeDevice}) when the
+     * machine is closed, or when its construction fails.
+     *
+     * <p>Devices get unit addresses in the order they are added: the built-in nvram, vty and
+     * v-scsi have 0x71000000, 0x71000001 and 0x71000002, and the first added device gets
+     * 0x71000003, the next 0x71000004, and so on. A machine's device is found again with
+     * {@link Machine#vioDevice(int, Class)} or {@link Machine#vioDevices()}.
+     *
+     * @return the unit address the device will have
+     * @throws IllegalStateException if {@link #MAX_ADDED_VIO_DEVICES} devices were already added
+     */
+    public int addVioDevice(Supplier<? extends VioDevice> factory) {
+        return addVio(java.util.Objects.requireNonNull(factory, "factory"));
+    }
+
+    /** Append a VIO device of any kind to the ordered list; returns its unit address. */
+    int addVio(Supplier<? extends VioDevice> factory) {
+        if (addedVio.size() >= MAX_ADDED_VIO_DEVICES) {
+            throw new IllegalStateException("at most " + MAX_ADDED_VIO_DEVICES + " VIO devices can be added");
+        }
+        addedVio.add(factory);
+        return VioDevice.REG_BASE + 3 + addedVio.size() - 1;
     }
 
     /** Back the NVRAM with a file (8 KiB .. 1 MiB) that receives every store. */

@@ -73,19 +73,19 @@ public final class Nvram extends VioDevice {
 
     /** Copy NVRAM bytes into guest memory. Returns false if the range is invalid. */
     boolean fetch(long offset, long buffer, long len) {
-        if (offset + len < offset || offset + len > data.length || !machine.memory().contains(buffer, len)) {
+        if (offset + len < offset || offset + len > data.length || !machine().memory().contains(buffer, len)) {
             return false;
         }
-        machine.memory().write(buffer, data, (int) offset, (int) len);
+        machine().memory().write(buffer, data, (int) offset, (int) len);
         return true;
     }
 
     /** Copy guest memory into NVRAM (and the backing file). Returns -1 on a bad range, 0 on an I/O error. */
     int store(long offset, long buffer, long len) {
-        if (offset + len < offset || offset + len > data.length || !machine.memory().contains(buffer, len)) {
+        if (offset + len < offset || offset + len > data.length || !machine().memory().contains(buffer, len)) {
             return -1;
         }
-        machine.memory().read(buffer, data, (int) offset, (int) len);
+        machine().memory().read(buffer, data, (int) offset, (int) len);
         if (file != null) {
             try {
                 ByteBuffer bb = ByteBuffer.wrap(data, (int) offset, (int) len);

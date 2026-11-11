@@ -23,7 +23,7 @@ import org.boxtheta.javapower.core.MmioHandler;
  * {@value PaprLog#LOGGER_NAME}).
  *
  * <p>Embedders can map devices of their own into the guest's real address space with
- * {@link #addMmio}.
+ * {@link #addMmio}, and put PCI devices on the PCI host bridge with {@link #addPciDevice}.
  *
  * <p>There is no default firmware: set one with {@link #firmware(byte[])} or
  * {@link #firmware(Path)}. The SLOF image the machine is built for ships in the separate artifact
@@ -273,6 +273,9 @@ public final class MachineConfig {
         }
     }
 
+    /** A PCI device added with {@link #addPciDevice}: the device and its slot, or -1 for the first free one. */
+    record Pci(PciDevice device, int slot) {}
+
     /**
      * Real addresses QEMU's {@code pseries} keeps for the windows of its PCI host bridges
      * ({@code SPAPR_PCI_BASE} 32 TiB to {@code SPAPR_PCI_LIMIT} 64 TiB); no MMIO region may lie
@@ -292,6 +295,7 @@ public final class MachineConfig {
     final List<Disk> disks = new ArrayList<>();
     final List<Mmio> mmios = new ArrayList<>();
     final List<Network> networks = new ArrayList<>();
+    final List<Pci> pciDevices = new ArrayList<>();
     Path nvramFile;
     String bootDevice;
     String kernelCmdline;
@@ -486,6 +490,53 @@ public final class MachineConfig {
         return n;
     }
 
+    /**
+     * Put a PCI device on the PCI host bridge, in the lowest slot no other device takes. Devices
+     * added with an explicit slot ({@link #addPciDevice(int, PciDevice)}) are placed first, then
+     * the others in the order they were added, so the same configuration always gives the same
+     * slots: the first device added this way is in slot 0 when no slot was given explicitly. A
+     * machine with PCI devices needs the host bridge ({@link #phb}); the device's state is part of
+     * the saved machine, and its slot, identity and BARs are part of the hardware a saved state
+     * must match. See {@link PciDevice}.
+     *
+     * @throws IllegalArgumentException if the device was already added
+     */
+    public MachineConfig addPciDevice(PciDevice device) {
+        return addPci(device, -1);
+    }
+
+    /**
+     * Put a PCI device into slot {@code slot} (0 to 31; function 0) of the PCI host bridge.
+     *
+     * @throws IllegalArgumentException if the slot is out of range or taken by another device
+     *     added with a slot, or the device was already added
+     */
+    public MachineConfig addPciDevice(int slot, PciDevice device) {
+        if (slot < 0 || slot >= Phb.SLOTS) {
+            throw new IllegalArgumentException("PCI slot " + slot + " is not 0.." + (Phb.SLOTS - 1));
+        }
+        for (Pci p : pciDevices) {
+            if (p.slot() == slot) {
+                throw new IllegalArgumentException("PCI slot " + slot + " is taken by " + p.device().name());
+            }
+        }
+        return addPci(device, slot);
+    }
+
+    private MachineConfig addPci(PciDevice device, int slot) {
+        Objects.requireNonNull(device, "device");
+        for (Pci p : pciDevices) {
+            if (p.device() == device) {
+                throw new IllegalArgumentException("PCI device " + device.name() + " was already added");
+            }
+        }
+        if (pciDevices.size() >= Phb.SLOTS) {
+            throw new IllegalArgumentException("more than " + Phb.SLOTS + " PCI devices");
+        }
+        pciDevices.add(new Pci(device, slot));
+        return this;
+    }
+
     /** Back the NVRAM with a file (8 KiB .. 1 MiB) that receives every store. */
     public MachineConfig nvram(Path file) {
         this.nvramFile = file;
@@ -522,7 +573,10 @@ public final class MachineConfig {
         return this;
     }
 
-    /** Whether to model the default (empty) PCI host bridge QEMU always creates. Default true. */
+    /**
+     * Whether to model the PCI host bridge QEMU always creates. Default true. Without it the
+     * machine can have no PCI devices ({@link #addPciDevice}).
+     */
     public MachineConfig phb(boolean b) {
         this.phb = b;
         return this;

@@ -21,7 +21,7 @@ import org.boxtheta.javapower.core.Spr;
 /**
  * The PAPR {@code pseries} machine: guest RAM, the SLOF firmware image, the device tree, XICS,
  * the VIO devices (nvram, vty, v-scsi, and the network and other devices added through
- * {@link MachineConfig}) and the hypervisor itself. Mirrors QEMU's
+ * {@link MachineConfig}), the PCI devices an embedder adds, and the hypervisor itself. Mirrors QEMU's
  * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp N -nodefaults} closely enough for the
  * stock SLOF binary.
  *
@@ -158,6 +158,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final List<VioDevice> addedVio = new ArrayList<>();
     private final List<TceTable> tceTables = new ArrayList<>();
     private TceTable phbTce;
+    /** The devices on PHB 0; null without the host bridge. */
+    private Phb phb;
     private final List<Drc> drcs = new ArrayList<>();
     private final Rtas rtas;
     /** The MMIO regions every CPU and H_LOGICAL_CI_* reach outside RAM. */
@@ -246,6 +248,10 @@ public final class Machine implements Hypervisor, AutoCloseable {
             throw new IOException("firmware image larger than " + FW_MAX_SIZE + " bytes");
         }
         this.firmware = fw;
+        if (!config.phb && !config.pciDevices.isEmpty()) {
+            throw new IllegalArgumentException("PCI devices need the PCI host bridge, but MachineConfig.phb(false)"
+                    + " was set");
+        }
         this.xics = new Xics(log);
         this.mem = new PhysicalMemory(config.ramSize);
         this.random = config.random != null ? config.random : new SecureRandom();
@@ -363,6 +369,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             TceTable t = new TceTable(DeviceTree.PHB0_LIOBN, 0, DeviceTree.PHB0_DMA_WINDOW, log);
             tceTables.add(t);
             phbTce = t;
+            phb = new Phb(mmio, t, mem, xics, log);
+            phb.machine = this;
+            phb.place(config.pciDevices);
         }
 
         // SCSI devices on the v-scsi bus.
@@ -410,7 +419,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         if (config.phb) {
             for (int i = 0; i < 256; i++) {
-                drcs.add(new Drc(Drc.Kind.PCI, i, null));
+                PciDevice d = (i & 7) == 0 ? phb.device(i >>> 3) : null;
+                drcs.add(new Drc(Drc.Kind.PCI, i, d != null ? () -> Phb.deviceNode(d) : null));
             }
         }
     }
@@ -496,6 +506,27 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     List<MmioDevice> mmioDevices() {
         return Collections.unmodifiableList(mmioDevices);
+    }
+
+    /** The devices on PHB 0, or null without the host bridge. */
+    Phb phb() {
+        return phb;
+    }
+
+    /**
+     * Whether the CPU running on the calling thread is in big-endian mode (MSR[LE] clear), as
+     * QEMU decides a legacy virtio device's byte order at reset; true on a thread that runs no
+     * CPU (QEMU's default for ppc64).
+     */
+    boolean currentCpuBigEndian() {
+        Thread t = Thread.currentThread();
+        for (VCpu v : vcpus) {
+            CpuState c = v.cpu;
+            if (c != null && c.runner == t) {
+                return (c.msr & Msr.LE) == 0;
+            }
+        }
+        return true;
     }
 
     /**
@@ -756,6 +787,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (phbTce != null) {
                 phbTce.reset();
             }
+            if (phb != null) {
+                phb.reset();
+            }
             for (Drc d : drcs) {
                 d.reset();
             }
@@ -927,8 +961,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
     // ---- asynchronous work, shutdown ---------------------------------------------------------
 
     /**
-     * Run timer-driven device work (the H_WATCHDOG timers, and giving up on received frames no
-     * guest buffer fits). Safe to call from any thread at any
+     * Run timer-driven device work: the H_WATCHDOG timers, giving up on received network frames
+     * no guest buffer fits, and telling virtio devices about requests that were in flight when a
+     * loaded state was saved. Safe to call from any thread at any
      * rate; the application calls it periodically (e.g. from its run loop or a timer thread).
      * Console input needs no pumping: it is delivered as soon as the backend produces it.
      */
@@ -967,6 +1002,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         for (LLan n : networks) {
             n.pump();
+        }
+        if (phb != null) {
+            phb.pump(); // outside the machine lock: it may call device code
         }
     }
 
@@ -1020,6 +1058,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
      */
     private IOException closeBackends(Throwable primary, boolean console) {
         IOException first = null;
+        if (phb != null) {
+            phb.close(); // the PCI devices may join another machine
+        }
         List<AutoCloseable> all = new ArrayList<>();
         for (ScsiTarget t : vscsi.targets()) {
             if (t instanceof ScsiDisk d) {
@@ -1061,10 +1102,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * results, the device tree the guest holds, process table, VPA/SLB shadow/DTL registrations,
      * watchdogs), XICS, RTAS, the DR connectors and every VIO device (CRQ, TCE tables, NVRAM
      * contents, console input not yet read by the guest, SCSI sense state, network device
-     * registration, receive buffers and filters), and, if the machine has MMIO regions, an
-     * {@code "MMIO"} record with each region handler's own state. Guest RAM and the CPUs
-     * are not written here: they belong to {@code PhysicalMemory} and the CPU module, and
-     * {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
+     * registration, receive buffers and filters), then, if the machine has PCI devices, a
+     * {@code "PCI "} record with each one's configuration space and own state, and, if it has
+     * MMIO regions, an {@code "MMIO"} record with each region handler's own state. Guest RAM
+     * and the CPUs are not written here: they belong to {@code PhysicalMemory} and the CPU
+     * module, and {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
      * console and the other host resources stay outside the state.
      *
      * <p>Received frames waiting for the guest's receive buffers are dropped, and the network
@@ -1119,6 +1161,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                     phbTce.saveState(d);
                 }
             });
+            if (phb != null && !phb.devices().isEmpty()) {
+                out.record("PCI ", phb::saveState);
+            }
             if (!mmioDevices.isEmpty()) {
                 out.record("MMIO", d -> {
                     for (MmioDevice m : mmioDevices) {
@@ -1164,6 +1209,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                     org.boxtheta.javapower.core.StateOutput.writeString(o, v.hardwareIdentity());
                 }
             });
+        }
+        if (phb != null && !phb.devices().isEmpty()) {
+            hardwareSection(d, "PCI ", phb::saveHardware);
         }
         if (!mmioDevices.isEmpty()) {
             hardwareSection(d, "MMIO", o -> {
@@ -1336,6 +1384,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (phbTce != null) {
                 phbTce.loadState(r);
             }
+            if (phb != null && !phb.devices().isEmpty()) {
+                phb.loadState(in.record("PCI "));
+            }
             if (!mmioDevices.isEmpty()) {
                 loadMmio(in.record("MMIO"));
             }
@@ -1393,6 +1444,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 java.util.Map<String, java.io.DataInputStream> saved = hardwareSections(rest);
                 java.util.Map<String, java.io.DataInputStream> now = hardwareSections(cur.readAllBytes());
                 compareVio(diff, saved.remove("VIO "), now.remove("VIO "));
+                Phb.compareHardware(diff, saved.remove("PCI "), now.remove("PCI "));
                 compareMmio(diff, saved.remove("MMIO"), now.remove("MMIO"));
                 for (String tag : saved.keySet()) {
                     diff.add("hardware this version of javapower does not know: section " + tag.trim());

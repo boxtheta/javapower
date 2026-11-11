@@ -185,14 +185,12 @@ final class Rtas {
             }
             case 0x12 -> nvramFetch(nargs, nret, args, rets);
             case 0x13 -> nvramStore(nargs, nret, args, rets);
-            case 0x14, 0x15, 0x16, 0x17 -> {
-                // PCI config space: the PHB has no devices, so every access fails like an access
-                // to a missing device does in QEMU.
-                log.once("rtas-pci-config", "config access to the empty PHB");
-                st(rets, 0, HW_ERROR);
-            }
+            case 0x14, 0x15, 0x16, 0x17 -> pciConfig(idx, nargs, nret, args, rets);
             case 0x18, 0x19 -> {
-                log.once("rtas-pci-msi", DeviceTree.RTAS_TOKENS.get(idx) + " on the empty PHB");
+                // No PCI device has MSI or MSI-X: a parameter error, as QEMU answers for such a
+                // device (or for none at all).
+                log.once("rtas-pci-msi", DeviceTree.RTAS_TOKENS.get(idx) + (pciDevices() ? ": no PCI device has MSI"
+                        : " on the empty PHB"));
                 st(rets, 0, PARAM_ERROR);
             }
             case 0x1a -> setIndicator(nargs, nret, args, rets);
@@ -202,8 +200,12 @@ final class Rtas {
             case 0x1e -> configureConnector(nargs, nret, args, rets);
             case 0x1f -> osTerm(args, rets);
             case 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29 -> {
-                // EEH and DDW calls all address a PE; there are no PCI devices, hence no PEs.
-                log.once("rtas-eeh-ddw", DeviceTree.RTAS_TOKENS.get(idx) + " on the empty PHB");
+                // EEH and DDW calls all address a PE. Without PCI devices there are none; with
+                // them, EEH is unavailable as in QEMU for emulated devices, and dynamic DMA
+                // windows are not implemented (QEMU offers them): the guest keeps the default
+                // window.
+                log.once("rtas-eeh-ddw", DeviceTree.RTAS_TOKENS.get(idx) + (pciDevices() ? " is not supported"
+                        : " on the empty PHB"));
                 st(rets, 0, PARAM_ERROR);
             }
             case 0x2a -> {
@@ -369,6 +371,50 @@ final class Rtas {
                 }
                 st(rets, 0, SUCCESS);
             }
+        }
+    }
+
+    private boolean pciDevices() {
+        return m.phb() != null && !m.phb().devices().isEmpty();
+    }
+
+    // ---- PCI configuration space --------------------------------------------------------------
+
+    /**
+     * read-pci-config, write-pci-config, ibm,read-pci-config, ibm,write-pci-config (QEMU's
+     * spapr_pci.c): the forms without a BUID name PHB 0 by BUID 0, which no bridge has, so they
+     * fail as in QEMU. Accesses to a missing device, misaligned or outside the 256 bytes of
+     * configuration space, or of a size other than 1, 2 or 4, are hardware errors.
+     */
+    private void pciConfig(int idx, int nargs, int nret, long args, long rets) {
+        boolean read = idx == 0x14 || idx == 0x16;
+        boolean ibm = idx >= 0x16;
+        int want = (ibm ? 4 : 2) + (read ? 0 : 1);
+        if (nargs != want || nret != (read ? 2 : 1)) {
+            st(rets, 0, HW_ERROR);
+            return;
+        }
+        Phb phb = m.phb();
+        int addr = ld(args, 0);
+        long buid = ibm ? (ldu(args, 1) << 32) | ldu(args, 2) : 0;
+        int size = ld(args, ibm ? 3 : 1);
+        if (phb == null || phb.devices().isEmpty()) {
+            log.once("rtas-pci-config", "config access to the empty PHB");
+        }
+        if (phb == null || buid != DeviceTree.PHB0_BUID) {
+            st(rets, 0, HW_ERROR);
+            return;
+        }
+        if (read) {
+            long v = phb.configRead(addr, size);
+            if (v < 0) {
+                st(rets, 0, HW_ERROR);
+                return;
+            }
+            st(rets, 0, SUCCESS);
+            st(rets, 1, (int) v);
+        } else {
+            st(rets, 0, phb.configWrite(addr, size, ld(args, ibm ? 4 : 2)) ? SUCCESS : HW_ERROR);
         }
     }
 

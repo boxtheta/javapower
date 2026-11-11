@@ -392,6 +392,11 @@ final class DeviceTree {
         p.setCell("#interrupt-cells", 1);
         p.setString("compatible", "IBM,Logical_PHB");
         p.setString("device_type", "pci");
+        // The devices, in slot order; QEMU has enumerated the bus (qemu,phb-enumerated), so
+        // SLOF only assigns their BARs.
+        for (PciDevice d : m.phb().devices()) {
+            p.addChild(Phb.deviceNode(d));
+        }
     }
 
     private static void vdevice(Machine m, Fdt.Node v) {

@@ -5,6 +5,7 @@ import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -22,8 +23,10 @@ import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Spr;
 import org.boxtheta.javapower.cpu.Interpreter;
 import org.boxtheta.javapower.firmware.slof.SlofFirmware;
+import org.boxtheta.javapower.papr.DatagramNetBackend;
 import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
+import org.boxtheta.javapower.papr.NetBackend;
 import org.boxtheta.javapower.papr.PaprLog;
 import org.boxtheta.javapower.papr.StdioCharBackend;
 
@@ -38,7 +41,9 @@ public final class Main {
     private static final String USAGE = "usage: javapower [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]"
             + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
             + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
-            + " [--persistent] [--load-state file] [--save-state file] [--test-mmio addr]";
+            + " [--persistent] [--load-state file] [--save-state file]"
+            + " [--net dgram,local=host:port,remote=host:port[,mac=xx:xx:xx:xx:xx:xx] | --net none[,mac=...]]"
+            + " [--test-mmio addr]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
@@ -82,6 +87,7 @@ public final class Main {
                         }
                     }
                     case "--no-code-sharing" -> shareCode = false;
+                    case "--net" -> addNetwork(cfg, args[++i]);
                     case "--test-mmio" -> {
                         long base = Long.decode(args[++i]);
                         cfg.addMmio("test-mmio", base, TestMmio.SIZE, new TestMmio(base)).compatible("javapower,test-mmio");
@@ -201,6 +207,79 @@ public final class Main {
         } finally {
             saved.countDown(); // also when the run or the save failed
         }
+    }
+
+    /**
+     * A network device from a {@code --net} specification: {@code dgram,local=host:port,remote=host:port}
+     * (one frame per UDP datagram, as QEMU's {@code -netdev dgram} with inet addresses) or
+     * {@code none} (a device whose cable leads nowhere), either followed by {@code ,mac=address}.
+     */
+    private static void addNetwork(MachineConfig cfg, String spec) {
+        String[] parts = spec.split(",");
+        String local = null;
+        String remote = null;
+        String mac = null;
+        for (int k = 1; k < parts.length; k++) {
+            int eq = parts[k].indexOf('=');
+            String key = eq < 0 ? parts[k] : parts[k].substring(0, eq);
+            String value = eq < 0 ? "" : parts[k].substring(eq + 1);
+            switch (key) {
+                case "local" -> local = value;
+                case "remote" -> remote = value;
+                case "mac" -> mac = value;
+                default -> throw new IllegalArgumentException("--net: unknown option " + parts[k]);
+            }
+        }
+        NetBackend backend;
+        switch (parts[0]) {
+            case "dgram" -> {
+                if (local == null || remote == null) {
+                    throw new IllegalArgumentException("--net dgram needs local=host:port and remote=host:port");
+                }
+                try {
+                    backend = new DatagramNetBackend(socketAddress(local), socketAddress(remote));
+                } catch (IOException e) {
+                    throw new IllegalArgumentException("--net: cannot bind " + local + ": " + e.getMessage(), e);
+                }
+            }
+            case "none" -> {
+                if (local != null || remote != null) {
+                    throw new IllegalArgumentException("--net none takes no addresses");
+                }
+                backend = new NetBackend() {
+                    @Override
+                    public void transmit(byte[] frame) {
+                    }
+
+                    @Override
+                    public void start(FrameSink sink) {
+                    }
+                };
+            }
+            default -> throw new IllegalArgumentException("--net takes dgram,... or none, got " + parts[0]);
+        }
+        MachineConfig.Network n = cfg.addNetwork(backend);
+        if (mac != null) {
+            n.mac(mac);
+        }
+    }
+
+    /** {@code host:port} or {@code [ipv6]:port}. */
+    private static InetSocketAddress socketAddress(String s) {
+        int colon = s.lastIndexOf(':');
+        if (colon <= 0) {
+            throw new IllegalArgumentException("--net: not host:port: " + s);
+        }
+        String host = s.substring(0, colon);
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        int port = Integer.parseInt(s.substring(colon + 1));
+        InetSocketAddress a = new InetSocketAddress(host, port);
+        if (a.isUnresolved()) {
+            throw new IllegalArgumentException("--net: unknown host " + host);
+        }
+        return a;
     }
 
     /**

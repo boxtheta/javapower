@@ -473,6 +473,7 @@ class PciTest {
             {new MachineConfig().ram(256L << 20).addPciDevice(3, new Dev()), "slot: saved 0, this machine 3"},
             {cfg(other), "device: saved , this machine model 2"},
             {cfg(new Dev(), new Dev()), "PCI devices: saved 1, this machine 2"},
+            {cfg(new VirtioPciDevice(new VirtioRng())), "model: saved test-dev, this machine virtio-rng-pci"},
             {new MachineConfig().ram(256L << 20), "PCI devices: saved 1, this machine 0"},
         };
         for (Object[] k : cases) {

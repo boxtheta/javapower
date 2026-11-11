@@ -1,6 +1,8 @@
 package org.boxtheta.javapower;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -11,6 +13,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.DecodeTable;
+import org.boxtheta.javapower.core.StateFormatException;
+import org.boxtheta.javapower.core.StateInput;
+import org.boxtheta.javapower.core.StateMismatchException;
+import org.boxtheta.javapower.core.StateOutput;
 import org.boxtheta.javapower.cpu.CpuDomain;
 import org.boxtheta.javapower.cpu.IntInsns;
 import org.boxtheta.javapower.cpu.Interpreter;
@@ -57,6 +63,17 @@ import org.boxtheta.javapower.papr.PaprLog;
  * With {@link Interpreter.Clock#WALL} (the default) all CPUs share one timebase that follows the
  * host clock, slowed down by {@code timeScale} (see {@link CpuDomain}). The deterministic clock
  * derives time from the instruction count and is only available with one CPU.
+ *
+ * <h2>Saving and restoring</h2>
+ * {@link #saveState} writes the whole machine to a stream while the guest is not running (before
+ * the first {@code run}, or after {@code run} has returned, e.g. after {@link #stop}), and
+ * {@link #loadState} reads it into an emulator built from a matching configuration, typically a
+ * new one in another process; the next {@code run} continues the guest where it was saved. The
+ * state covers every CPU, guest RAM, the hypervisor, the interrupt controller and the devices.
+ * Host resources stay outside it and are the embedder's to keep: disk contents (reattach the
+ * same images, with the guest's writes, as {@code BlockBackend}s), the console backend, the
+ * NVRAM file (it is rewritten from the state), {@link MachineConfig#random} and
+ * {@link MachineConfig#clock}. Guest time does not advance while a machine is saved.
  */
 public final class Emulator implements AutoCloseable {
     /** How often device timers are serviced while the guest runs. */
@@ -71,6 +88,8 @@ public final class Emulator implements AutoCloseable {
     /** Held for the duration of {@link #run}; {@link #close} takes it to wait for a run to end. */
     private final ReentrantLock runLock = new ReentrantLock();
     private volatile boolean closed;
+    /** A load failed after it started changing the machine; see {@link #loadState}. */
+    private boolean loadFailed;
 
     /** A machine driven by the host's wall clock at real time. */
     public Emulator(MachineConfig config) throws IOException {
@@ -199,6 +218,100 @@ public final class Emulator implements AutoCloseable {
     /** Power-on reset: the next {@link #run} starts from firmware entry. */
     public void reset() {
         needsReset = true;
+        loadFailed = false;
+    }
+
+    // ---- saved state ----------------------------------------------------------------------------
+
+    /**
+     * Write the complete machine state to {@code out}: every CPU (registers, timebase and
+     * decrementer, reservation, idle and RTAS-stopped state), the hypervisor and interrupt
+     * controller, the devices, and guest RAM, with all-zero 4 KiB pages left out. The format is
+     * versioned and checksummed (see {@link StateOutput}); RAM goes in records of at most 1 MiB,
+     * so the stream can be wrapped in a compressor (e.g. {@link java.util.zip.GZIPOutputStream})
+     * without the state being held in memory. Pass a buffered stream; it is flushed, not closed.
+     *
+     * <p>What stays outside the state is described in the class comment. Work the CPUs had been
+     * asked to do at their next instruction is done first, and their TLBs are flushed, which
+     * does not change what the guest computes. Derived state (compiled code, decode caches, TLBs)
+     * is not saved; it is rebuilt as the restored guest runs.
+     *
+     * @throws IllegalStateException if the guest is running (also when called from a hook inside
+     *     {@code run}), the emulator is closed, or a failed {@link #loadState} left it partly
+     *     loaded
+     */
+    public void saveState(OutputStream out) throws IOException {
+        lockIdle();
+        try {
+            if (loadFailed) {
+                throw new IllegalStateException("a failed loadState left the machine partly loaded");
+            }
+            StateOutput so = new StateOutput(out);
+            so.record("EMU ", d -> d.writeBoolean(needsReset));
+            machine.saveState(so);
+            domain.saveState(so);
+            machine.memory().saveState(so);
+            so.finish();
+        } finally {
+            runLock.unlock();
+        }
+    }
+
+    /**
+     * Replace this machine's state with one written by {@link #saveState}; the next
+     * {@link #run} continues the saved guest. The emulator must have been built from a
+     * configuration with the same hardware: CPU count, RAM size, the PCI host bridge and
+     * spapr-rng settings, NVRAM size, and the same SCSI devices (type, target id, LUN, block
+     * size, size in bytes, read-only). The disk contents should be the ones the guest had
+     * written when the state was saved; nothing checks that. Firmware, boot device, kernel
+     * command line, UUID and name need not match: what the guest saw of them is in its RAM and
+     * the saved device tree. The clock ({@link Interpreter.Clock}) and time scale may differ
+     * too: each CPU's timebase continues from its saved value either way.
+     *
+     * <p>A state of another format version, or one that is truncated or corrupt, is refused
+     * with a {@link StateFormatException}; one saved from different hardware with a
+     * {@link StateMismatchException} listing the differences. A mismatch is always found before
+     * anything is changed. A format error found later (the input is read once, front to back)
+     * leaves the machine partly loaded: {@link #run} and {@link #saveState} then refuse until a
+     * load succeeds or {@link #reset} is called.
+     *
+     * @throws IllegalStateException if the guest is running or the emulator is closed
+     */
+    public void loadState(InputStream in) throws IOException {
+        lockIdle();
+        try {
+            StateInput si = new StateInput(in);
+            boolean reset = si.record("EMU ").readBoolean();
+            boolean ok = false;
+            try {
+                machine.loadState(si); // checks the hardware before changing anything
+                domain.loadState(si);
+                machine.memory().loadState(si);
+                si.finish();
+                ok = true;
+            } catch (StateMismatchException e) {
+                ok = !loadFailed; // found before any change: the machine is as it was
+                throw e;
+            } finally {
+                loadFailed = !ok;
+            }
+            needsReset = reset;
+            stopAsked = false;
+            clearStopRequests();
+        } finally {
+            runLock.unlock();
+        }
+    }
+
+    /** Take the run lock for a save or load; the guest must not be running. */
+    private void lockIdle() {
+        if (runLock.isHeldByCurrentThread() || !runLock.tryLock()) {
+            throw new IllegalStateException("the guest is running: stop() it and let run() return first");
+        }
+        if (closed) {
+            runLock.unlock();
+            throw new IllegalStateException("the emulator is closed");
+        }
     }
 
     /** Run until the guest powers off or panics, or {@link #stop} is called. Guest reboots are followed. */
@@ -223,6 +336,10 @@ public final class Emulator implements AutoCloseable {
         try {
             if (closed) {
                 throw new IllegalStateException("the emulator is closed");
+            }
+            if (loadFailed) {
+                throw new IllegalStateException("a failed loadState left the machine partly loaded: load a state"
+                        + " again or reset()");
             }
             return runLocked(maxInsns);
         } finally {

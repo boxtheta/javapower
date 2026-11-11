@@ -379,6 +379,106 @@ public final class Xics {
         }
     }
 
+    // ---- saved state ----------------------------------------------------------------------------
+
+    /** Write every source's routing and status and every presenter's registers. */
+    synchronized void saveState(java.io.DataOutput out) throws java.io.IOException {
+        int n = 0;
+        for (int i = 0; i < NR_IRQS; i++) {
+            if (!sourceIsReset(i)) {
+                n++;
+            }
+        }
+        out.writeInt(n);
+        for (int i = 0; i < NR_IRQS; i++) {
+            if (!sourceIsReset(i)) {
+                out.writeShort(i);
+                out.writeInt(flags[i]);
+                out.writeInt(server[i]);
+                out.writeByte(priority[i]);
+                out.writeByte(savedPriority[i]);
+                out.writeByte(status[i]);
+            }
+        }
+        out.writeInt(icps.size());
+        for (Icp icp : icps.values()) {
+            out.writeInt(icp.server);
+            out.writeInt(icp.xirr);
+            out.writeByte(icp.pendingPriority);
+            out.writeByte(icp.mfrr);
+            out.writeBoolean(icp.xisrFromIcs);
+            out.writeBoolean(icp.outputLevel);
+        }
+    }
+
+    private boolean sourceIsReset(int i) {
+        return flags[i] == 0 && server[i] == 0 && priority[i] == 0xff && savedPriority[i] == 0xff && status[i] == 0;
+    }
+
+    /**
+     * Read the state written by {@link #saveState}. Sources must have been claimed the same way
+     * (they are, for the same machine configuration). Every presenter's output line is driven to
+     * its saved level.
+     */
+    synchronized void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        int[] fl = new int[NR_IRQS];
+        int[] srv = new int[NR_IRQS];
+        int[] pr = new int[NR_IRQS];
+        int[] sp = new int[NR_IRQS];
+        int[] st = new int[NR_IRQS];
+        java.util.Arrays.fill(pr, 0xff);
+        java.util.Arrays.fill(sp, 0xff);
+        int n = in.readInt("source count", 0, NR_IRQS);
+        for (int k = 0; k < n; k++) {
+            int i = in.readUnsignedShort();
+            if (i >= NR_IRQS) {
+                throw in.corrupt("interrupt source " + i);
+            }
+            fl[i] = in.readInt();
+            srv[i] = in.readInt();
+            pr[i] = in.readUnsignedByte();
+            sp[i] = in.readUnsignedByte();
+            st[i] = in.readUnsignedByte();
+        }
+        for (int i = 0; i < NR_IRQS; i++) {
+            if (fl[i] != flags[i]) {
+                throw in.corrupt(String.format("interrupt source 0x%x claimed differently", i + IRQ_BASE));
+            }
+        }
+        int m = in.readInt();
+        if (m != icps.size()) {
+            throw in.corrupt(m + " presentation controllers, expected " + icps.size());
+        }
+        int[][] icp = new int[m][];
+        boolean[][] icpFlags = new boolean[m][];
+        for (int k = 0; k < m; k++) {
+            icp[k] = new int[] {in.readInt(), in.readInt(), in.readUnsignedByte(), in.readUnsignedByte()};
+            icpFlags[k] = new boolean[] {in.readBoolean(), in.readBoolean()};
+            if (!icps.containsKey(icp[k][0])) {
+                throw in.corrupt("presentation controller for server " + icp[k][0]);
+            }
+        }
+        // Everything read and checked: apply.
+        System.arraycopy(srv, 0, server, 0, NR_IRQS);
+        System.arraycopy(pr, 0, priority, 0, NR_IRQS);
+        System.arraycopy(sp, 0, savedPriority, 0, NR_IRQS);
+        for (int i = 0; i < NR_IRQS; i++) {
+            setStatus(i, st[i]);
+        }
+        for (int k = 0; k < m; k++) {
+            Icp c = icps.get(icp[k][0]);
+            c.xirr = icp[k][1];
+            c.pendingPriority = icp[k][2];
+            c.mfrr = icp[k][3];
+            c.xisrFromIcs = icpFlags[k][0];
+            if (icpFlags[k][1]) {
+                c.raise();
+            } else {
+                c.lower();
+            }
+        }
+    }
+
     /** Current XIRR of a server (tests, debugging). */
     public synchronized int xirr(int srv) {
         return icp(srv).xirr;

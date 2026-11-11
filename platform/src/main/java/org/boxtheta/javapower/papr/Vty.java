@@ -124,6 +124,64 @@ public final class Vty extends VioDevice {
         }
     }
 
+    /** Input not yet taken by the guest: the device buffer, then the backlog. */
+    @Override
+    protected void saveDevice(java.io.DataOutput d) throws java.io.IOException {
+        synchronized (inLock) {
+            byte[] b = new byte[in - out];
+            for (int i = 0; i < b.length; i++) {
+                b[i] = buf[(out + i) % BUFSIZE];
+            }
+            org.boxtheta.javapower.core.StateOutput.writeBytes(d, b);
+            byte[] l = new byte[backlog.size()];
+            int i = 0;
+            for (byte x : backlog) {
+                l[i++] = x;
+            }
+            org.boxtheta.javapower.core.StateOutput.writeBytes(d, l);
+        }
+    }
+
+    /**
+     * Restore the saved input. Input the new backend delivered before the load (typed while the
+     * machine was being restored) is kept and follows the saved input.
+     */
+    @Override
+    protected void loadDevice(org.boxtheta.javapower.core.StateInput.Record r) throws java.io.IOException {
+        byte[] b = r.readBytes(BUFSIZE);
+        byte[] l = r.readBytes(MAX_BACKLOG);
+        if (b == null || l == null) {
+            throw r.corrupt("vty input");
+        }
+        synchronized (inLock) {
+            ArrayDeque<Byte> early = new ArrayDeque<>();
+            while (out != in) {
+                early.add(buf[out++ % BUFSIZE]);
+            }
+            early.addAll(backlog);
+            backlog.clear();
+            in = 0;
+            out = 0;
+            for (byte x : b) {
+                buf[in++] = x;
+            }
+            for (byte x : l) {
+                backlog.add(x);
+            }
+            backlog.addAll(early);
+        }
+    }
+
+    /**
+     * After a load: move waiting input into an empty device buffer and raise the interrupt, as
+     * when input arrives (the saved interrupt state already covers input that was saved there).
+     */
+    void afterLoad() {
+        synchronized (inLock) {
+            fill();
+        }
+    }
+
     @Override
     protected void resetDevice() {
         // QEMU keeps buffered input across reset.

@@ -146,6 +146,60 @@ public abstract class VioDevice {
         }
     }
 
+    // ---- saved state ----------------------------------------------------------------------------
+
+    /** Write the bus state (signal state, CRQ, TCE table) and then the device's own state. */
+    final void saveState(java.io.DataOutput out) throws java.io.IOException {
+        synchronized (lock) {
+            out.writeInt(reg);
+            out.writeLong(signalState);
+            out.writeLong(crqAddr);
+            out.writeInt(crqSize);
+            out.writeInt(crqNext);
+            out.writeBoolean(tce != null);
+            if (tce != null) {
+                tce.saveState(out);
+            }
+            saveDevice(out);
+        }
+    }
+
+    /** Read the state written by {@link #saveState}. */
+    final void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+        synchronized (lock) {
+            int r = in.readInt();
+            if (r != reg) {
+                throw in.corrupt(String.format("VIO device 0x%x where %s was expected", r, nodeName()));
+            }
+            long sig = in.readLong();
+            long addr = in.readLong();
+            int size = in.readInt();
+            int next = in.readInt();
+            if (size < 0 || next < 0 || (size == 0 ? next != 0 : next >= size || next % 16 != 0)) {
+                throw in.corrupt(nodeName() + " CRQ of " + size + " bytes at offset " + next);
+            }
+            if (in.readBoolean() != (tce != null)) {
+                throw in.corrupt(nodeName() + " TCE table presence");
+            }
+            if (tce != null) {
+                tce.loadState(in);
+            }
+            signalState = sig;
+            crqAddr = addr;
+            crqSize = size;
+            crqNext = next;
+            loadDevice(in);
+        }
+    }
+
+    /** Device-specific part of the saved state; called with the device lock held. */
+    protected void saveDevice(java.io.DataOutput out) throws java.io.IOException {
+    }
+
+    /** Read what {@link #saveDevice} wrote; called with the device lock held. */
+    protected void loadDevice(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
+    }
+
     // ---- interrupts --------------------------------------------------------------------------
 
     /** Pulse this device's (edge) interrupt. */

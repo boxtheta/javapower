@@ -899,6 +899,215 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return first;
     }
 
+    // ---- saved state ------------------------------------------------------------------------
+
+    /**
+     * Write the platform part of the machine state: a {@code "PHW "} record describing the
+     * hardware (CPU count, RAM size, devices and disks, which must match when the state is
+     * loaded), then a {@code "PAPR"} record with the hypervisor state (shutdown state, CAS
+     * results, the device tree the guest holds, process table, VPA/SLB shadow/DTL registrations,
+     * watchdogs), XICS, RTAS, the DR connectors and every VIO device (CRQ, TCE tables, NVRAM
+     * contents, console input not yet read by the guest, SCSI sense state). Guest RAM and the CPUs
+     * are not written here: they belong to {@code PhysicalMemory} and the CPU module, and
+     * {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
+     * console and the other host resources stay outside the state.
+     *
+     * <p>No CPU may be running.
+     */
+    public void saveState(org.boxtheta.javapower.core.StateOutput out) throws IOException {
+        synchronized (lock) {
+            out.record("PHW ", this::saveHardware);
+            out.record("PAPR", d -> {
+                d.writeByte(shutdown.ordinal());
+                org.boxtheta.javapower.core.StateOutput.writeString(d, shutdownMessage);
+                org.boxtheta.javapower.core.StateOutput.writeBytes(d, ov5Cas.toDtBytes());
+                d.writeInt(compatPvr);
+                d.writeBoolean(casPreIsa3);
+                d.writeLong(patbEntry);
+                d.writeInt(htabShift);
+                org.boxtheta.javapower.core.StateOutput.writeBytes(d, rngSeed);
+                org.boxtheta.javapower.core.StateOutput.writeBytes(d, fdtBlob);
+                d.writeInt(fdtInitialSize);
+                d.writeLong(fdtAddr);
+                long now = System.nanoTime();
+                for (Watchdog w : watchdogs) {
+                    d.writeBoolean(w.armed);
+                    d.writeInt(w.action);
+                    d.writeBoolean(w.leaveOthers);
+                    d.writeLong(w.armed ? Math.max(0, w.deadline - now) : 0);
+                }
+                for (VCpu v : vcpus) {
+                    d.writeLong(v.vpaAddr);
+                    d.writeLong(v.slbShadowAddr);
+                    d.writeInt(v.slbShadowSize);
+                    d.writeLong(v.dtlAddr);
+                    d.writeInt(v.dtlSize);
+                }
+                xics.saveState(d);
+                rtas.saveState(d);
+                d.writeInt(drcs.size());
+                for (Drc c : drcs) {
+                    c.saveState(d);
+                }
+                d.writeInt(vio.size());
+                for (VioDevice v : vio) {
+                    v.saveState(d);
+                }
+                d.writeBoolean(phbTce != null);
+                if (phbTce != null) {
+                    phbTce.saveState(d);
+                }
+            });
+        }
+    }
+
+    /** The hardware that must match between a saved state and the machine it is loaded into. */
+    private void saveHardware(java.io.DataOutput d) throws IOException {
+        d.writeInt(vcpus.length);
+        d.writeLong(mem.size());
+        d.writeBoolean(config.phb);
+        d.writeBoolean(config.rng);
+        d.writeInt(nvram.size());
+        List<ScsiTarget> ts = vscsi.targets();
+        d.writeInt(ts.size());
+        for (ScsiTarget t : ts) {
+            ScsiDisk disk = (ScsiDisk) t;
+            d.writeUTF(disk.type().name());
+            d.writeInt(disk.id());
+            d.writeInt(disk.lun());
+            d.writeInt(disk.blockSize());
+            d.writeLong(disk.backend().size());
+            d.writeBoolean(disk.backend().readOnly());
+        }
+    }
+
+    /**
+     * Read the records written by {@link #saveState}. The hardware description is checked first:
+     * if it differs from this machine's, nothing is changed and a
+     * {@link org.boxtheta.javapower.core.StateMismatchException} lists every difference. The
+     * attached CPUs' interrupt inputs are driven from the restored XICS state; the CPUs' own
+     * state is the CPU module's to load. The device tree, boot settings and option vectors the
+     * guest negotiated come from the state, not from this machine's configuration. Watchdogs
+     * resume with the time they had left.
+     *
+     * <p>No CPU may be running. If loading fails after the check, the machine is left partly
+     * loaded and must be reset or loaded again before it runs.
+     *
+     * @throws org.boxtheta.javapower.core.StateMismatchException if the hardware differs
+     * @throws org.boxtheta.javapower.core.StateFormatException if the records are corrupt
+     */
+    public void loadState(org.boxtheta.javapower.core.StateInput in) throws IOException {
+        synchronized (lock) {
+            checkHardware(in.record("PHW "));
+            org.boxtheta.javapower.core.StateInput.Record r = in.record("PAPR");
+            int sd = r.readUnsignedByte();
+            if (sd >= ShutdownReason.values().length) {
+                throw r.corrupt("shutdown reason " + sd);
+            }
+            String msg = r.readString();
+            byte[] ov = r.readBytes(OptionVector.MAX_BYTES + 1);
+            if (ov == null || ov.length < 1) {
+                throw r.corrupt("option vector 5");
+            }
+            int pvr = r.readInt();
+            boolean pre3 = r.readBoolean();
+            long patb = r.readLong();
+            int htab = r.readInt();
+            byte[] seed = r.readBytes(rngSeed.length);
+            byte[] blob = r.readBytes(FDT_MAX_SIZE * 2);
+            int initial = r.readInt();
+            long addr = r.readLong();
+            if (seed == null || seed.length != rngSeed.length || blob == null) {
+                throw r.corrupt("device tree");
+            }
+            try {
+                Fdt.parse(blob);
+            } catch (Fdt.FdtException e) {
+                throw r.corrupt("device tree: " + e.getMessage());
+            }
+            shutdown = ShutdownReason.values()[sd];
+            shutdownMessage = msg;
+            ov5Cas = OptionVector.fromBytes(java.util.Arrays.copyOfRange(ov, 1, ov.length));
+            compatPvr = pvr;
+            casPreIsa3 = pre3;
+            patbEntry = patb;
+            htabShift = htab;
+            rngSeed = seed;
+            fdtBlob = blob;
+            fdtInitialSize = initial;
+            fdtAddr = addr;
+            long now = System.nanoTime();
+            for (Watchdog w : watchdogs) {
+                w.armed = r.readBoolean();
+                w.action = r.readInt();
+                w.leaveOthers = r.readBoolean();
+                w.deadline = now + r.readLong();
+            }
+            for (VCpu v : vcpus) {
+                v.vpaAddr = r.readLong();
+                v.slbShadowAddr = r.readLong();
+                v.slbShadowSize = r.readInt();
+                v.dtlAddr = r.readLong();
+                v.dtlSize = r.readInt();
+            }
+            xics.loadState(r);
+            rtas.loadState(r);
+            if (r.readInt() != drcs.size()) {
+                throw r.corrupt("DR connector count");
+            }
+            for (Drc c : drcs) {
+                c.loadState(r);
+            }
+            if (r.readInt() != vio.size()) {
+                throw r.corrupt("VIO device count");
+            }
+            for (VioDevice v : vio) {
+                v.loadState(r);
+            }
+            if (r.readBoolean() != (phbTce != null)) {
+                throw r.corrupt("PHB TCE table");
+            }
+            if (phbTce != null) {
+                phbTce.loadState(r);
+            }
+            vty.afterLoad();
+        }
+    }
+
+    private void checkHardware(org.boxtheta.javapower.core.StateInput.Record r) throws IOException {
+        java.io.ByteArrayOutputStream mine = new java.io.ByteArrayOutputStream();
+        saveHardware(new java.io.DataOutputStream(mine));
+        List<String> diff = new ArrayList<>();
+        java.io.DataInputStream cur = new java.io.DataInputStream(new java.io.ByteArrayInputStream(mine.toByteArray()));
+        compare(diff, "CPUs", r.readInt(), cur.readInt());
+        compare(diff, "bytes of RAM", r.readLong(), cur.readLong());
+        compare(diff, "PCI host bridge", r.readBoolean(), cur.readBoolean());
+        compare(diff, "spapr-rng", r.readBoolean(), cur.readBoolean());
+        compare(diff, "bytes of NVRAM", r.readInt(), cur.readInt());
+        int n = r.readInt("disk count", 0, 64);
+        int m = cur.readInt();
+        compare(diff, "SCSI devices", n, m);
+        for (int i = 0; i < Math.min(n, m); i++) {
+            String what = "SCSI device " + i + ": ";
+            compare(diff, what + "type", r.readUTF(), cur.readUTF());
+            compare(diff, what + "target id", r.readInt(), cur.readInt());
+            compare(diff, what + "LUN", r.readInt(), cur.readInt());
+            compare(diff, what + "block size", r.readInt(), cur.readInt());
+            compare(diff, what + "bytes", r.readLong(), cur.readLong());
+            compare(diff, what + "read-only", r.readBoolean(), cur.readBoolean());
+        }
+        if (!diff.isEmpty()) {
+            throw new org.boxtheta.javapower.core.StateMismatchException(
+                    "the machine state was saved from different hardware: " + String.join("; ", diff));
+        }
+    }
+
+    private static void compare(List<String> diff, String what, Object saved, Object now) {
+        if (!saved.equals(now)) {
+            diff.add(what + ": saved " + saved + ", this machine " + now);
+        }
+    }
+
     // ---- hypercalls --------------------------------------------------------------------------
 
     static long toReal(long addr) {

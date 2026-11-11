@@ -7,7 +7,10 @@ package org.boxtheta.javapower.papr;
  *
  * <p>Implement this to connect the guest console to anything (a socket, a terminal widget, a
  * test script). The machine owns the backend it is given: it calls {@link #start} once while it
- * is constructed and {@link #close} when it is closed.
+ * is constructed and {@link #close} when it is closed. If the machine's construction fails, it
+ * closes the backends it already started and leaves the others to the caller. Each console of a
+ * machine needs a backend instance of its own ({@link MachineConfig#console},
+ * {@link MachineConfig#addConsole}).
  */
 public interface CharBackend {
     /** The device side of the console, handed to {@link #start}. Thread-safe. */

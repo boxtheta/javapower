@@ -23,7 +23,8 @@ import org.boxtheta.javapower.core.MmioHandler;
  * {@value PaprLog#LOGGER_NAME}).
  *
  * <p>Embedders can map devices of their own into the guest's real address space with
- * {@link #addMmio}, and put PCI devices on the PCI host bridge with {@link #addPciDevice}.
+ * {@link #addMmio}, put PCI devices on the PCI host bridge with {@link #addPciDevice}, and add
+ * further consoles with {@link #addConsole}.
  *
  * <p>There is no default firmware: set one with {@link #firmware(byte[])} or
  * {@link #firmware(Path)}. The SLOF image the machine is built for ships in the separate artifact
@@ -55,6 +56,67 @@ public final class MachineConfig {
      * source follows from the low byte of its unit address, so 256 devices in all fit.
      */
     public static final int MAX_ADDED_VIO_DEVICES = 256 - 3;
+    /**
+     * Most consoles a machine may have, counting the first: 8. Linux reaches its vty consoles
+     * through the {@code hvc} tty driver, which has eight devices, {@code /dev/hvc0} to
+     * {@code /dev/hvc7}; a ninth vty would be invisible to it.
+     */
+    public static final int MAX_CONSOLES = 8;
+
+    /**
+     * A console added with {@link #addConsole}: its backend, unit address and optional name.
+     */
+    public static final class Console {
+        private final MachineConfig owner;
+        final CharBackend backend;
+        final int unitAddress;
+        String name;
+
+        private Console(MachineConfig owner, CharBackend backend, int unitAddress) {
+            this.owner = owner;
+            this.backend = backend;
+            this.unitAddress = unitAddress;
+        }
+
+        /**
+         * Give the console a name the guest can find: the device tree node of the vty gets a
+         * {@code label} property with it, so guest software can pick its console by name instead
+         * of by position (see the README for how a Linux or FreeBSD guest gets from the name to
+         * its device). The name is also part of the hardware a saved state must match.
+         *
+         * @param name 1 to 63 letters, digits and {@code . _ , : + -}, starting with a letter or
+         *     digit, and unique among the consoles of this configuration; null removes it
+         * @throws IllegalArgumentException if the name is not of that form or already taken
+         */
+        public Console name(String name) {
+            if (name != null) {
+                if (!name.matches("[A-Za-z0-9][A-Za-z0-9._,:+-]{0,62}")) {
+                    throw new IllegalArgumentException("console name \"" + name + "\" must be 1 to 63 letters, digits"
+                            + " and . _ , : + -, starting with a letter or digit");
+                }
+                for (Console k : owner.consoles) {
+                    if (k != this && name.equals(k.name)) {
+                        throw new IllegalArgumentException("there is already a console named " + name);
+                    }
+                }
+            }
+            this.name = name;
+            return this;
+        }
+
+        /** The name given with {@link #name(String)}, or null. */
+        public String name() {
+            return name;
+        }
+
+        /**
+         * The unit address of the console's vty, which finds it in a built machine:
+         * {@code machine.vioDevice(console.unitAddress(), Vty.class)}.
+         */
+        public int unitAddress() {
+            return unitAddress;
+        }
+    }
 
     /** One SCSI device on the v-scsi bus. */
     public static final class Disk {
@@ -296,6 +358,8 @@ public final class MachineConfig {
     final List<Mmio> mmios = new ArrayList<>();
     final List<Network> networks = new ArrayList<>();
     final List<Pci> pciDevices = new ArrayList<>();
+    /** The consoles after the first ({@link #addConsole}), in the order they were added. */
+    final List<Console> consoles = new ArrayList<>();
     Path nvramFile;
     String bootDevice;
     String kernelCmdline;
@@ -365,10 +429,67 @@ public final class MachineConfig {
         return this;
     }
 
-    /** Backend of the spapr-vty console (vty@71000001). Defaults to a {@link BufferCharBackend}. */
+    /**
+     * Backend of the first console, the spapr-vty at vty@71000001: the console of the firmware,
+     * the boot loader and the operating system ({@code /chosen/stdout-path}). Defaults to a
+     * {@link BufferCharBackend}.
+     *
+     * @throws IllegalArgumentException if {@code c} is already the backend of an added console
+     */
     public MachineConfig console(CharBackend c) {
+        if (c != null) {
+            for (Console k : consoles) {
+                if (k.backend == c) {
+                    throw new IllegalArgumentException("this CharBackend is already the backend of the console at 0x"
+                            + Integer.toHexString(k.unitAddress) + "; each console needs a backend of its own");
+                }
+            }
+        }
         this.console = c;
         return this;
+    }
+
+    /**
+     * Add a console after the first: another spapr-vty on {@code backend}, with the next unit
+     * address of the VIO devices (the first added VIO device of any kind gets 0x71000003, see
+     * {@link #addVioDevice}). Linux numbers the vty consoles after the first {@code /dev/hvc1},
+     * {@code /dev/hvc2} and so on in unit address order, which is the order they were added;
+     * FreeBSD names them {@code /dev/ttyu1}, {@code /dev/ttyu2} and so on (and
+     * {@code /dev/cuau1}, ...) in the same order. {@link Console#name} gives one a name the guest
+     * can look up instead. The first console ({@link #console}) stays the console of the firmware
+     * and the operating system.
+     *
+     * <p>The machine owns the backend as it does the first console's: it calls
+     * {@link CharBackend#start} once while it is constructed, after the first console's, and
+     * {@link CharBackend#close} when it is closed (or when its construction fails after the
+     * backend was started). Input the guest has not read yet is part of the saved state. Every
+     * machine built from this configuration uses the same backend instance, so build one machine
+     * from it at a time, as with the first console.
+     *
+     * @return the console, to give it a name or read its unit address
+     * @throws IllegalArgumentException if {@code backend} is already the backend of a console
+     * @throws IllegalStateException if the machine would have more than {@link #MAX_CONSOLES}
+     *     consoles, or more than {@link #MAX_ADDED_VIO_DEVICES} added VIO devices
+     */
+    public Console addConsole(CharBackend backend) {
+        Objects.requireNonNull(backend, "backend");
+        if (backend == console) {
+            throw new IllegalArgumentException("this CharBackend is already the backend of the first console;"
+                    + " each console needs a backend of its own");
+        }
+        for (Console k : consoles) {
+            if (k.backend == backend) {
+                throw new IllegalArgumentException("this CharBackend is already the backend of the console at 0x"
+                        + Integer.toHexString(k.unitAddress) + "; each console needs a backend of its own");
+            }
+        }
+        if (consoles.size() + 1 >= MAX_CONSOLES) {
+            throw new IllegalStateException("a machine has at most " + MAX_CONSOLES + " consoles, counting the first");
+        }
+        Console k = new Console(this, backend, VioDevice.REG_BASE + 3 + addedVio.size());
+        addVio(() -> new Vty(k.backend, k.name));
+        consoles.add(k);
+        return k;
     }
 
     /** Add a disk ({@code scsi-hd}) backed by an image file. */

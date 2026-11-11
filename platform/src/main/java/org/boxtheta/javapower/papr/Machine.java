@@ -43,7 +43,7 @@ import org.boxtheta.javapower.core.Spr;
  * A single-CPU machine can still use {@code attachCpu(cpu)} and {@code reset(cpu)}.
  *
  * <p>Each machine has its own {@link #log() log} (sink and once-per-key counts) and owns the host
- * resources its configuration names (disk images, NVRAM file, console backend, added VIO
+ * resources its configuration names (disk images, NVRAM file, console backends, added VIO
  * devices), which {@link #close} releases. Machines are independent: several may live in one JVM.
  *
  * <h2>Threading and locking</h2>
@@ -156,6 +156,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final List<VioDevice> vio = new ArrayList<>();
     /** The devices from {@code MachineConfig.addedVio} this machine attached, in that order. */
     private final List<VioDevice> addedVio = new ArrayList<>();
+    /** Every vty in unit address order: the console first, then those added after it. */
+    private final List<Vty> vtys = new ArrayList<>();
     private final List<TceTable> tceTables = new ArrayList<>();
     private TceTable phbTce;
     /** The devices on PHB 0; null without the host bridge. */
@@ -224,7 +226,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Build the machine described by {@code config}: allocate guest RAM, load the firmware, open
-     * the disk images and the NVRAM file, and start the console backend. If this fails, everything
+     * the disk images and the NVRAM file, and start the console backends (the first console's,
+     * then those of {@link MachineConfig#addConsole} with the other added devices). If this fails, everything
      * opened so far is closed again before the exception propagates, including the added VIO
      * devices created so far. Added devices are started ({@link VioDevice#startDevice}) last, in
      * the order they were added.
@@ -365,6 +368,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 tceTables.add(d.tce());
             }
         }
+        checkConsoles();
         if (config.phb) {
             TceTable t = new TceTable(DeviceTree.PHB0_LIOBN, 0, DeviceTree.PHB0_DMA_WINDOW, log);
             tceTables.add(t);
@@ -425,6 +429,25 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
     }
 
+    /** At most {@link MachineConfig#MAX_CONSOLES} vtys, each with a backend of its own. */
+    private void checkConsoles() {
+        java.util.Map<CharBackend, Vty> seen = new java.util.IdentityHashMap<>();
+        for (VioDevice d : vio) {
+            if (d instanceof Vty v) {
+                Vty other = seen.put(v.backend(), v);
+                if (other != null) {
+                    throw new IllegalArgumentException("the consoles " + other.nodeName() + " and " + v.nodeName()
+                            + " have the same CharBackend; each console needs a backend of its own");
+                }
+                vtys.add(v);
+            }
+        }
+        if (vtys.size() > MachineConfig.MAX_CONSOLES) {
+            throw new IllegalArgumentException("a machine has at most " + MachineConfig.MAX_CONSOLES
+                    + " consoles (vtys), counting the first; this one has " + vtys.size());
+        }
+    }
+
     private static void closeQuietly(AutoCloseable c, Throwable primary) {
         try {
             c.close();
@@ -456,8 +479,19 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return xics;
     }
 
+    /** The first console: the vty at 0x71000001, the console of the firmware and the guest. */
     public Vty vty() {
         return vty;
+    }
+
+    /**
+     * Every console in unit address order: the first ({@link #vty()}), then those added with
+     * {@link MachineConfig#addConsole} (and any {@link Vty} added with
+     * {@link MachineConfig#addVioDevice}) in the order they were added. Fixed for the machine's
+     * life.
+     */
+    public List<Vty> vtys() {
+        return Collections.unmodifiableList(vtys);
     }
 
     public VScsi vscsi() {
@@ -1030,7 +1064,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Release the host resources: close the disk backends (deleting snapshot overlays), the NVRAM
-     * file, the console backend, the network backends and the added VIO devices
+     * file, the console backends, the network backends and the added VIO devices
      * ({@link VioDevice#closeDevice}). Idempotent. The CPUs must not be running. Guest RAM is
      * off-heap memory the JVM reclaims once the machine is unreachable.
      *
@@ -1053,8 +1087,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Close every backend, collecting failures: into {@code primary} if given, otherwise into the
-     * returned exception. The console and network backends are left alone when construction
-     * fails, since they were never started.
+     * returned exception. The first console and the network backends are left alone when
+     * construction fails before they were started; the added consoles close their backends
+     * only if they were started.
      */
     private IOException closeBackends(Throwable primary, boolean console) {
         IOException first = null;
@@ -1390,7 +1425,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (!mmioDevices.isEmpty()) {
                 loadMmio(in.record("MMIO"));
             }
-            vty.afterLoad();
+            for (Vty v : vtys) {
+                v.afterLoad();
+            }
         }
     }
 

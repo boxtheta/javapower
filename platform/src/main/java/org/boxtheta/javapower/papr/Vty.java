@@ -12,6 +12,12 @@ import java.util.ArrayDeque;
  * thread. Input state is guarded by an input lock and guest output by a separate output lock, so
  * H_PUT_TERM_CHAR never waits for console input or for H_GET_TERM_CHAR, and neither takes the
  * machine lock.
+ *
+ * <p>The first vty of a machine is its console ({@link MachineConfig#console}); further ones come
+ * from {@link MachineConfig#addConsole} and may carry a name, which the guest finds in the node's
+ * {@code label} property. The machine starts each vty's backend once while it is constructed and
+ * closes it when the machine is closed; a backend the machine never started (because construction
+ * failed first) is left to its owner.
  */
 public final class Vty extends VioDevice {
     static final int BUFSIZE = 16;
@@ -19,6 +25,8 @@ public final class Vty extends VioDevice {
     private static final int MAX_BACKLOG = 1 << 20;
 
     private final CharBackend backend;
+    private final String name;
+    private volatile boolean started;
     private final byte[] buf = new byte[BUFSIZE];
     private int in;
     private int out;
@@ -26,12 +34,26 @@ public final class Vty extends VioDevice {
     private final Object inLock = new Object();
     private final Object outLock = new Object();
 
+    /** A vty without a name on {@code backend}. */
     public Vty(CharBackend backend) {
-        this.backend = backend;
+        this(backend, null);
+    }
+
+    Vty(CharBackend backend, String name) {
+        this.backend = java.util.Objects.requireNonNull(backend, "backend");
+        this.name = name;
     }
 
     public CharBackend backend() {
         return backend;
+    }
+
+    /**
+     * The name given with {@link MachineConfig.Console#name}, which the guest reads from the
+     * node's {@code label} property; null for none (always for the first console).
+     */
+    public String name() {
+        return name;
     }
 
     @Override
@@ -49,7 +71,35 @@ public final class Vty extends VioDevice {
         return "hvterm1";
     }
 
+    @Override
+    protected void addDeviceProps(Fdt.Node node) {
+        if (name != null) {
+            node.setString("label", name);
+        }
+    }
+
+    /** The name, so that a state saved with other names (or none) is refused. */
+    @Override
+    public String hardwareIdentity() {
+        return name == null ? "" : "label=" + name;
+    }
+
+    /** Start the backend of a vty added with {@link MachineConfig#addConsole}. */
+    @Override
+    protected void startDevice() {
+        start();
+    }
+
+    /** Close the backend of a vty added with {@link MachineConfig#addConsole}, if it was started. */
+    @Override
+    protected void closeDevice() {
+        if (started) {
+            backend.close();
+        }
+    }
+
     void start() {
+        started = true;
         backend.start(new CharBackend.InputSink() {
             @Override
             public void receive(byte[] b, int off, int len) {

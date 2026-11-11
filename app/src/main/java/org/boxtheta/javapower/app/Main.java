@@ -44,12 +44,25 @@ public final class Main {
             + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
             + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
             + " [--persistent] [--load-state file] [--save-state file]"
+            + " [--console tcp:[host:]port[,name=NAME]]..."
             + " [--net dgram,local=host:port,remote=host:port[,mac=xx:xx:xx:xx:xx:xx] | --net none[,mac=...]]"
             + " [--virtio-rng] [--test-mmio addr]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
                 .logSink(PaprLog.printTo(System.err));
+        // Consoles after the first; closed at exit (the machine closes those it started).
+        java.util.List<SocketConsole> sockets = new java.util.ArrayList<>();
+        try {
+            run(args, cfg, sockets);
+        } finally {
+            for (SocketConsole c : sockets) {
+                c.close();
+            }
+        }
+    }
+
+    private static void run(String[] args, MachineConfig cfg, java.util.List<SocketConsole> sockets) throws Exception {
         Interpreter.Clock clock = Interpreter.Clock.WALL;
         long maxInsns = Long.MAX_VALUE;
         int icountShift = 0;
@@ -90,6 +103,7 @@ public final class Main {
                         }
                     }
                     case "--no-code-sharing" -> shareCode = false;
+                    case "--console" -> sockets.add(addConsole(cfg, args[++i]));
                     case "--net" -> addNetwork(cfg, args[++i]);
                     case "--test-mmio" -> {
                         long base = Long.decode(args[++i]);
@@ -340,6 +354,39 @@ public final class Main {
             System.err.printf("[javapower] test-mmio %s %d bytes at 0x%x: 0x%x (%s)%n", what, size, base + offset, v,
                     Thread.currentThread().getName());
         }
+    }
+
+    /**
+     * {@code --console tcp:[host:]port[,name=NAME]}: another console, on a TCP port (loopback
+     * unless a host is given), optionally named.
+     */
+    private static SocketConsole addConsole(MachineConfig cfg, String spec) {
+        String[] parts = spec.split(",");
+        if (!parts[0].startsWith("tcp:")) {
+            throw new IllegalArgumentException("--console takes tcp:[host:]port[,name=NAME], got " + spec);
+        }
+        String name = null;
+        for (int k = 1; k < parts.length; k++) {
+            if (!parts[k].startsWith("name=")) {
+                throw new IllegalArgumentException("--console: unknown option " + parts[k]);
+            }
+            name = parts[k].substring(5);
+        }
+        SocketConsole s;
+        try {
+            s = new SocketConsole(parts[0].substring(4));
+        } catch (IOException | RuntimeException e) {
+            throw new IllegalArgumentException("--console " + spec + ": cannot listen: " + e.getMessage(), e);
+        }
+        try {
+            MachineConfig.Console c = cfg.addConsole(s).name(name);
+            System.err.printf("[javapower] console vty@%x%s on %s%n", c.unitAddress(),
+                    name == null ? "" : " (" + name + ")", s.address());
+        } catch (RuntimeException e) {
+            s.close();
+            throw e;
+        }
+        return s;
     }
 
     /** A state file, gunzipped if its name ends in .gz. */

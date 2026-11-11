@@ -1,8 +1,9 @@
 # javapower
 
 A Power ISA emulator for the JVM. It models a PAPR `pseries` machine (POWER9, radix MMU, XICS,
-VIO console and v-scsi) closely enough to run QEMU's stock SLOF firmware and boot FreeBSD 15.1 and
-openSUSE Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
+VIO console and v-scsi) closely enough to run QEMU's stock SLOF firmware and boot FreeBSD 15.1
+(ppc64le, and big-endian powerpc64 including its 32-bit compatibility layer) and openSUSE
+Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
 as a library. Java 25 or later; no runtime dependencies.
 
 ## Embedding
@@ -98,6 +99,17 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr.
+
+## Supported guests
+
+| Guest | Status | Typical command |
+|---|---|---|
+| FreeBSD 15.1 ppc64le install ISO | boots to the installer | `app --cdrom FreeBSD-15.1-RELEASE-powerpc-powerpc64le-disc1.iso` |
+| FreeBSD 15.1 powerpc64 (big-endian) install ISO | boots to the installer; its kyua tests and 32-bit (COMPAT_FREEBSD32) programs give the same results as under QEMU | `app --ram 4096 --cdrom FreeBSD-15.1-RELEASE-powerpc-powerpc64-disc1.iso` |
+| openSUSE Tumbleweed ppc64le Minimal VM (4K-sector raw image) | boots to the first-boot configuration screen | `app --disk4k opensuse-tw-minimal.raw --clock-scale 4` |
+
+`scripts/guest/drive.py` checks these on the dev server by driving the console through a pty,
+against our CLI or QEMU (see `scripts/guest/README.md`).
 
 ## Building and testing
 

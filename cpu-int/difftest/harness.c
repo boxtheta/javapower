@@ -1,5 +1,6 @@
-// Bare-metal differential-test driver (little-endian, 64-bit, real mode). See README.md.
-// Built with clang --target=powerpc64le-linux-gnu -mcpu=power9 -ffreestanding -nostdlib.
+// Bare-metal differential-test driver (64-bit, real mode). See README.md.
+// Built with clang --target=powerpc64le-linux-gnu (or powerpc64-linux-gnu -mabi=elfv2 for the
+// big-endian variant, which runs with LPCR[ILE]=0) -mcpu=power9 -ffreestanding -nostdlib.
 typedef unsigned long u64;
 typedef unsigned int u32;
 typedef unsigned char u8;
@@ -107,7 +108,11 @@ static void puts_vty(const char *s) {
         w[0] = w[1] = 0;
         while (n < 16 && s[n]) n++;
         // H_PUT_TERM_CHAR takes the bytes packed big-endian into two registers.
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         for (int i = 0; i < n; i++) b[(i & ~7) + 7 - (i & 7)] = (u8)s[i];
+#else
+        for (int i = 0; i < n; i++) b[i] = (u8)s[i];
+#endif
         hcall(0x58, 0x71000000, n, w[0], w[1], 0, 0, 0);
         hcall(0x58, 0x71000001, n, w[0], w[1], 0, 0, 0);
         s += n;

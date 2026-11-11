@@ -40,7 +40,10 @@ final class Golden {
     static final String[] SPR_NAMES = {"AMR", "IAMR", "UAMOR", "PIDR", "FSCR", "TAR", "DSCR", "SPRG0",
         "SPRG3", "EBBRR", "BESCR", "PPR", "VRSAVE", "CTRL", "SPRG2", "EBBHR"};
 
-    /** LPCR as QEMU's pseries has it after reset, H_SET_MODE(LE) and H_REGISTER_PROC_TBL(radix, GTSE). */
+    /**
+     * LPCR as QEMU's pseries has it after reset, H_SET_MODE(LE) and H_REGISTER_PROC_TBL(radix, GTSE).
+     * Cases from the big-endian harness carry {@code ile=0}: it skips H_SET_MODE(LE).
+     */
     static final long LPCR = Interpreter.LPCR_LPES0 | Interpreter.LPCR_LPES1 | Interpreter.LPCR_EEE
             | Interpreter.LPCR_DEE | Interpreter.LPCR_OEE | Interpreter.LPCR_PDEE | Interpreter.LPCR_HDEE
             | Spr.LPCR_LD | Spr.LPCR_ILE | Spr.LPCR_UPRT | Spr.LPCR_HR | Spr.LPCR_GTSE;
@@ -156,6 +159,11 @@ final class Golden {
                     case "ctr" -> s.ctr = hex(v);
                     case "msr", "pc", "code" -> {}
                     case "ail" -> s.spr[Spr.LPCR] |= hex(v) << Spr.LPCR_AIL_SHIFT;
+                    case "ile" -> { // big-endian harness: interrupts delivered with LPCR[ILE]=0
+                        if (hex(v) == 0) {
+                            s.spr[Spr.LPCR] &= ~Spr.LPCR_ILE;
+                        }
+                    }
                     case "cfar" -> {}
                     default -> inputToken(k, v, sprIn, mem);
                 }
@@ -175,7 +183,8 @@ final class Golden {
             cpu.storeDec(0x7fffffffL);
             s.spr[Spr.SRR0] = pc;
             s.spr[Spr.SRR1] = msr;
-            s.msr = msr;
+            // The harness enters the case by rfid, which sets EE, IR and DR along with PR.
+            s.msr = (msr & Msr.PR) != 0 ? msr | Msr.EE | Msr.IR | Msr.DR : msr;
             s.pc = pc;
             s.resValid = false;
             cpu.mmu().flushAll();

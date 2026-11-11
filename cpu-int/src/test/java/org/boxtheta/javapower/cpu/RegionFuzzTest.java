@@ -23,8 +23,12 @@ import org.junit.jupiter.api.Test;
  * pointer, hitting the region's own page), forward branches (direct, through LR and CTR, and an
  * op of another module that skips an instruction), and optionally decrementer interrupts. It
  * runs in both byte orders, both computation modes, with translation on (radix, with unmapped,
- * read-only and beyond-RAM pages) and off, in supervisor and problem state. The interpreted and
- * compiled machines must end in identical state: registers, SPRs, interrupt history, memory.
+ * read-only and beyond-RAM pages) and off, in supervisor and problem state. Byte order also
+ * changes while running: interrupts may be delivered in the other byte order (LPCR[ILE] differs
+ * from MSR[LE], so the decrementer handler runs in it and rfid switches back), and in supervisor
+ * state the loop may rfid with MSR[LE] flipped into a stub of the other byte order that rfids
+ * back. The interpreted and compiled machines must end in identical state: registers, SPRs,
+ * interrupt history, memory.
  */
 class RegionFuzzTest {
     static final long RAM = 1 << 20;
@@ -37,6 +41,8 @@ class RegionFuzzTest {
     static final long T1 = 0x60000;
     static final long T2 = 0x61000;
     static final long T3 = 0x62000;
+    /** The other-byte-order stub reached by rfid with MSR[LE] flipped. */
+    static final long FLIP = 0x14000;
     static final int FOREIGN_PO = 5;
 
     static final int INTERP = 0;
@@ -44,7 +50,8 @@ class RegionFuzzTest {
     static final int REGIONS = 2;
     static final int PROMOTED = 3;
 
-    record Mode(boolean le, boolean sf, boolean dr, boolean pr, boolean dec) {}
+    /** le: MSR[LE] of the loop; ile: LPCR[ILE]; flips: the loop rfids into the other byte order. */
+    record Mode(boolean le, boolean ile, boolean sf, boolean dr, boolean pr, boolean dec, boolean flips) {}
 
     static final class Machine {
         final PhysicalMemory pm = new PhysicalMemory(RAM);
@@ -80,7 +87,7 @@ class RegionFuzzTest {
                     cpu.regionThreshold = 4;
                 }
             }
-            s.spr[Spr.LPCR] |= (m.le ? Spr.LPCR_ILE : 0) | Spr.LPCR_HR | Spr.LPCR_UPRT | Spr.LPCR_GTSE;
+            s.spr[Spr.LPCR] |= (m.ile ? Spr.LPCR_ILE : 0) | Spr.LPCR_HR | Spr.LPCR_UPRT | Spr.LPCR_GTSE;
             s.procTable = PRTB;
             pageTables();
             s.msr = Msr.ME | (m.sf ? Msr.SF : 0) | (m.le ? Msr.LE : 0) | (m.dr ? Msr.IR | Msr.DR : 0)
@@ -115,6 +122,10 @@ class RegionFuzzTest {
         }
 
         void load(long addr, List<Integer> code) {
+            load(addr, code, le);
+        }
+
+        void load(long addr, List<Integer> code, boolean le) {
             for (int k = 0; k < code.size(); k++) {
                 if (le) {
                     pm.write32le(addr + 4L * k, code.get(k));
@@ -166,6 +177,14 @@ class RegionFuzzTest {
     static final int SC = 0x44000002;
     static final int RFID = 0x4c000024;
 
+    static int mfmsr(int rt) {
+        return x(rt, 0, 0, 83, 0);
+    }
+
+    static int mtmsrdL(int rs) {
+        return (31 << 26) | (rs << 21) | (1 << 16) | (178 << 1);
+    }
+
     /** Registers random instructions may write. */
     static final int[] DST = {0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
     // r24: decrementer count, r25: index / DEC value, r26: data base, r27: page-crossing base,
@@ -175,6 +194,8 @@ class RegionFuzzTest {
         final Random r;
         final List<Integer> code = new ArrayList<>();
         final long base;
+        /** Whether the body may rfid into the FLIP stub (supervisor state only). */
+        boolean flips;
 
         Gen(Random r, long base) {
             this.r = r;
@@ -203,6 +224,10 @@ class RegionFuzzTest {
 
         /** One random instruction (or a short sequence) of the loop body. */
         void random() {
+            if (flips && r.nextInt(25) == 0) {
+                flip();
+                return;
+            }
             int k = r.nextInt(100);
             if (k < 40) {
                 alu();
@@ -337,6 +362,27 @@ class RegionFuzzTest {
             }
         }
 
+        /**
+         * rfid into the FLIP stub with MSR[LE] inverted, which returns to SPRG2 by rfid with it
+         * inverted again. MSR[EE] is cleared first so a decrementer interrupt cannot overwrite
+         * SRR0/SRR1 in between; the stub sets it again if the mode uses the decrementer.
+         */
+        void flip() {
+            emit(d(14, 23, 0, 0)); // li r23, 0
+            emit(mtmsrdL(23)); // EE = RI = 0
+            long ret = pc() + 4L * 10;
+            emit(d(15, 23, 0, (int) (ret >>> 16)));
+            emit(d(24, 23, 23, (int) ret & 0xffff));
+            emit(mtspr(Spr.SPRG2, 23));
+            emit(d(15, 23, 0, (int) (FLIP >>> 16)));
+            emit(d(24, 23, 23, (int) FLIP & 0xffff));
+            emit(mtspr(Spr.SRR0, 23));
+            emit(mfmsr(23));
+            emit(d(26, 23, 23, 1)); // xori r23, r23, MSR[LE]
+            emit(mtspr(Spr.SRR1, 23));
+            emit(RFID);
+        }
+
         void handlerOps() {
             switch (r.nextInt(8)) {
                 case 0 -> emit(mtspr(Spr.XER, src()));
@@ -393,8 +439,9 @@ class RegionFuzzTest {
     }
 
     /** Build the program for {@code seed}: setup, loop, sc. Returns it with the register setup applied by {@link #setup}. */
-    static List<Integer> program(Random r) {
+    static List<Integer> program(Random r, Mode mode) {
         Gen g = new Gen(r, CODE);
+        g.flips = mode.flips;
         int iterations = 50 + r.nextInt(500);
         g.emit(d(14, 31, 0, iterations)); // li r31, n
         long loop = g.pc();
@@ -411,10 +458,34 @@ class RegionFuzzTest {
         return g.code;
     }
 
-    static void setup(Machine m, Random r, List<Integer> code, Mode mode) {
+    /** The FLIP stub (run in the other byte order): random work, then rfid back to SPRG2. */
+    static List<Integer> flipStub(Random r, Mode mode) {
+        Gen g = new Gen(r, FLIP);
+        int n = 2 + r.nextInt(12);
+        for (int k = 0; k < n; k++) {
+            if (r.nextBoolean()) {
+                g.mem();
+            } else {
+                g.alu();
+            }
+        }
+        g.emit(mfspr(23, Spr.SPRG2));
+        g.emit(mtspr(Spr.SRR0, 23));
+        g.emit(mfmsr(23));
+        g.emit(d(26, 23, 23, 1)); // xori r23, r23, MSR[LE]
+        if (mode.dec) {
+            g.emit(d(24, 23, 23, (int) Msr.EE)); // ori r23, r23, MSR[EE]
+        }
+        g.emit(mtspr(Spr.SRR1, 23));
+        g.emit(RFID);
+        return g.code;
+    }
+
+    static void setup(Machine m, Random r, List<Integer> code, List<Integer> stub, Mode mode) {
         m.load(CODE, code);
-        // Decrementer handler (real mode): count, re-arm with r25, return.
-        m.load(0x900, List.of(d(14, 24, 24, 1), mtspr(Spr.DEC, 25), RFID));
+        m.load(FLIP, stub, !mode.le);
+        // Decrementer handler (real mode, byte order from LPCR[ILE]): count, re-arm with r25, return.
+        m.load(0x900, List.of(d(14, 24, 24, 1), mtspr(Spr.DEC, 25), RFID), mode.ile);
         for (int k = 0; k < 32; k++) {
             m.s.gpr[k] = r.nextLong();
         }
@@ -456,18 +527,25 @@ class RegionFuzzTest {
 
     static long[] run(int seed, Mode mode, long insns) {
         Random r0 = new Random(seed);
-        List<Integer> code = program(r0);
+        List<Integer> code = program(r0, mode);
+        List<Integer> stub = flipStub(r0, mode);
         long setupSeed = r0.nextLong();
         Machine ref = new Machine(INTERP, mode);
-        setup(ref, new Random(setupSeed), code, mode);
+        setup(ref, new Random(setupSeed), code, stub, mode);
         ref.cpu.run(insns);
+        if (ref.s.spr[Spr.SPRG2] != 0) {
+            FLIPPED[0]++;
+        }
+        if (mode.ile != mode.le && ref.interrupts.stream().anyMatch(v -> v.startsWith("900@"))) {
+            FLIPPED[1]++;
+        }
         String end = ref.s.stopRequested && !ref.interrupts.isEmpty()
                 ? ref.interrupts.get(ref.interrupts.size() - 1).replaceAll("@.*", "") : "limit";
         ENDINGS.merge(end, 1, Integer::sum);
         long[] stats = new long[2];
         for (int tier : new int[] {REGIONS, PROMOTED, BLOCKS}) {
             Machine m = new Machine(tier, mode);
-            setup(m, new Random(setupSeed), code, mode);
+            setup(m, new Random(setupSeed), code, stub, mode);
             m.cpu.run(insns);
             compare(ref, m, "seed " + seed + " " + mode + " tier " + tier + ": ");
             if (tier == REGIONS) {
@@ -483,20 +561,32 @@ class RegionFuzzTest {
         long insns = 0;
         for (int seed = 0; seed < seeds; seed++) {
             Random r = new Random(seed * 7919L + (dr ? 1 : 0) + (pr ? 2 : 0));
-            Mode mode = new Mode(r.nextBoolean(), r.nextInt(4) != 0, dr, pr, r.nextInt(3) == 0);
+            boolean le = r.nextBoolean();
+            boolean ile = r.nextInt(3) == 0 ? !le : le;
+            boolean dec = r.nextInt(3) == 0 || ile != le;
+            Mode mode = new Mode(le, ile, r.nextInt(4) != 0, dr, pr, dec, !pr && r.nextInt(3) == 0);
             long[] st = run(seed, mode, 40_000);
             regions += st[0];
             insns += st[1];
         }
-        System.out.printf("RegionFuzzTest dr=%b pr=%b: %d cases, %d regions, %d instructions, endings %s%n", dr, pr,
-                seeds, regions, insns, ENDINGS);
+        System.out.printf("RegionFuzzTest dr=%b pr=%b: %d cases, %d regions, %d instructions, endings %s,"
+                + " %d ran the other-byte-order stub, %d took other-byte-order interrupts%n", dr, pr,
+                seeds, regions, insns, ENDINGS, FLIPPED[0], FLIPPED[1]);
         ENDINGS.clear();
+        if (!pr) {
+            assertTrue(FLIPPED[0] > seeds / 10, "few cases ran the byte-order stub: " + FLIPPED[0]);
+        }
+        assertTrue(FLIPPED[1] > seeds / 20, "few cases took other-byte-order interrupts: " + FLIPPED[1]);
+        FLIPPED[0] = 0;
+        FLIPPED[1] = 0;
         assertTrue(regions > seeds / 2, "few regions compiled: " + regions);
         assertTrue(insns > seeds * 5000L, "cases end too early: " + insns + " instructions");
     }
 
     /** How the interpreted runs ended (last interrupt vector, or "limit"), for the coverage report. */
     static final java.util.Map<String, Integer> ENDINGS = new java.util.TreeMap<>();
+    /** Cases that ran the FLIP stub, and that took a decrementer interrupt in the other byte order. */
+    static final int[] FLIPPED = new int[2];
 
     @Test
     void realMode() {

@@ -114,18 +114,57 @@ class InterpreterTest {
 
     @Test
     void decrementerInterruptWhenDecReachesZero() {
-        boot(Interpreter.Clock.DETERMINISTIC, addi(3, 0, 100), mtspr(Spr.DEC, 3), ori(5, 0, 0x8000),
+        boot(Interpreter.Clock.DETERMINISTIC, addi(3, 0, 10000), mtspr(Spr.DEC, 3), ori(5, 0, 0x8000),
                 mtmsrdL(5), branch(0));
-        cpu.run(10_000);
+        cpu.run(100_000);
         assertEquals(1, interrupts.size());
         assertEquals(PpcException.DECREMENTER, interrupts.get(0)[0]);
-        // DEC was written at icount 1 (TB 0): the interrupt is taken once TB reaches 100.
-        long due = Interpreter.tbToNsCeil(Interpreter.nsToTb(1) + 100);
+        // DEC was written at icount 1 (TB 0): the interrupt is taken once TB reaches 10000.
+        long due = Interpreter.tbToNsCeil(Interpreter.nsToTb(1) + 10000);
         assertEquals(due, interrupts.get(0)[1]);
         assertEquals(CODE + 16, s.spr[Spr.SRR0]);
         assertEquals(0x900, s.pc);
         // Level-triggered: still pending until DEC is rewritten.
         assertTrue(cpu.decPending());
+    }
+
+    @Test
+    void decrementerExpiryWaitsForMinimumInstructions() {
+        // DEC reaches 0 after 100 ticks, but is noticed only DEC_MIN_INSNS instructions after the
+        // mtdec (at icount 1), like QEMU's timer-callback latency.
+        boot(Interpreter.Clock.DETERMINISTIC, addi(3, 0, 100), mtspr(Spr.DEC, 3), ori(5, 0, 0x8000),
+                mtmsrdL(5), branch(0));
+        cpu.run(100_000);
+        assertEquals(PpcException.DECREMENTER, interrupts.get(0)[0]);
+        assertEquals(1 + Interpreter.DEC_MIN_INSNS, interrupts.get(0)[1]);
+    }
+
+    @Test
+    void interruptedCodeProgressesWhenHandlerRearmsAnExpiredTimer() {
+        // A handler that re-arms DEC with 1 tick and returns: DEC has expired again by the rfid.
+        // The interrupted loop (r10 += 1) must still run between interrupts.
+        for (Interpreter.Clock clock : Interpreter.Clock.values()) {
+            boot(clock, addi(3, 0, 1), mtspr(Spr.DEC, 3), ori(5, 0, 0x8000), mtmsrdL(5), addi(10, 10, 1),
+                    branch(-4));
+            load(0x900, addi(3, 0, 1), mtspr(Spr.DEC, 3), 0x4c000024 /* rfid */);
+            int[] decs = new int[1];
+            cpu.interruptHook = (st, vec, srr0) -> decs[0]++;
+            s.gpr[10] = 0;
+            cpu.run(200_000);
+            assertTrue(decs[0] > 10, clock + ": " + decs[0] + " interrupts");
+            assertTrue(s.gpr[10] > 50_000, clock + ": the loop ran " + s.gpr[10] + " times");
+        }
+    }
+
+    @Test
+    void waitWakesWhenDecReachesZero() {
+        // Idle: the DEC_MIN_INSNS slack does not apply; wait ends when DEC reaches 0.
+        boot(Interpreter.Clock.DETERMINISTIC, addi(3, 0, 100), mtspr(Spr.DEC, 3), ori(5, 0, 0x8000),
+                mtmsrdL(5), 0x7c00003c /* wait */, branch(0));
+        cpu.run(100_000);
+        assertEquals(PpcException.DECREMENTER, interrupts.get(0)[0]);
+        assertEquals(Interpreter.tbToNsCeil(Interpreter.nsToTb(1) + 100), interrupts.get(0)[1]);
+        assertEquals(CODE + 20, s.spr[Spr.SRR0]);
     }
 
     @Test

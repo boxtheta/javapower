@@ -20,7 +20,8 @@ import org.junit.jupiter.api.TestFactory;
  * through the interpreter. Cases are grouped by the part of their name before the first '-'.
  */
 class GoldenTest {
-    static final String[] GROUPS = {"selftest", "alu", "alu32", "branch", "ldst", "sys", "spr", "mmu"};
+    static final String[] GROUPS = {"selftest", "alu", "alu32", "branch", "ldst", "sys", "spr", "mmu",
+        "selftestbe", "sysbe", "mmube", "trace", "tracebe"};
 
     @TestFactory
     Stream<DynamicNode> golden() throws IOException {

@@ -197,12 +197,24 @@ public final class Interpreter {
     // Decrementer: DEC = decNext - TB. Pending is level-triggered and latched (QEMU book3s model):
     // raised when DEC reaches 0 or a negative value is written, lowered when a non-negative
     // value is written.
+    //
+    // Reaching 0 is noticed no sooner than DEC_MIN_INSNS instructions after the write, unless the
+    // CPU idles. In QEMU an expiry is raised by a host timer callback, so the vCPU always runs on
+    // for a while after an mtdec whose deadline is already past; without that slack, a guest
+    // whose timer handler takes longer than the period it re-arms (FreeBSD's timerfd with a 1 us
+    // interval) takes the next decrementer interrupt right after each rfid and never returns to
+    // the interrupted code. A negative value written still raises it at once, as in QEMU.
+    static final long DEC_MIN_INSNS = CHUNK;
     private long decNext;
     private boolean decPending;
     /** A non-negative value was written and DEC has not reached zero since. */
     private boolean decArmed;
-    /** DETERMINISTIC: icount at which the decrementer reaches 0 (Long.MAX_VALUE if never). */
+    /** icount before which an armed decrementer does not become pending while executing. */
+    private long decEarliest;
+    /** DETERMINISTIC: icount at which the decrementer becomes pending (Long.MAX_VALUE if never). */
     private long decDueIcount = Long.MAX_VALUE;
+    /** DETERMINISTIC: icount at which DEC reaches 0, without the DEC_MIN_INSNS floor (idle wake-up). */
+    private long decZeroIcount = Long.MAX_VALUE;
     /** Timebase offset (TB = virtual-time ticks + tbOffset). */
     private long tbOffset;
 
@@ -365,16 +377,19 @@ public final class Interpreter {
         long now = tb();
         decNext = now + v;
         decDueIcount = Long.MAX_VALUE;
+        decZeroIcount = Long.MAX_VALUE;
         if (signed < 0) {
             decPending = true;
             decArmed = false;
         } else {
             decPending = false;
             decArmed = true;
+            decEarliest = s.icount + DEC_MIN_INSNS;
             if (clock == Clock.DETERMINISTIC) {
                 long dueNs = tbToNsCeil(decNext - tbOffset);
-                decDueIcount = icountShift == 0 ? dueNs
+                decZeroIcount = icountShift == 0 ? dueNs
                         : ((dueNs + (1L << icountShift) - 1) >>> icountShift);
+                decDueIcount = Math.max(decZeroIcount, decEarliest);
             }
         }
         recheck = true;
@@ -383,11 +398,13 @@ public final class Interpreter {
     /** Whether a decrementer interrupt is pending (level, latched until DEC is written). */
     public boolean decPending() {
         if (decArmed) {
-            boolean due = clock == Clock.DETERMINISTIC ? s.icount >= decDueIcount : tb() >= decNext;
+            boolean due = clock == Clock.DETERMINISTIC ? s.icount >= decDueIcount
+                    : s.icount >= decEarliest && tb() >= decNext;
             if (due) {
                 decPending = true;
                 decArmed = false;
                 decDueIcount = Long.MAX_VALUE;
+                decZeroIcount = Long.MAX_VALUE;
             }
         }
         return decPending;
@@ -582,6 +599,13 @@ public final class Interpreter {
         fetchPage = -1;
         jitOn = compileBlocks && hook == null;
         blockMode = RegionCompiler.mode(s.msr);
+        // Trace interrupts (MSR[SE], MSR[BE]) are decided by the MSR before each instruction, and
+        // any MSR change ends the chunk: with either bit set, run one instruction per chunk.
+        traceMsr = s.msr & (MSR_SE | MSR_BE);
+        if (traceMsr != 0) {
+            chunkEnd = start + 1;
+            jitOn = false;
+        }
         // Whether pc may start a compiled block: true at a branch target and after a block.
         boolean blockStart = true;
         while (true) {
@@ -784,9 +808,44 @@ public final class Interpreter {
             long npc = s.npc;
             s.pc = npc;
             if (++s.icount >= chunkEnd || recheck) {
+                if (traceMsr != 0) {
+                    traceAfter(pc, insn);
+                }
                 return s.icount - start;
             }
             blockStart = npc != ((pc + 4) & pcMask);
+        }
+    }
+
+    // ================================================================== trace interrupts
+
+    /** MSR[SE] (ISA bit 53): single-step trace. */
+    static final long MSR_SE = 1L << 10;
+    /** MSR[BE] (ISA bit 54): branch trace. */
+    static final long MSR_BE = 1L << 9;
+    private static final int SIAR = 796;
+    /** MSR[SE] | MSR[BE] at the start of the current chunk (which then holds one instruction). */
+    private long traceMsr;
+
+    /**
+     * After {@code insn} at {@code pc} completed without an interrupt: take a trace interrupt if
+     * MSR[SE] was set (except after sc, whose interrupt or hypercall stands in for it, and the
+     * rfi class, as QEMU does) or MSR[BE] was set and it was a branch, taken or not. SRR0 is the
+     * next instruction, SRR1 has ISA bit 33 set, SIAR holds {@code pc}.
+     */
+    private void traceAfter(long pc, int insn) {
+        int po = insn >>> 26;
+        int xo = (insn >>> 1) & 0x3ff;
+        boolean trace;
+        if ((traceMsr & MSR_SE) != 0) {
+            boolean rfi = po == 19 && (xo == 18 || xo == 274 || xo == 82 || xo == 146);
+            trace = po != 17 && !rfi;
+        } else {
+            trace = po == 16 || po == 18 || (po == 19 && (xo == 16 || xo == 528 || xo == 560));
+        }
+        if (trace && !s.ceded && !waiting) {
+            s.spr[SIAR] = pc;
+            deliver(PpcException.TRACE, s.pc, 1L << 30);
         }
     }
 
@@ -1623,6 +1682,11 @@ public final class Interpreter {
      */
     private boolean idle() {
         leaveGuest();
+        // Nothing runs while idle, so the DEC_MIN_INSNS slack no longer applies.
+        decEarliest = Math.min(decEarliest, s.icount);
+        if (decZeroIcount != Long.MAX_VALUE) {
+            decDueIcount = Math.max(decZeroIcount, s.icount);
+        }
         while (true) {
             if (s.stopRequested) {
                 return false;

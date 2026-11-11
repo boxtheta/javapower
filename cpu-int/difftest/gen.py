@@ -17,7 +17,7 @@ line per case:
 
   name|IN tokens|OUT tokens
 
-IN:  msr= pc= code=w,w,..  then non-default r<n>= cr= xer= lr= ctr= s<i>= p<addr>= m<off>=
+IN:  msr= pc= code=w,w,..  [ile=0] then non-default r<n>= cr= xer= lr= ctr= s<i>= p<addr>= m<off>=
 OUT: vec= srr0= srr1= dar= dsisr= hmsr= cr= xer= then changed r<n>= lr= ctr= s<i>= q<addr>=
      m<off>=, and x=<names> for outputs that must not be compared (time, random numbers).
 Defaults are mirrored in Golden.java.
@@ -44,6 +44,9 @@ MAXPATCH = 12
 DAR_IN = 0x0000DA00DA00DA00
 M64 = 0xFFFFFFFFFFFFFFFF
 CASE_RFID = 0  # address of the harness's rfid (CFAR at case entry), set by build_fw
+# Firmware byte order: False = little-endian harness with LPCR[ILE]=1 (H_SET_MODE LE), True =
+# big-endian harness, interrupts delivered with LPCR[ILE]=0. Set per group (groups.BE_FIRMWARE).
+FW_BE = False
 
 # Case.spr[] order (must match harness.c and Golden.java).
 SPR_NAMES = ["AMR", "IAMR", "UAMOR", "PIDR", "FSCR", "TAR", "DSCR", "SPRG0", "SPRG3", "EBBRR",
@@ -151,9 +154,17 @@ def map_std(c, pid=1, slot_leaf=None):
     return c
 
 
+def fw_order():
+    return ">" if FW_BE else "<"
+
+
 def pack(c, words):
+    """One case record in the firmware's byte order. Code words are stored so that they read
+    back in the case's own byte order; page-table patches are big-endian in memory."""
+    e = fw_order()
     le = (c.msr & MSR_LE) != 0
-    w = [x if le else struct.unpack("<I", struct.pack(">I", x))[0] for x in words]
+    swap = le == FW_BE
+    w = [struct.unpack("<I", struct.pack(">I", x))[0] if swap else x for x in words]
     w += [0] * (MAXSLOT - len(w))
     gpr = [default_gpr(i) for i in range(32)]
     for k, v in c.gpr.items():
@@ -165,14 +176,14 @@ def pack(c, words):
     mem = bytearray(default_mem())
     for off, b in c.mem.items():
         mem[off:off + len(b)] = b
-    out = struct.pack("<4Q", 1 | (c.ail << 8), c.msr & M64, c.pc & M64, len(words))
-    out += struct.pack("<32I", *w)
-    out += struct.pack("<32Q", *gpr)
-    out += struct.pack("<4Q", c.cr, c.xer, c.lr, c.ctr)
-    out += struct.pack("<16Q", *spr)
-    out += struct.pack("<Q", len(c.patch))
+    out = struct.pack(e + "4Q", 1 | (c.ail << 8), c.msr & M64, c.pc & M64, len(words))
+    out += struct.pack(e + "32I", *w)
+    out += struct.pack(e + "32Q", *gpr)
+    out += struct.pack(e + "4Q", c.cr, c.xer, c.lr, c.ctr)
+    out += struct.pack(e + "16Q", *spr)
+    out += struct.pack(e + "Q", len(c.patch))
     for a, v in patches:
-        out += struct.pack("<QQ", a, struct.unpack("<Q", struct.pack(">Q", v))[0])
+        out += struct.pack(e + "Q", a) + struct.pack(">Q", v)
     out += bytes(mem)
     out += b"\0" * (REC - len(out))
     assert len(out) == REC
@@ -181,15 +192,15 @@ def pack(c, words):
 
 def unpack_out(buf):
     o = {}
+    e = fw_order()
     base = 776 + WINSIZE  # outputs follow the inputs (see struct Case in harness.c)
-    vals = struct.unpack_from("<6Q", buf, base)
+    vals = struct.unpack_from(e + "6Q", buf, base)
     for k, v in zip(["vec", "srr0", "srr1", "dar", "dsisr", "hmsr"], vals):
         o[k] = v
-    o["gpr"] = list(struct.unpack_from("<32Q", buf, base + 48))
-    o["cr"], o["xer"], o["lr"], o["ctr"] = struct.unpack_from("<4Q", buf, base + 304)
-    o["spr"] = list(struct.unpack_from("<16Q", buf, base + 336))
-    o["patch"] = [struct.unpack(">Q", struct.pack("<Q", v))[0]
-                  for v in struct.unpack_from("<%dQ" % MAXPATCH, buf, base + 464)]
+    o["gpr"] = list(struct.unpack_from(e + "32Q", buf, base + 48))
+    o["cr"], o["xer"], o["lr"], o["ctr"] = struct.unpack_from(e + "4Q", buf, base + 304)
+    o["spr"] = list(struct.unpack_from(e + "16Q", buf, base + 336))
+    o["patch"] = list(struct.unpack_from(">%dQ" % MAXPATCH, buf, base + 464))
     o["mem"] = buf[base + 464 + 8 * MAXPATCH:base + 464 + 8 * MAXPATCH + WINSIZE]
     return o
 
@@ -206,7 +217,8 @@ def build_fw(work):
             f.write(".org 0x%x\n mtspr 273, 3\n lis 3, 0x%x\n ori 3, 3, 0x%x\n b common\n"
                     % (a, a >> 16, a & 0xFFFF))
     elf = os.path.join(work, "fw.elf")
-    run(["clang", "--target=powerpc64le-linux-gnu", "-mcpu=power9", "-O2", "-nostdlib", "-static",
+    target = ["--target=powerpc64-linux-gnu", "-mabi=elfv2"] if FW_BE else ["--target=powerpc64le-linux-gnu"]
+    run(["clang"] + target + ["-mcpu=power9", "-O2", "-nostdlib", "-static",
          "-fuse-ld=lld", "-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-fno-pic",
          "-msoft-float", "-mno-altivec", "-mno-vsx", "-I", work, "-T", os.path.join(HERE, "link.ld"),
          "-Wl,--no-relax", "-o", elf, os.path.join(HERE, "boot.S"), os.path.join(HERE, "harness.c")])
@@ -214,8 +226,8 @@ def build_fw(work):
     run(["llvm-objcopy", "-O", "binary", elf, fw])
     tobj = os.path.join(work, "tramp.o")
     tbin = os.path.join(work, "tramp.bin")
-    run(["llvm-mc", "-triple=powerpc64-unknown-linux-gnu", "-mcpu=pwr9", "-filetype=obj", "-o", tobj,
-         os.path.join(HERE, "tramp.S")])
+    run(["llvm-mc", "-triple=powerpc64-unknown-linux-gnu", "-mcpu=pwr9", "-filetype=obj",
+         "-defsym=FW_BE=%d" % FW_BE, "-o", tobj, os.path.join(HERE, "tramp.S")])
     run(["llvm-objcopy", "-O", "binary", "--only-section=.text", tobj, tbin])
     data = bytearray(open(fw, "rb").read())
     t = open(tbin, "rb").read()
@@ -320,6 +332,8 @@ def golden_line(c, words, o):
     ins = ["msr=%x" % c.msr, "pc=%x" % c.pc, "code=" + ",".join("%08x" % w for w in words)]
     if c.ail:
         ins.append("ail=%d" % c.ail)
+    if FW_BE:
+        ins.append("ile=0")
     ins.append("cfar=%x" % CASE_RFID)
     gin = [default_gpr(k) for k in range(32)]
     for k in sorted(c.gpr):
@@ -366,6 +380,8 @@ def golden_line(c, words, o):
 def main():
     group, outdir = sys.argv[1], sys.argv[2]
     import groups
+    global FW_BE
+    FW_BE = group in groups.BE_FIRMWARE
     cases = list(groups.GROUPS[group]())
     names = set()
     for c in cases:
@@ -375,7 +391,7 @@ def main():
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as work:
         fw = build_fw(work)
         words = assemble_cases(cases, work)
-        hdr = struct.pack("<Q", len(cases)) + b"\0" * 4088
+        hdr = struct.pack(fw_order() + "Q", len(cases)) + b"\0" * 4088
         inp = hdr + b"".join(pack(c, w) for c, w in zip(cases, words))
         res = run_qemu(fw, inp, work, timeout=600)
     if len(res) != len(inp):

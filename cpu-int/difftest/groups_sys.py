@@ -201,6 +201,45 @@ def gen_cfar(g):
         g.case("cfar", code, {5: 0x1234}, cr=0)
 
 
+def trace():
+    """Trace interrupts: MSR[SE] (single step) after each kind of instruction, and MSR[BE]
+    (branch trace), in supervisor and problem state, 64- and 32-bit, translation on and off."""
+    g = G(random.Random(43))
+    first = {
+        "add": "add 3, 4, 5", "addo": "addo. 3, 4, 5", "ld": "ld 3, 0(6)", "std": "std 3, 0(6)",
+        "lbzu": "lbzu 3, 1(6)", "b": "b .+8", "bl": "bl .+8", "bctaken": "bc 12, 2, .+8",
+        "bcnot": "bc 4, 2, .+8", "bdnz": "bdnz .+8", "blr": "blr", "bctr": "bctr", "mfmsr": "mfmsr 3",
+        "mtmsrdoff": "mtmsrd 7, 0", "mtmsrdl": "mtmsrd 8, 1", "isync": "isync", "sync": "sync",
+        "lwarx": "lwarx 3, 0, 6", "stwcx": "stwcx. 3, 0, 6", "dcbz": "dcbz 0, 6", "mtspr": "mtspr 272, 3",
+        "mfcr": "mfcr 3", "nop": "nop", "tw0": "tw 0, 3, 3", "twtrap": "tw 31, 3, 3", "ill": 0,
+        "sc": "sc", "priv": "mtspr 26, 3", "ldbad": "ld 3, 4(9)", "lmw": "lmw 28, 0(6)",
+    }
+    for msr in [MSR64LE, USER, MSR32LE, VIRT, MSR64BE, MSR64BE | MSR_PR | MSR_IR | MSR_DR]:
+        for mn, insn in first.items():
+            m = msr | SE
+            regs = {6: 0x300000 - 8, 7: m & ~SE, 8: 0, 9: 0x7FFFFFFF00000000}
+            # Branch targets: lr/ctr point two instructions on.
+            c = g.case("se" + mn, [insn, "addi 10, 10, 1"], regs, msr=m, cr=0x20000000)
+            c.lr = SLOT + 8
+            c.ctr = SLOT + 8 if mn == "bctr" else 2
+        # rfid to the next instruction keeping SE, and dropping it.
+        for keep in [True, False]:
+            tgt_msr = (msr | SE) if keep else msr
+            g.case("serfid", ["rfid", "addi 10, 10, 1", "addi 10, 10, 1"],
+                   {}, msr=msr | SE).s("SPRG0", 0)
+            g.out[-1].code = ["mtsrr0 4", "mtsrr1 5", "rfid", "addi 10, 10, 1", "addi 10, 10, 1"] + ["sc"] * 4
+            g.out[-1].msr = msr  # SE set by the rfid itself
+            g.out[-1].r(4, SLOT + 12).r(5, tgt_msr)
+    for msr in [MSR64LE, USER, MSR64BE]:
+        for mn in ["b", "bl", "bctaken", "bcnot", "bdnz", "blr", "bctr", "add", "ld", "sc", "mtmsrdoff"]:
+            m = msr | BE
+            c = g.case("bt" + mn, [first[mn], "addi 10, 10, 1"], {6: 0x300000 - 8, 7: msr}, msr=m,
+                       cr=0x20000000)
+            c.lr = SLOT + 8
+            c.ctr = SLOT + 8 if mn == "bctr" else 2
+    return g.out
+
+
 def gen_misc(g):
     g.case("isync", [xform(19, 150) | (1 << 11)])  # reserved bit
     g.case("mftb", ["mftb 3", "mftbu 4"]).ignore += ["r3", "r4"]
@@ -260,4 +299,4 @@ def spr():
     return out
 
 
-GROUPS = {"sys": sys, "spr": spr}
+GROUPS = {"sys": sys, "spr": spr, "trace": trace}

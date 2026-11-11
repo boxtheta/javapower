@@ -1,4 +1,4 @@
-# Bare-metal differential-test firmware, little-endian 64-bit part (see README.md).
+# Bare-metal differential-test firmware, 64-bit part, built little- or big-endian (see README.md).
 #
 # Low memory (real addresses):
 #   0x00100       big-endian trampoline (tramp.S), patched in by build.py

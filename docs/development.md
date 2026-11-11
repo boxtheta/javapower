@@ -1,17 +1,22 @@
 # Development environment
 
-All builds, tests and QEMU runs happen on a build server, `devserver.nodes.bxta.net` (Arch, 12
-cores, JDK 27 as the default and JDK 21 in `/usr/lib/jvm/java-21-openjdk`, Gradle, QEMU 11.1,
-clang/lld with PowerPC targets, gdb, dtc, podman). Nothing is built locally. A FreeBSD sister
-machine, `unix01.nodes.bxta.net`, has the same JDKs, Gradle, QEMU and guest images; select it with
-`JP_HOST`.
+Builds, tests and QEMU runs happen on a build server rather than on the machine with the checkout.
+The server needs JDK 21 and JDK 27, Gradle, QEMU 11.1, clang/lld with PowerPC targets, gdb, dtc
+and, for firmware rebuilds, podman. Linux and FreeBSD hosts both work.
+
+Which server is a local detail: the scripts take its ssh name from `JP_HOST`, read from the
+environment or from `local.env` at the repository root (untracked), e.g.
+
+```
+JP_HOST=${JP_HOST:-build.example.org}
+```
 
 - `scripts/remote.sh <workspace> <command...>` rsyncs this checkout to `~/javapower/work/<workspace>`
   on the server and runs the command there. Use your own workspace name so parallel builds don't
   collide, e.g. `scripts/remote.sh agent-a gradle -q :cpu-int:test`.
 - Scratch files on the server go under `~/javapower/work/<workspace>-scratch/`.
 
-## What is on the server
+## What the scripts expect on the server
 
 - `~/javapower/images/`: `freebsd-15.1-disc1.iso` (ppc64le), `freebsd-15.1-be-disc1.iso`
   (powerpc64), `opensuse-tw-minimal.raw` (4096-byte sectors).

@@ -2,4 +2,7 @@ build/
 .gradle/
 *.class
 .idea/
+# Local setup: the build server (see docs/development.md) and private notes.
+/local.env
+CLAUDE.local.md
 *.iml

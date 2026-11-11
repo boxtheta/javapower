@@ -12,10 +12,9 @@
 #    hand at https://central.sonatype.com/publishing/deployments (publishing cannot be undone).
 #    Needs a portal user token in CENTRAL_TOKEN_USER and CENTRAL_TOKEN_PASSWORD.
 #
-# JP_RELEASE_KEY overrides the signing key; JP_HOST the build server.
+# JP_RELEASE_KEY overrides the signing key. The build server is JP_HOST, as for remote.sh.
 set -eu
 KEY=${JP_RELEASE_KEY:-6E501D76959FFF2632BDEE5B8BE9EC452CDD18D3}
-HOST=${JP_HOST:-devserver.nodes.bxta.net}
 VERSION=${1:?usage: release.sh <version> [--upload]}
 UPLOAD=${2:-}
 case $VERSION in
@@ -30,6 +29,9 @@ if [ "$UPLOAD" = --upload ]; then
 fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+# The server is a local detail: JP_HOST, from the environment or the untracked local.env.
+if [ -f "$ROOT/local.env" ]; then . "$ROOT/local.env"; fi
+HOST=${JP_HOST:?set JP_HOST, or put JP_HOST=<build server> in local.env at the repository root}
 if [ -n "$(git status --porcelain)" ]; then
     echo "working tree is not clean; a release is built from a commit" >&2; exit 1
 fi

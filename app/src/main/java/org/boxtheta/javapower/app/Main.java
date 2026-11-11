@@ -29,6 +29,8 @@ import org.boxtheta.javapower.papr.MachineConfig;
 import org.boxtheta.javapower.papr.NetBackend;
 import org.boxtheta.javapower.papr.PaprLog;
 import org.boxtheta.javapower.papr.StdioCharBackend;
+import org.boxtheta.javapower.papr.VirtioPciDevice;
+import org.boxtheta.javapower.papr.VirtioRng;
 
 /** Command-line front end: boots a pseries guest with the console on stdin/stdout. */
 public final class Main {
@@ -43,7 +45,7 @@ public final class Main {
             + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
             + " [--persistent] [--load-state file] [--save-state file]"
             + " [--net dgram,local=host:port,remote=host:port[,mac=xx:xx:xx:xx:xx:xx] | --net none[,mac=...]]"
-            + " [--test-mmio addr]";
+            + " [--virtio-rng] [--test-mmio addr]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
@@ -62,6 +64,7 @@ public final class Main {
         Path loadState = null;
         Path saveState = null;
         java.util.List<MachineConfig.Disk> disks = new java.util.ArrayList<>();
+        int virtioRngs = 0;
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
@@ -92,6 +95,7 @@ public final class Main {
                         long base = Long.decode(args[++i]);
                         cfg.addMmio("test-mmio", base, TestMmio.SIZE, new TestMmio(base)).compatible("javapower,test-mmio");
                     }
+                    case "--virtio-rng" -> virtioRngs++;
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
@@ -118,6 +122,13 @@ public final class Main {
             // Pin every source of entropy and time of day, so the same command repeats exactly.
             cfg.random(new Random(DETERMINISTIC_SEED)).clock(Clock.fixed(DETERMINISTIC_TIME, ZoneOffset.UTC));
             seed = DETERMINISTIC_SEED;
+        }
+        // virtio-rng-pci devices in slots 0, 1, ...; seeded too under --deterministic.
+        java.util.List<VirtioRng> rngs = new java.util.ArrayList<>();
+        for (int k = 0; k < virtioRngs; k++) {
+            VirtioRng rng = seed != null ? new VirtioRng(new Random(seed + 1 + k)) : new VirtioRng();
+            cfg.addPciDevice(new VirtioPciDevice(rng));
+            rngs.add(rng);
         }
 
         Emulator emulator;
@@ -196,6 +207,9 @@ public final class Main {
             if (emu.cpuCount() > 1) {
                 System.err.printf("[javapower] tlb shootdowns=%d wait=%dms%n", emu.domain().tlbShootdowns(),
                         emu.domain().tlbShootdownWaitNanos() / 1_000_000);
+            }
+            for (int k = 0; k < rngs.size(); k++) {
+                System.err.printf("[javapower] virtio-rng in PCI slot %d: %d bytes served%n", k, rngs.get(k).bytesServed());
             }
             for (Map.Entry<String, Long> e : emu.unimplementedInstructions().entrySet()) {
                 System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());

@@ -4,13 +4,7 @@ import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.constant.ConstantDescs.CD_long;
 import static java.lang.constant.ConstantDescs.CD_void;
-import static java.lang.constant.ConstantDescs.INIT_NAME;
-import static java.lang.constant.ConstantDescs.MTD_void;
 
-import java.lang.classfile.ClassFile;
-import java.lang.classfile.CodeBuilder;
-import java.lang.classfile.Label;
-import java.lang.classfile.TypeKind;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.DynamicConstantDesc;
@@ -21,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.boxtheta.javapower.core.Op;
+import org.boxtheta.javapower.cpu.internal.asm.Label;
 
 /**
  * Translates a straight-line run of guest instructions into a hidden class whose
@@ -62,7 +57,6 @@ final class BlockCompiler {
     private static final ClassDesc CD_PPCEX = ClassDesc.of("org.boxtheta.javapower.core.PpcException");
     private static final ClassDesc CD_INTERP = ClassDesc.of("org.boxtheta.javapower.cpu.Interpreter");
     private static final ClassDesc CD_MMU = ClassDesc.of("org.boxtheta.javapower.cpu.RadixMmu");
-    private static final ClassDesc CD_BASE = ClassDesc.of("org.boxtheta.javapower.cpu.CompiledBlock");
     private static final ClassDesc CD_BLOCK = ClassDesc.of("org.boxtheta.javapower.cpu.Block");
     private static final MethodTypeDesc MTD_HANDLER = MethodTypeDesc.of(CD_void, CD_CPU, CD_int);
     private static final MethodTypeDesc MTD_RUN = MethodTypeDesc.of(CD_int, CD_CPU, CD_INTERP);
@@ -113,7 +107,7 @@ final class BlockCompiler {
     }
 
     /** Push {@code (base + off) & mask} (a long), base being a long local. */
-    private static void address(CodeBuilder cob, int base, long off, long mask) {
+    private static void address(CodeEmitter cob, int base, long off, long mask) {
         cob.lload(base);
         if (off != 0) {
             cob.loadConstant(off).ladd();
@@ -130,70 +124,62 @@ final class BlockCompiler {
      */
     static CompiledBlock compile(long ea, long pcMask, int[] words, int[] slots, int n, Op[] ops) {
         List<Op> foreign = new ArrayList<>();
-        byte[] bytes = ClassFile.of().build(CD_BLOCK, clb -> {
-            clb.withFlags(ClassFile.ACC_FINAL | ClassFile.ACC_SYNTHETIC);
-            clb.withSuperclass(CD_BASE);
-            clb.withMethodBody(INIT_NAME, MTD_void, 0, cob -> cob
-                    .aload(0)
-                    .invokespecial(CD_BASE, INIT_NAME, MTD_void)
-                    .return_());
-            clb.withMethodBody("run", MTD_RUN, ClassFile.ACC_FINAL, cob -> {
-                int base = cob.allocateLocal(TypeKind.LONG);
-                cob.aload(1).getfield(CD_CPU, "pc", CD_long).lstore(base);
-                Label start = cob.newLabel();
-                Label end = cob.newLabel();
-                Label exit = cob.newLabel();
-                Label fault = cob.newLabel();
-                cob.labelBinding(start);
-                for (int k = 0; k < n; k++) {
-                    cob.aload(1);
-                    address(cob, base, 4L * k, pcMask);
-                    cob.putfield(CD_CPU, "pc", CD_long);
-                    cob.aload(1);
-                    address(cob, base, 4L * k + 4, pcMask);
-                    cob.putfield(CD_CPU, "npc", CD_long);
-                    int slot = slots[k];
-                    if (slot < Interpreter.INLINE_HANDLERS.length) {
-                        String h = Interpreter.INLINE_HANDLERS[slot];
-                        ClassDesc owner = ClassDesc.of("org.boxtheta.javapower.cpu." + h.substring(0, h.indexOf('.')));
-                        cob.aload(1).loadConstant(words[k])
-                                .invokestatic(owner, h.substring(h.indexOf('.') + 1), MTD_HANDLER);
-                    } else if (slot < Interpreter.FIRST_DYNAMIC) {
-                        cob.aload(1).loadConstant(words[k])
-                                .invokestatic(CD_INTERP, Interpreter.specialHandler(slot), MTD_HANDLER);
-                    } else {
-                        cob.loadConstant(DynamicConstantDesc.ofNamed(ConstantDescs.BSM_CLASS_DATA_AT,
-                                ConstantDescs.DEFAULT_NAME, CD_OP, foreign.size()));
-                        foreign.add(ops[slot]);
-                        cob.aload(1).loadConstant(words[k]).invokeinterface(CD_OP, "exec", MTD_HANDLER);
-                    }
-                    cob.aload(1).dup().getfield(CD_CPU, "icount", CD_long).lconst_1().ladd()
-                            .putfield(CD_CPU, "icount", CD_long);
-                    int f = flags(slot, slot < ops.length ? ops[slot] : null);
-                    if (k < n - 1) {
-                        if ((f & STORE) != 0) {
-                            cob.aload(2).getfield(CD_INTERP, "mmu", CD_MMU).getfield(CD_MMU, "guardHit", CD_boolean)
-                                    .ifne(exit);
-                        }
-                        if ((f & FOREIGN) != 0) {
-                            cob.aload(1).getfield(CD_CPU, "npc", CD_long);
-                            address(cob, base, 4L * k + 4, pcMask);
-                            cob.lcmp().ifne(exit);
-                        }
-                    }
+        CodeEmitter cob = new CodeEmitter(CD_BLOCK, MTD_RUN);
+        int base = cob.allocateLocal(CodeEmitter.LONG);
+        cob.aload(1).getfield(CD_CPU, "pc", CD_long).lstore(base);
+        Label start = cob.newLabel();
+        Label end = cob.newLabel();
+        Label exit = cob.newLabel();
+        Label fault = cob.newLabel();
+        cob.exceptionCatch(start, end, fault, CD_PPCEX);
+        cob.labelBinding(start);
+        for (int k = 0; k < n; k++) {
+            cob.aload(1);
+            address(cob, base, 4L * k, pcMask);
+            cob.putfield(CD_CPU, "pc", CD_long);
+            cob.aload(1);
+            address(cob, base, 4L * k + 4, pcMask);
+            cob.putfield(CD_CPU, "npc", CD_long);
+            int slot = slots[k];
+            if (slot < Interpreter.INLINE_HANDLERS.length) {
+                String h = Interpreter.INLINE_HANDLERS[slot];
+                ClassDesc owner = ClassDesc.of("org.boxtheta.javapower.cpu." + h.substring(0, h.indexOf('.')));
+                cob.aload(1).loadConstant(words[k])
+                        .invokestatic(owner, h.substring(h.indexOf('.') + 1), MTD_HANDLER);
+            } else if (slot < Interpreter.FIRST_DYNAMIC) {
+                cob.aload(1).loadConstant(words[k])
+                        .invokestatic(CD_INTERP, Interpreter.specialHandler(slot), MTD_HANDLER);
+            } else {
+                cob.loadConstant(DynamicConstantDesc.ofNamed(ConstantDescs.BSM_CLASS_DATA_AT,
+                        ConstantDescs.DEFAULT_NAME, CD_OP, foreign.size()));
+                foreign.add(ops[slot]);
+                cob.aload(1).loadConstant(words[k]).invokeinterface(CD_OP, "exec", MTD_HANDLER);
+            }
+            cob.aload(1).dup().getfield(CD_CPU, "icount", CD_long).lconst_1().ladd()
+                    .putfield(CD_CPU, "icount", CD_long);
+            int f = flags(slot, slot < ops.length ? ops[slot] : null);
+            if (k < n - 1) {
+                if ((f & STORE) != 0) {
+                    cob.aload(2).getfield(CD_INTERP, "mmu", CD_MMU).getfield(CD_MMU, "guardHit", CD_boolean)
+                            .ifne(exit);
                 }
-                cob.labelBinding(end);
-                cob.labelBinding(exit);
-                // s.pc = s.npc, as after every instruction in the run loop.
-                cob.aload(1).aload(1).getfield(CD_CPU, "npc", CD_long).putfield(CD_CPU, "pc", CD_long);
-                cob.loadConstant(CompiledBlock.CONTINUE).ireturn();
-                cob.labelBinding(fault);
-                int ex = cob.allocateLocal(TypeKind.REFERENCE);
-                cob.astore(ex).aload(2).aload(ex).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
-                cob.loadConstant(CompiledBlock.FAULTED).ireturn();
-                cob.exceptionCatch(start, end, fault, CD_PPCEX);
-            });
-        });
+                if ((f & FOREIGN) != 0) {
+                    cob.aload(1).getfield(CD_CPU, "npc", CD_long);
+                    address(cob, base, 4L * k + 4, pcMask);
+                    cob.lcmp().ifne(exit);
+                }
+            }
+        }
+        cob.labelBinding(end);
+        cob.labelBinding(exit);
+        // s.pc = s.npc, as after every instruction in the run loop.
+        cob.aload(1).aload(1).getfield(CD_CPU, "npc", CD_long).putfield(CD_CPU, "pc", CD_long);
+        cob.loadConstant(CompiledBlock.CONTINUE).ireturn();
+        cob.labelBinding(fault);
+        int ex = cob.allocateLocal(CodeEmitter.REFERENCE);
+        cob.astore(ex).aload(2).aload(ex).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
+        cob.loadConstant(CompiledBlock.FAULTED).ireturn();
+        byte[] bytes = cob.finish();
         try {
             MethodHandles.Lookup hl = MethodHandles.lookup().defineHiddenClassWithClassData(bytes, foreign, true);
             return (CompiledBlock) hl.findConstructor(hl.lookupClass(), MethodType.methodType(void.class)).invoke();

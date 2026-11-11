@@ -1,15 +1,25 @@
 package org.boxtheta.javapower.core;
 
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 
 /**
- * Guest real memory: one contiguous RAM region starting at real address 0, held off-heap so it can
- * exceed 2 GiB. Accessors take real addresses and an explicit byte order; out-of-range accesses
- * throw {@link IndexOutOfBoundsException} (callers that can be handed a bad address by the guest
- * check {@link #contains} first).
+ * Guest real memory: one contiguous RAM region starting at real address 0. Accessors take real
+ * addresses and an explicit byte order; out-of-range accesses throw
+ * {@link IndexOutOfBoundsException} (callers that can be handed a bad address by the guest check
+ * {@link #contains} first).
+ *
+ * <h2>Backing store</h2>
+ * This class is multi-release, with the same behaviour in both versions. On Java 22 and later RAM
+ * is one off-heap {@code MemorySegment}, which counts against the JVM's direct memory limit
+ * ({@code -XX:MaxDirectMemorySize}, by default the maximum heap size). On Java 21 (this version)
+ * it is held on the Java heap in {@code byte[]} chunks of 1 GiB, so the maximum heap
+ * ({@code -Xmx}) must leave room for it; the rare access that straddles two chunks is assembled
+ * byte by byte. Either way the limit must exceed the guest RAM of every machine alive at once,
+ * the constructor throws {@link OutOfMemoryError} with an explanation when the RAM cannot be
+ * allocated, and the memory is released when this object becomes unreachable.
  *
  * <p>Shared by the CPUs and by device models doing DMA. Plain accesses are not synchronised and
  * only as atomic as the host makes aligned accesses of their size; the {@code cas*} methods are
@@ -22,271 +32,284 @@ import java.nio.ByteOrder;
  * keeps its translation only while {@link #codeGeneration} still returns that value. Every write
  * through this class (the plain accessors, {@link #write}, {@link #fill} and the
  * compare-and-swaps) to a flagged page advances its generation and clears the flag; so does
- * {@link #invalidateCode}, which engines call for writes they make to the segment directly and
- * for instruction-cache invalidations. A write racing with a {@code watchCode} on another thread
- * may go unnoticed, exactly as a store by another processor may: the guest's own
+ * {@link #invalidateCode}, which engines call for writes they make to the backing store directly
+ * and for instruction-cache invalidations. A write racing with a {@code watchCode} on another
+ * thread may go unnoticed, exactly as a store by another processor may: the guest's own
  * cross-modification protocol ({@code icbi}, then a context-synchronising instruction on the
  * executing CPU) is what makes the new code visible, and engines implement {@code icbi} with
  * {@link #invalidateCode}.
  */
-public final class PhysicalMemory {
-    private static final ValueLayout.OfShort S_BE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfShort S_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfInt I_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfInt I_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfLong L_BE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfLong L_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+public final class PhysicalMemory extends MemoryBase {
+    /** log2 of the chunk size. */
+    private static final int CHUNK_SHIFT = 30;
+    private static final int CHUNK_SIZE = 1 << CHUNK_SHIFT;
+    private static final int CHUNK_MASK = CHUNK_SIZE - 1;
 
-    private final MemorySegment ram;
-    private final long size;
-    /** Per 4 KiB page: nonzero while some engine holds code translated from it (see the class comment). */
-    private final byte[] codePages;
-    /** Per 4 KiB page: the code generation. */
-    private final int[] codeGens;
-    /** Advanced after every advance of any page's code generation (see {@link #codeWriteCount}). */
-    private final java.util.concurrent.atomic.AtomicInteger codeWrites = new java.util.concurrent.atomic.AtomicInteger();
+    private static final VarHandle S_BE = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.BIG_ENDIAN);
+    private static final VarHandle S_LE = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I_BE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN);
+    private static final VarHandle I_LE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle L_BE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
+    private static final VarHandle L_LE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+    private static final VarHandle I_NATIVE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.nativeOrder());
+    private static final VarHandle L_NATIVE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
 
+    /**
+     * Index in every chunk array of the chunk's first byte. Atomic accesses through a byte-array
+     * view need the element's host address to be aligned; arrays are 8-byte aligned objects but
+     * their first element need not be (it depends on the object header layout), so each chunk
+     * starts at the index that is.
+     */
+    static final int BIAS = alignedBias();
+
+    /** The RAM: guest byte {@code a} is {@code chunks[a >>> CHUNK_SHIFT][BIAS + (a & CHUNK_MASK)]}. */
+    private final byte[][] chunks;
+
+    /**
+     * Allocate {@code size} bytes of zeroed guest RAM.
+     *
+     * @throws IllegalArgumentException if {@code size} is negative or too large to track
+     * @throws OutOfMemoryError if the Java heap cannot accommodate the RAM
+     */
     public PhysicalMemory(long size) {
-        this.size = size;
-        this.ram = Arena.ofAuto().allocate(size, 4096);
-        int pages = (int) Math.min(Integer.MAX_VALUE - 8, (size + 4095) >>> CODE_PAGE_SHIFT);
-        this.codePages = new byte[pages];
-        this.codeGens = new int[pages];
+        super(size);
+        int n = (int) ((size + CHUNK_MASK) >>> CHUNK_SHIFT);
+        this.chunks = new byte[n][];
+        try {
+            for (int c = 0; c < n; c++) {
+                chunks[c] = new byte[BIAS + (int) Math.min(CHUNK_SIZE, size - ((long) c << CHUNK_SHIFT))];
+            }
+        } catch (OutOfMemoryError e) {
+            Arrays.fill(chunks, null);
+            OutOfMemoryError err = new OutOfMemoryError("cannot allocate " + (size >> 20)
+                    + " MiB of guest RAM on the Java heap (maximum heap " + (Runtime.getRuntime().maxMemory() >> 20)
+                    + " MiB): on Java 21 guest RAM is held on the heap, so the JVM's -Xmx must exceed the guest RAM"
+                    + " of all machines alive at once by the emulator's own needs (about 1 GiB), or run on Java 22"
+                    + " or later, where RAM is off-heap");
+            err.initCause(e);
+            throw err;
+        }
     }
 
-    public long size() {
-        return size;
+    /** The smallest index of a {@code byte[]} at which 8-byte atomic view accesses are aligned. */
+    private static int alignedBias() {
+        byte[] probe = new byte[16];
+        for (int b = 0; b < 8; b++) {
+            try {
+                L_NATIVE.compareAndSet(probe, b, 0L, 0L);
+                return b;
+            } catch (IllegalStateException e) {
+                // misaligned: try the next index
+            } catch (UnsupportedOperationException e) {
+                break;
+            }
+        }
+        throw new ExceptionInInitializerError("this JVM has no atomic access to byte arrays; on Java 22 and later the"
+                + " multi-release jar provides the MemorySegment version of PhysicalMemory");
     }
 
-    public boolean contains(long addr, long len) {
-        return addr >= 0 && len >= 0 && addr <= size - len;
+    /**
+     * For javapower's own execution engines only, not part of the supported API: the object
+     * holding the RAM, whose type depends on the Java version. Here it is the {@code byte[][]}
+     * chunks: guest byte {@code a} is element {@code b + (a & (2^30 - 1))} of chunk
+     * {@code a >>> 30}, where {@code b} is the smallest index of a {@code byte[]} at which 8-byte
+     * atomic byte-array view accesses are aligned (0 on HotSpot's usual object layout). Writes
+     * made through it bypass code-write tracking.
+     */
+    @Override
+    public Object jitBacking() {
+        return chunks;
     }
 
-    /** The backing segment, for engines that want to inline accesses. */
-    public MemorySegment segment() {
-        return ram;
+    /** The chunk holding guest address {@code a}; out of range throws (negative addresses included). */
+    private byte[] chunk(long a) {
+        return chunks[(int) Math.min(a >>> CHUNK_SHIFT, Integer.MAX_VALUE)];
     }
 
-    public int read8(long a) { return ram.get(ValueLayout.JAVA_BYTE, a) & 0xff; }
-    public int read16be(long a) { return ram.get(S_BE, a) & 0xffff; }
-    public int read16le(long a) { return ram.get(S_LE, a) & 0xffff; }
-    public int read32be(long a) { return ram.get(I_BE, a); }
-    public int read32le(long a) { return ram.get(I_LE, a); }
-    public long read64be(long a) { return ram.get(L_BE, a); }
-    public long read64le(long a) { return ram.get(L_LE, a); }
+    /** Whether an {@code n}-byte access at {@code a} crosses into the next chunk. */
+    private static boolean straddles(long a, int n) {
+        return ((int) a & CHUNK_MASK) > CHUNK_SIZE - n;
+    }
 
-    public void write8(long a, int v) { ram.set(ValueLayout.JAVA_BYTE, a, (byte) v); wrote(a, 1); }
-    public void write16be(long a, int v) { ram.set(S_BE, a, (short) v); wrote(a, 2); }
-    public void write16le(long a, int v) { ram.set(S_LE, a, (short) v); wrote(a, 2); }
-    public void write32be(long a, int v) { ram.set(I_BE, a, v); wrote(a, 4); }
-    public void write32le(long a, int v) { ram.set(I_LE, a, v); wrote(a, 4); }
-    public void write64be(long a, long v) { ram.set(L_BE, a, v); wrote(a, 8); }
-    public void write64le(long a, long v) { ram.set(L_LE, a, v); wrote(a, 8); }
+    private static int index(long a) {
+        return BIAS + ((int) a & CHUNK_MASK);
+    }
+
+    /** {@code n} bytes at {@code a} as a big-endian value, byte by byte (for chunk-straddling accesses). */
+    private long slowReadBe(long a, int n) {
+        long v = 0;
+        for (int k = 0; k < n; k++) {
+            v = (v << 8) | (chunk(a + k)[index(a + k)] & 0xff);
+        }
+        return v;
+    }
+
+    private void slowWriteBe(long a, int n, long v) {
+        checkRange(a, n);
+        for (int k = n - 1; k >= 0; k--, v >>>= 8) {
+            chunk(a + k)[index(a + k)] = (byte) v;
+        }
+    }
+
+    public int read8(long a) {
+        return chunk(a)[index(a)] & 0xff;
+    }
+
+    public int read16be(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 2) ? (int) slowReadBe(a, 2) : (short) S_BE.get(c, index(a)) & 0xffff;
+    }
+
+    public int read16le(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 2) ? Short.reverseBytes((short) slowReadBe(a, 2)) & 0xffff
+                : (short) S_LE.get(c, index(a)) & 0xffff;
+    }
+
+    public int read32be(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 4) ? (int) slowReadBe(a, 4) : (int) I_BE.get(c, index(a));
+    }
+
+    public int read32le(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 4) ? Integer.reverseBytes((int) slowReadBe(a, 4)) : (int) I_LE.get(c, index(a));
+    }
+
+    public long read64be(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 8) ? slowReadBe(a, 8) : (long) L_BE.get(c, index(a));
+    }
+
+    public long read64le(long a) {
+        byte[] c = chunk(a);
+        return straddles(a, 8) ? Long.reverseBytes(slowReadBe(a, 8)) : (long) L_LE.get(c, index(a));
+    }
+
+    public void write8(long a, int v) {
+        chunk(a)[index(a)] = (byte) v;
+        wrote(a, 1);
+    }
+
+    public void write16be(long a, int v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 2)) {
+            slowWriteBe(a, 2, v);
+        } else {
+            S_BE.set(c, index(a), (short) v);
+        }
+        wrote(a, 2);
+    }
+
+    public void write16le(long a, int v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 2)) {
+            slowWriteBe(a, 2, Short.reverseBytes((short) v));
+        } else {
+            S_LE.set(c, index(a), (short) v);
+        }
+        wrote(a, 2);
+    }
+
+    public void write32be(long a, int v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 4)) {
+            slowWriteBe(a, 4, v);
+        } else {
+            I_BE.set(c, index(a), v);
+        }
+        wrote(a, 4);
+    }
+
+    public void write32le(long a, int v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 4)) {
+            slowWriteBe(a, 4, Integer.reverseBytes(v));
+        } else {
+            I_LE.set(c, index(a), v);
+        }
+        wrote(a, 4);
+    }
+
+    public void write64be(long a, long v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 8)) {
+            slowWriteBe(a, 8, v);
+        } else {
+            L_BE.set(c, index(a), v);
+        }
+        wrote(a, 8);
+    }
+
+    public void write64le(long a, long v) {
+        byte[] c = chunk(a);
+        if (straddles(a, 8)) {
+            slowWriteBe(a, 8, Long.reverseBytes(v));
+        } else {
+            L_LE.set(c, index(a), v);
+        }
+        wrote(a, 8);
+    }
 
     public void read(long addr, byte[] dst, int off, int len) {
-        MemorySegment.copy(ram, ValueLayout.JAVA_BYTE, addr, dst, off, len);
+        checkRange(addr, len);
+        java.util.Objects.checkFromIndexSize(off, len, dst.length);
+        while (len > 0) {
+            int n = (int) Math.min(len, CHUNK_SIZE - (addr & CHUNK_MASK));
+            System.arraycopy(chunk(addr), index(addr), dst, off, n);
+            addr += n;
+            off += n;
+            len -= n;
+        }
     }
 
     public void write(long addr, byte[] src, int off, int len) {
-        MemorySegment.copy(src, off, ram, ValueLayout.JAVA_BYTE, addr, len);
+        checkRange(addr, len);
+        java.util.Objects.checkFromIndexSize(off, len, src.length);
+        long a = addr;
+        int o = off;
+        int left = len;
+        while (left > 0) {
+            int n = (int) Math.min(left, CHUNK_SIZE - (a & CHUNK_MASK));
+            System.arraycopy(src, o, chunk(a), index(a), n);
+            a += n;
+            o += n;
+            left -= n;
+        }
         if (len > 0) {
             wroteRange(addr, len);
         }
     }
 
     public void fill(long addr, long len, byte value) {
-        ram.asSlice(addr, len).fill(value);
+        checkRange(addr, len);
+        long a = addr;
+        long left = len;
+        while (left > 0) {
+            int n = (int) Math.min(left, CHUNK_SIZE - (a & CHUNK_MASK));
+            Arrays.fill(chunk(a), index(a), index(a) + n, value);
+            a += n;
+            left -= n;
+        }
         if (len > 0) {
             wroteRange(addr, len);
         }
     }
 
-    // ---- code-write tracking (see the class comment) ------------------------------------------
+    // ---- raw primitives for the compare-and-swaps (aligned accesses never straddle a chunk) ----
 
-    /** log2 of the code-write tracking granule (4 KiB). */
-    public static final int CODE_PAGE_SHIFT = 12;
-    private static final java.lang.invoke.VarHandle CODE_PAGE =
-            java.lang.invoke.MethodHandles.arrayElementVarHandle(byte[].class);
-    private static final java.lang.invoke.VarHandle CODE_GEN =
-            java.lang.invoke.MethodHandles.arrayElementVarHandle(int[].class);
-
-    /**
-     * Flag the page holding real address {@code addr} as holding translated code and return its
-     * code generation. Call before reading the code to translate; the translation is current
-     * while {@link #codeGeneration} returns the value returned here. A full fence: the flag is
-     * visible to other threads before any later read of the code.
-     */
-    public int watchCode(long addr) {
-        int p = (int) (addr >>> CODE_PAGE_SHIFT);
-        CODE_PAGE.setVolatile(codePages, p, (byte) 1);
-        java.lang.invoke.VarHandle.fullFence();
-        return (int) CODE_GEN.getVolatile(codeGens, p);
+    @Override
+    boolean casNative32(long a, int expect, int update) {
+        return I_NATIVE.compareAndSet(chunk(a), index(a), expect, update);
     }
 
-    /** The code generation of the page holding real address {@code addr} (a plain read). */
-    public int codeGeneration(long addr) {
-        return codeGens[(int) (addr >>> CODE_PAGE_SHIFT)];
+    @Override
+    boolean casNative64(long a, long expect, long update) {
+        return L_NATIVE.compareAndSet(chunk(a), index(a), expect, update);
     }
 
-    /**
-     * A counter advanced after every advance of any page's code generation. While it has not
-     * changed, no page's generation has: an engine that checked its code against the page
-     * generations when the counter had some value may skip the check while it still has it.
-     * A volatile read.
-     */
-    public int codeWriteCount() {
-        return codeWrites.get();
-    }
-
-    /** Whether the page holding real address {@code addr} is flagged as holding translated code. */
-    public boolean isCodePage(long addr) {
-        return codePages[(int) (addr >>> CODE_PAGE_SHIFT)] != 0;
-    }
-
-    /**
-     * Advance the code generation of every page that {@code [addr, addr + len)} touches, flagged
-     * or not, and clear their flags: translations of code in them are no longer current. For
-     * writes made to {@link #segment} directly and for instruction-cache invalidation.
-     */
-    public void invalidateCode(long addr, long len) {
-        if (len <= 0) {
-            return;
-        }
-        int last = (int) ((addr + len - 1) >>> CODE_PAGE_SHIFT);
-        for (int p = (int) (addr >>> CODE_PAGE_SHIFT); p <= last; p++) {
-            codePages[p] = 0;
-            CODE_GEN.getAndAdd(codeGens, p, 1);
-        }
-        codeWrites.incrementAndGet();
-    }
-
-    /** After a write of {@code n} (1..8) bytes at {@code a}: advance the generation of flagged pages. */
-    private void wrote(long a, int n) {
-        byte[] cp = codePages;
-        int p0 = (int) (a >>> CODE_PAGE_SHIFT);
-        int p1 = (int) ((a + n - 1) >>> CODE_PAGE_SHIFT);
-        if ((cp[p0] | cp[p1]) != 0) {
-            codeWritten(p0, p1);
-        }
-    }
-
-    private void wroteRange(long a, long len) {
-        byte[] cp = codePages;
-        int last = (int) ((a + len - 1) >>> CODE_PAGE_SHIFT);
-        for (int p = (int) (a >>> CODE_PAGE_SHIFT); p <= last; p++) {
-            if (cp[p] != 0) {
-                codeWritten(p, last);
-                return;
-            }
-        }
-    }
-
-    private void codeWritten(int first, int last) {
-        for (int p = first; p <= last; p++) {
-            if (codePages[p] != 0) {
-                codePages[p] = 0;
-                CODE_GEN.getAndAdd(codeGens, p, 1);
-            }
-        }
-        codeWrites.incrementAndGet();
-    }
-
-    // ---- atomic compare-and-swap, for store-conditional and atomic memory operations ----------
-    //
-    // Each compares the naturally aligned value at {@code a} (interpreted in the stated byte
-    // order) with {@code expect} and, if equal, replaces it with {@code update}, atomically with
-    // respect to every other compare-and-swap and to plain accesses of the same bytes from other
-    // threads. They are full memory barriers. Returns whether the swap happened. A misaligned
-    // address throws IllegalArgumentException. The 8- and 16-bit forms swap the enclosing aligned
-    // word and retry if only its other bytes changed.
-
-    private static final ValueLayout.OfInt I_NATIVE = ValueLayout.JAVA_INT;
-    private static final ValueLayout.OfLong L_NATIVE = ValueLayout.JAVA_LONG;
-    private static final java.lang.invoke.VarHandle I_VH = I_NATIVE.varHandle();
-    private static final java.lang.invoke.VarHandle L_VH = L_NATIVE.varHandle();
-    private static final boolean NATIVE_BE = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
-
-    private static void checkAligned(long a, int size) {
-        if ((a & (size - 1)) != 0) {
-            throw new IllegalArgumentException("misaligned " + size + "-byte atomic access at 0x" + Long.toHexString(a));
-        }
-    }
-
-    private boolean casRaw32(long a, int expectRaw, int updateRaw) {
-        boolean ok = (boolean) I_VH.compareAndSet(ram, a, expectRaw, updateRaw);
-        if (ok) {
-            wrote(a, 4);
-        }
-        return ok;
-    }
-
-    private boolean casRaw64(long a, long expectRaw, long updateRaw) {
-        boolean ok = (boolean) L_VH.compareAndSet(ram, a, expectRaw, updateRaw);
-        if (ok) {
-            wrote(a, 8);
-        }
-        return ok;
-    }
-
-    public boolean cas32be(long a, int expect, int update) {
-        checkAligned(a, 4);
-        return NATIVE_BE ? casRaw32(a, expect, update)
-                : casRaw32(a, Integer.reverseBytes(expect), Integer.reverseBytes(update));
-    }
-
-    public boolean cas32le(long a, int expect, int update) {
-        checkAligned(a, 4);
-        return NATIVE_BE ? casRaw32(a, Integer.reverseBytes(expect), Integer.reverseBytes(update))
-                : casRaw32(a, expect, update);
-    }
-
-    public boolean cas64be(long a, long expect, long update) {
-        checkAligned(a, 8);
-        return NATIVE_BE ? casRaw64(a, expect, update)
-                : casRaw64(a, Long.reverseBytes(expect), Long.reverseBytes(update));
-    }
-
-    public boolean cas64le(long a, long expect, long update) {
-        checkAligned(a, 8);
-        return NATIVE_BE ? casRaw64(a, Long.reverseBytes(expect), Long.reverseBytes(update))
-                : casRaw64(a, expect, update);
-    }
-
-    /** Byte compare-and-swap ({@code expect} and {@code update} are taken modulo 256). */
-    public boolean cas8(long a, int expect, int update) {
-        return casSub(a & ~3L, (int) (a & 3) * 8, 0xff, expect, update);
-    }
-
-    public boolean cas16be(long a, int expect, int update) {
-        checkAligned(a, 2);
-        return casSub(a & ~3L, (int) (a & 3) * 8, 0xffff, Short.reverseBytes((short) expect) & 0xffff,
-                Short.reverseBytes((short) update) & 0xffff);
-    }
-
-    public boolean cas16le(long a, int expect, int update) {
-        checkAligned(a, 2);
-        return casSub(a & ~3L, (int) (a & 3) * 8, 0xffff, expect, update);
-    }
-
-    /**
-     * Swap the field of {@code mask} at byte offset {@code bitOff / 8} of the aligned word at
-     * {@code w}. The field values are given in memory (little-endian byte) order.
-     */
-    private boolean casSub(long w, int bitOff, int mask, int expect, int update) {
-        // Work on the word as a little-endian value so byte k of memory is bits 8k..8k+7.
-        expect &= mask;
-        update &= mask;
-        while (true) {
-            int raw = (int) I_VH.getVolatile(ram, w);
-            int le = NATIVE_BE ? Integer.reverseBytes(raw) : raw;
-            if (((le >>> bitOff) & mask) != expect) {
-                return false;
-            }
-            int nle = (le & ~(mask << bitOff)) | (update << bitOff);
-            int nraw = NATIVE_BE ? Integer.reverseBytes(nle) : nle;
-            if (casRaw32(w, raw, nraw)) {
-                return true;
-            }
-        }
+    @Override
+    int getVolatileNative32(long a) {
+        return (int) I_NATIVE.getVolatile(chunk(a), index(a));
     }
 }

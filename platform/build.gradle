@@ -1,4 +1,8 @@
-// Guest RAM is off-heap; several machines may be alive at once in a test JVM.
-test {
+// Several machines (up to 2 GiB of RAM each) may be alive at once in a test JVM. Guest RAM is on
+// the heap on Java 21 (`test`) and off-heap direct memory on Java 22 and later (`test27`).
+tasks.named('test') {
+    maxHeapSize = '20g'
+}
+tasks.withType(Test).configureEach {
     jvmArgs '-XX:MaxDirectMemorySize=16g'
 }

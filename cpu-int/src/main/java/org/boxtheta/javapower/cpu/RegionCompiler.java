@@ -4,16 +4,7 @@ import static java.lang.constant.ConstantDescs.CD_boolean;
 import static java.lang.constant.ConstantDescs.CD_int;
 import static java.lang.constant.ConstantDescs.CD_long;
 import static java.lang.constant.ConstantDescs.CD_void;
-import static java.lang.constant.ConstantDescs.INIT_NAME;
-import static java.lang.constant.ConstantDescs.MTD_void;
 
-import java.lang.classfile.ClassFile;
-import java.lang.classfile.ClassModel;
-import java.lang.classfile.CodeBuilder;
-import java.lang.classfile.Label;
-import java.lang.classfile.MethodModel;
-import java.lang.classfile.TypeKind;
-import java.lang.classfile.attribute.CodeAttribute;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
 import java.lang.constant.DynamicConstantDesc;
@@ -31,6 +22,7 @@ import java.util.TreeMap;
 import org.boxtheta.javapower.core.Op;
 import org.boxtheta.javapower.core.PhysicalMemory;
 import org.boxtheta.javapower.core.Spr;
+import org.boxtheta.javapower.cpu.internal.asm.Label;
 
 /**
  * The second compilation tier: translates a <em>region</em> of guest code (every basic block
@@ -115,9 +107,8 @@ final class RegionCompiler {
     private static final ClassDesc CD_INTERP = ClassDesc.of("org.boxtheta.javapower.cpu.Interpreter");
     private static final ClassDesc CD_MMU = ClassDesc.of("org.boxtheta.javapower.cpu.RadixMmu");
     private static final ClassDesc CD_RT = ClassDesc.of("org.boxtheta.javapower.cpu.JitRt");
-    private static final ClassDesc CD_BASE = ClassDesc.of("org.boxtheta.javapower.cpu.CompiledBlock");
+    private static final ClassDesc CD_RAM_ACCESS = ClassDesc.of("org.boxtheta.javapower.cpu.RamAccess");
     private static final ClassDesc CD_REGION = ClassDesc.of("org.boxtheta.javapower.cpu.Region");
-    private static final ClassDesc CD_SEG = ClassDesc.of("java.lang.foreign.MemorySegment");
     private static final ClassDesc CD_LONG = ClassDesc.of("java.lang.Long");
     private static final ClassDesc CD_INT = ClassDesc.of("java.lang.Integer");
     private static final ClassDesc CD_MATH = ClassDesc.of("java.lang.Math");
@@ -136,11 +127,11 @@ final class RegionCompiler {
     private static final MethodTypeDesc MTD_CMP = MethodTypeDesc.of(CD_int, CD_int, CD_int, CD_long, CD_long, CD_int);
     private static final MethodTypeDesc MTD_XLATE =
             MethodTypeDesc.of(CD_long, CD_LARR, CD_LARR, CD_IARR, CD_long, CD_int, CD_int, CD_int);
-    private static final MethodTypeDesc MTD_LD = MethodTypeDesc.of(CD_long, CD_SEG, CD_long);
-    private static final MethodTypeDesc MTD_ST = MethodTypeDesc.of(CD_void, CD_SEG, CD_long, CD_long);
+    private static final MethodTypeDesc MTD_LD = MethodTypeDesc.of(CD_long, RamAccess.TYPE, CD_long);
+    private static final MethodTypeDesc MTD_ST =
+            MethodTypeDesc.of(CD_boolean, RamAccess.TYPE, CD_PM, CD_long, CD_long, CD_long);
     private static final MethodTypeDesc MTD_RD = MethodTypeDesc.of(CD_long, CD_MMU, CD_long);
     private static final MethodTypeDesc MTD_WR = MethodTypeDesc.of(CD_void, CD_MMU, CD_long, CD_long);
-    private static final MethodTypeDesc MTD_STORED = MethodTypeDesc.of(CD_boolean, CD_PM, CD_long, CD_int, CD_long);
     private static final MethodTypeDesc MTD_MFOCRF = MethodTypeDesc.of(CD_long, CD_int, CD_int, CD_long);
 
     // Basic block terminators.
@@ -257,7 +248,7 @@ final class RegionCompiler {
         }
         Gen g = new Gen(ea, pa, mode, bbs, entry, pm);
         byte[] bytes = g.build();
-        if (codeLength(bytes) > MAX_CODE) {
+        if (g.cb.codeLength() > MAX_CODE) {
             return null;
         }
         CompiledBlock code;
@@ -270,16 +261,6 @@ final class RegionCompiler {
             throw new IllegalStateException("cannot define compiled region", e);
         }
         return new Result(code, entry.insns.size(), total, lo, hi);
-    }
-
-    private static int codeLength(byte[] bytes) {
-        ClassModel cm = ClassFile.of().parse(bytes);
-        for (MethodModel m : cm.methods()) {
-            if (m.methodName().equalsString("run")) {
-                return m.findAttribute(java.lang.classfile.Attributes.code()).map(CodeAttribute::codeLength).orElse(0);
-            }
-        }
-        return 0;
     }
 
     // ================================================================== discovery
@@ -677,7 +658,7 @@ final class RegionCompiler {
         final List<Long> sitePc = new ArrayList<>();
         final List<Integer> siteOff = new ArrayList<>();
 
-        CodeBuilder cb;
+        CodeEmitter cb;
         long used;
         long written;
         boolean hasMem;
@@ -704,7 +685,7 @@ final class RegionCompiler {
         Label tail;
         final List<Runnable> stubs = new ArrayList<>();
 
-        static final int CD_SEG_IDX = 0;
+        static final int CD_RAM_IDX = 0;
         static final int CD_PM_IDX = 1;
         static final int CD_PCS_IDX = 2;
         static final int CD_OFFS_IDX = 3;
@@ -720,7 +701,7 @@ final class RegionCompiler {
             this.bbs = bbs;
             this.entry = entry;
             this.pm = pm;
-            classData.add(pm.segment());
+            classData.add(RamAccess.backing(pm));
             classData.add(pm);
             classData.add(null); // site pcs, filled in after generation
             classData.add(null); // site offsets
@@ -737,17 +718,9 @@ final class RegionCompiler {
                 }
             }
             dataflow();
-            byte[] bytes = ClassFile.of().build(CD_REGION, clb -> {
-                clb.withFlags(ClassFile.ACC_FINAL | ClassFile.ACC_SYNTHETIC);
-                clb.withSuperclass(CD_BASE);
-                clb.withMethodBody(INIT_NAME, MTD_void, 0, c -> c.aload(0).invokespecial(CD_BASE, INIT_NAME, MTD_void)
-                        .return_());
-                clb.withMethodBody("run", MTD_RUN, ClassFile.ACC_FINAL, c -> {
-                    cb = c;
-                    body();
-                });
-            });
-            return bytes;
+            cb = new CodeEmitter(CD_REGION, MTD_RUN);
+            body();
+            return cb.finish();
         }
 
         // ---------------------------------------------------------- dataflow
@@ -812,25 +785,25 @@ final class RegionCompiler {
         }
 
         void allocLocals() {
-            gprs = cb.allocateLocal(TypeKind.REFERENCE);
-            pb = cb.allocateLocal(TypeKind.LONG);
+            gprs = cb.allocateLocal(CodeEmitter.REFERENCE);
+            pb = cb.allocateLocal(CodeEmitter.LONG);
             for (int v = 0; v < NVAL; v++) {
-                slot[v] = (used & g(v)) != 0 ? cb.allocateLocal(isInt(v) ? TypeKind.INT : TypeKind.LONG) : -1;
+                slot[v] = (used & g(v)) != 0 ? cb.allocateLocal(isInt(v) ? CodeEmitter.INT : CodeEmitter.LONG) : -1;
             }
-            ic = cb.allocateLocal(TypeKind.LONG);
-            end = cb.allocateLocal(TypeKind.LONG);
-            npc = cb.allocateLocal(TypeKind.LONG);
-            at = cb.allocateLocal(TypeKind.INT);
-            wb = cb.allocateLocal(TypeKind.INT);
-            tEa = cb.allocateLocal(TypeKind.LONG);
-            tPa = cb.allocateLocal(TypeKind.LONG);
-            tV = cb.allocateLocal(TypeKind.LONG);
-            tHit = cb.allocateLocal(TypeKind.INT);
+            ic = cb.allocateLocal(CodeEmitter.LONG);
+            end = cb.allocateLocal(CodeEmitter.LONG);
+            npc = cb.allocateLocal(CodeEmitter.LONG);
+            at = cb.allocateLocal(CodeEmitter.INT);
+            wb = cb.allocateLocal(CodeEmitter.INT);
+            tEa = cb.allocateLocal(CodeEmitter.LONG);
+            tPa = cb.allocateLocal(CodeEmitter.LONG);
+            tV = cb.allocateLocal(CodeEmitter.LONG);
+            tHit = cb.allocateLocal(CodeEmitter.INT);
             if (hasMem) {
-                mmu = cb.allocateLocal(TypeKind.REFERENCE);
-                tag = cb.allocateLocal(TypeKind.REFERENCE);
-                addend = cb.allocateLocal(TypeKind.REFERENCE);
-                epoch = cb.allocateLocal(TypeKind.REFERENCE);
+                mmu = cb.allocateLocal(CodeEmitter.REFERENCE);
+                tag = cb.allocateLocal(CodeEmitter.REFERENCE);
+                addend = cb.allocateLocal(CodeEmitter.REFERENCE);
+                epoch = cb.allocateLocal(CodeEmitter.REFERENCE);
             }
         }
 
@@ -986,18 +959,12 @@ final class RegionCompiler {
         // ---------------------------------------------------------- method body
 
         void body() {
-            // The class file builder may run this more than once: start from scratch.
-            sitePc.clear();
-            siteOff.clear();
-            stubs.clear();
-            while (classData.size() > 4) {
-                classData.remove(classData.size() - 1);
-            }
             allocLocals();
             tail = cb.newLabel();
             Label fault = cb.newLabel();
             Label tryStart = cb.newLabel();
             Label tryEnd = cb.newLabel();
+            cb.exceptionCatch(tryStart, tryEnd, fault, CD_PPCEX);
             for (BB b : bbs.values()) {
                 b.label = cb.newLabel();
             }
@@ -1041,7 +1008,7 @@ final class RegionCompiler {
             cb.iconst_0().ireturn();
             // Fault: write back, then pc/icount of the faulting instruction, then deliver.
             cb.labelBinding(fault);
-            int ex = cb.allocateLocal(TypeKind.REFERENCE);
+            int ex = cb.allocateLocal(CodeEmitter.REFERENCE);
             cb.astore(ex);
             Label noWb = cb.newLabel();
             cb.iload(wb).ifeq(noWb);
@@ -1066,7 +1033,6 @@ final class RegionCompiler {
             cb.iload(at).iaload().i2l().ladd().putfield(CD_CPU, "icount", CD_long);
             cb.aload(2).aload(ex).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
             cb.iconst_1().ireturn();
-            cb.exceptionCatch(tryStart, tryEnd, fault, CD_PPCEX);
         }
 
         /** Leave the region: write back dirty values, set npc from the stack (a long), go to the tail. */
@@ -1761,8 +1727,8 @@ final class RegionCompiler {
             }
             cb.dup2().lstore(tPa).loadConstant(-1L).lcmp().ifeq(slow);
             if (!m.store) {
-                cdConst(CD_SEG_IDX, CD_SEG);
-                cb.lload(tPa).invokestatic(CD_RT, "ld" + sfx, MTD_LD);
+                cdConst(CD_RAM_IDX, RamAccess.TYPE);
+                cb.lload(tPa).invokestatic(CD_RAM_ACCESS, "ld" + sfx, MTD_LD);
                 cb.labelBinding(done);
                 // stack: raw value (zero-extended for 8/16, sign-extended 32, 64)
                 if (m.size == 4 && !m.sign) {
@@ -1792,11 +1758,9 @@ final class RegionCompiler {
                     cb.goto_(done);
                 });
             } else {
-                cdConst(CD_SEG_IDX, CD_SEG);
-                cb.lload(tPa).lload(tV).invokestatic(CD_RT, "st" + sfx, MTD_ST);
+                cdConst(CD_RAM_IDX, RamAccess.TYPE);
                 cdConst(CD_PM_IDX, CD_PM);
-                cb.lload(tPa).loadConstant(m.size).loadConstant(pagePa).invokestatic(CD_RT, "storedCode",
-                        MTD_STORED);
+                cb.lload(tPa).lload(tV).loadConstant(pagePa).invokestatic(CD_RAM_ACCESS, "st" + sfx, MTD_ST);
                 cb.istore(tHit);
                 cb.labelBinding(done);
                 if (m.update) {

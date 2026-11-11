@@ -1,26 +1,14 @@
 package org.boxtheta.javapower.cpu;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.ByteOrder;
-
-import org.boxtheta.javapower.core.PhysicalMemory;
-
 /**
  * Small static helpers called by code {@link RegionCompiler} generates. They are written so the
  * JIT inlines them into the region's method: value computations whose operands are guest
- * registers held in JVM locals, the software TLB's hit path, and raw guest RAM accesses.
+ * registers held in JVM locals and the software TLB's hit path (guest RAM accesses are in
+ * {@link RamAccess}).
  * Semantics mirror the instruction handlers ({@link Alu}, {@link LoadStore}) exactly.
  */
 final class JitRt {
     private JitRt() {}
-
-    private static final ValueLayout.OfShort S_BE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfShort S_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfInt I_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfInt I_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfLong L_BE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfLong L_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private static final int TLB_MASK = (1 << RadixMmu.TLB_BITS) - 1;
 
@@ -49,78 +37,6 @@ final class JitRt {
     static long real(long ea, long limit) {
         long pa = ea & 0x0FFFFFFFFFFFFFFFL;
         return pa > limit ? -1 : pa;
-    }
-
-    // ------------------------------------------------------------------ raw RAM
-
-    static long ld8(MemorySegment m, long pa) {
-        return m.get(ValueLayout.JAVA_BYTE, pa) & 0xffL;
-    }
-
-    static long ld16le(MemorySegment m, long pa) {
-        return m.get(S_LE, pa) & 0xffffL;
-    }
-
-    static long ld16be(MemorySegment m, long pa) {
-        return m.get(S_BE, pa) & 0xffffL;
-    }
-
-    /** Sign-extended; callers zero-extend where the instruction does. */
-    static long ld32le(MemorySegment m, long pa) {
-        return m.get(I_LE, pa);
-    }
-
-    static long ld32be(MemorySegment m, long pa) {
-        return m.get(I_BE, pa);
-    }
-
-    static long ld64le(MemorySegment m, long pa) {
-        return m.get(L_LE, pa);
-    }
-
-    static long ld64be(MemorySegment m, long pa) {
-        return m.get(L_BE, pa);
-    }
-
-    static void st8(MemorySegment m, long pa, long v) {
-        m.set(ValueLayout.JAVA_BYTE, pa, (byte) v);
-    }
-
-    static void st16le(MemorySegment m, long pa, long v) {
-        m.set(S_LE, pa, (short) v);
-    }
-
-    static void st16be(MemorySegment m, long pa, long v) {
-        m.set(S_BE, pa, (short) v);
-    }
-
-    static void st32le(MemorySegment m, long pa, long v) {
-        m.set(I_LE, pa, (int) v);
-    }
-
-    static void st32be(MemorySegment m, long pa, long v) {
-        m.set(I_BE, pa, (int) v);
-    }
-
-    static void st64le(MemorySegment m, long pa, long v) {
-        m.set(L_LE, pa, v);
-    }
-
-    static void st64be(MemorySegment m, long pa, long v) {
-        m.set(L_BE, pa, v);
-    }
-
-    /**
-     * After a direct store of {@code size} bytes at {@code pa}: tell {@code pm} if the page holds
-     * translated code, and return whether the region must stop after this instruction (the store
-     * hit translated code, possibly its own page {@code page}).
-     */
-    static boolean storedCode(PhysicalMemory pm, long pa, int size, long page) {
-        boolean code = pm.isCodePage(pa);
-        if (code) {
-            pm.invalidateCode(pa, size);
-        }
-        return code || ((pa ^ page) >>> 12) == 0;
     }
 
     // ------------------------------------------------------------------ MMU slow paths

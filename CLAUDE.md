@@ -39,7 +39,16 @@ The emulator is published as a library as well as a CLI. Maven coordinates are
 
 ## Conventions
 
-- Java 25 language level, no runtime dependencies. JUnit 5 for tests. `-Werror` is on.
+- Java 21 language level (`--release 21`, JDK 21 toolchain); tests run on JDK 21 and JDK 27
+  (`test27`). JUnit 5 for tests. `-Werror` is on.
+- `core` and `cpu-int` are multi-release jars: `src/main/java22` (compiled `--release 22`) holds
+  the `MemorySegment` versions of `PhysicalMemory` and `cpu.RamAccess`; the Java 21 versions keep
+  RAM in heap `byte[]` chunks (atomic CAS on byte-array views works on JDK 21, not on 27). Only classes that must differ go there, with the same public API (checked
+  by `validateMultiRelease`). Change both versions together; `test` covers the 21 one, `test27`
+  the 22 one.
+- No runtime dependencies. The one bundled third-party library is ASM (BSD-3-Clause), relocated
+  at build time into `org.boxtheta.javapower.cpu.internal.asm` inside the `cpu-int` jar; the JIT
+  generates bytecode with it. Don't add others, and keep ASM out of published POMs.
 - Comments use ISA bit numbering (bit 0 = MSB) and say so; code uses Java shifts.
 - Instruction handlers are stateless `Op`s registered into a `DecodeTable` through an `InsnSet`.
   They must raise `PpcException` before modifying state.
@@ -48,8 +57,9 @@ The emulator is published as a library as well as a CLI. Maven coordinates are
 
 ## Dev server
 
-All builds, tests and QEMU runs happen on `devserver.nodes.bxta.net` (Arch, 12 cores, JDK 27,
-Gradle, QEMU 11.1, clang/lld with PowerPC targets, gdb, dtc). Nothing is built locally.
+All builds, tests and QEMU runs happen on `devserver.nodes.bxta.net` (Arch, 12 cores, JDK 27 as
+the default and JDK 21 in `/usr/lib/jvm/java-21-openjdk`, Gradle, QEMU 11.1, clang/lld with
+PowerPC targets, gdb, dtc). Nothing is built locally.
 
 - `scripts/remote.sh <workspace> <command...>` rsyncs this checkout to `~/javapower/work/<workspace>`
   on the server and runs the command there. Use your own workspace name so parallel builds don't

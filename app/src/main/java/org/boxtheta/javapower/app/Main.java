@@ -80,7 +80,14 @@ public final class Main {
             seed = DETERMINISTIC_SEED;
         }
 
-        try (Emulator emu = new Emulator(cfg, clock, clockScale, seed)) {
+        Emulator emulator;
+        try {
+            emulator = new Emulator(cfg, clock, clockScale, seed);
+        } catch (OutOfMemoryError e) {
+            System.err.println("javapower: " + e.getMessage());
+            return;
+        }
+        try (Emulator emu = emulator) {
             for (Interpreter interp : emu.interpreters()) {
                 int n = interp.state().index;
                 interp.icountShift = icountShift;

@@ -1,3 +1,9 @@
+// Shadow relocates the bundled ASM into cpu-int (see cpu-int/build.gradle); it is not applied
+// as a plugin, only its task type is used.
+plugins {
+    id 'com.gradleup.shadow' version '9.6.1' apply false
+}
+
 subprojects {
     apply plugin: 'java-library'
     apply plugin: 'maven-publish'
@@ -5,7 +11,9 @@ subprojects {
     version = '0.1.0-SNAPSHOT'
     repositories { mavenCentral() }
     java {
-        toolchain { languageVersion = JavaLanguageVersion.of(27) }
+        // Compiled and tested with JDK 21, the oldest supported runtime; `test27` also runs the
+        // tests on JDK 27.
+        toolchain { languageVersion = JavaLanguageVersion.of(21) }
         withSourcesJar()
         withJavadocJar()
     }
@@ -39,7 +47,7 @@ subprojects {
         }
     }
     tasks.withType(JavaCompile).configureEach {
-        options.release = 25
+        options.release = 21
         options.encoding = 'UTF-8'
         options.compilerArgs += ['-Xlint:all,-serial,-this-escape', '-Werror']
     }
@@ -48,15 +56,65 @@ subprojects {
         testImplementation 'org.junit.jupiter:junit-jupiter'
         testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     }
-    test {
+    tasks.withType(Test).configureEach {
         useJUnitPlatform()
         maxHeapSize = '4g'
-        testLogging { events 'failed'; exceptionFormat 'full' }
+        testLogging { events 'failed'; exceptionFormat = 'full' }
     }
+    // The same tests on JDK 27, as part of `check`.
+    def test27 = tasks.register('test27', Test) {
+        description = 'Runs the tests on JDK 27.'
+        group = 'verification'
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(27) }
+        shouldRunAfter tasks.named('test')
+    }
+    tasks.named('check') { dependsOn test27 }
     if (name != 'core') {
         dependencies { api project(':core') }
     }
 }
+// core and cpu-int are multi-release jars. src/main/java22 holds the few classes that differ on
+// Java 22 and later (guest RAM as a MemorySegment rather than heap arrays); they go to
+// META-INF/versions/22. `test` runs on Java 21 against the base classes, `test27` on JDK 27
+// against the versioned ones, and `validateMultiRelease` checks that both versions of each class
+// have the same public API.
+configure([project(':core'), project(':cpu-int')]) {
+    sourceSets {
+        java22 {
+            java { srcDirs = ['src/main/java22'] }
+            compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        }
+    }
+    tasks.named('compileJava22Java') {
+        javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(27) }
+        options.release = 22
+    }
+    tasks.named('jar') {
+        into('META-INF/versions/22') { from sourceSets.java22.output }
+        manifest { attributes('Multi-Release': 'true') }
+    }
+    tasks.named('sourcesJar') {
+        into('META-INF/versions/22') { from sourceSets.java22.allSource }
+    }
+    tasks.named('test27') {
+        classpath = sourceSets.java22.output + classpath
+    }
+    def validate = tasks.register('validateMultiRelease', Exec) {
+        description = 'Checks the multi-release jar with jar --validate.'
+        group = 'verification'
+        def jarFile = tasks.named('jar').flatMap { it.archiveFile }
+        def jdk = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(27) }
+        inputs.file(jarFile)
+        doFirst {
+            executable jdk.get().metadata.installationPath.file('bin/jar').asFile
+            args '--validate', '--file', jarFile.get().asFile
+        }
+    }
+    tasks.named('check') { dependsOn validate }
+}
+
 // The embedding entry point: one artifact that pulls in everything.
 project(':emulator') {
     dependencies {

@@ -13,6 +13,22 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 class EmulatorTest {
+    /**
+     * Here core and cpu-int come from their (multi-release) jars, as they do for embedders: the
+     * JVM picks the MemorySegment version of PhysicalMemory on Java 22 and later, the ByteBuffer
+     * one on Java 21.
+     */
+    @Test
+    void multiReleaseJarsMatchTheRunningJava() throws Exception {
+        Class<?> pm = org.boxtheta.javapower.core.PhysicalMemory.class;
+        assertTrue(pm.getProtectionDomain().getCodeSource().getLocation().getPath().endsWith(".jar"),
+                pm.getProtectionDomain().getCodeSource().getLocation().toString());
+        try (Emulator emu = new Emulator(new MachineConfig().ram(256L << 20).firmware(new byte[] {0x48, 0, 0, 0}))) {
+            String backing = emu.machine().memory().jitBacking().getClass().getName();
+            assertEquals(Runtime.version().feature() >= 22, backing.contains("MemorySegment"), backing);
+        }
+    }
+
     /** Stock SLOF must reach its banner; this exercises CPU, MMU-off paths, hcalls and the console. */
     @Test
     void slofPrintsBanner() throws Exception {

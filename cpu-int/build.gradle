@@ -1,0 +1,39 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+// The JIT generates bytecode with ASM, bundled rather than depended on: a Shadow task relocates
+// ASM's classes to org.boxtheta.javapower.cpu.internal.asm, the code compiles against that
+// relocated jar, and the published jar carries the relocated classes and ASM's license. The
+// relocated jar is a file dependency, so the published POM and module metadata do not mention
+// ASM.
+configurations {
+    asm {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+dependencies {
+    asm 'org.ow2.asm:asm:9.11.1'
+}
+
+def relocatedAsm = tasks.register('relocatedAsm', ShadowJar) {
+    description = 'Relocates ASM into org.boxtheta.javapower.cpu.internal.asm.'
+    archiveFileName = 'asm-relocated.jar'
+    destinationDirectory = layout.buildDirectory.dir('relocated-asm')
+    configurations = [project.configurations.asm]
+    relocate 'org.objectweb.asm', 'org.boxtheta.javapower.cpu.internal.asm'
+    exclude 'module-info.class'
+    exclude 'META-INF/**'
+}
+
+dependencies {
+    compileOnly files(relocatedAsm)
+    testRuntimeOnly files(relocatedAsm)
+}
+
+tasks.named('jar') {
+    from(zipTree(relocatedAsm.flatMap { it.archiveFile })) {
+        exclude 'META-INF/**'
+    }
+    from(file('LICENSE-ASM')) { into 'META-INF' }
+}

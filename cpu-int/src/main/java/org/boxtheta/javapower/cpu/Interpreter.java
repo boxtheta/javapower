@@ -1,8 +1,5 @@
 package org.boxtheta.javapower.cpu;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -128,9 +125,6 @@ public final class Interpreter {
         void onUnimplemented(CpuState s, long pc, int insn, String opcode);
     }
 
-    private static final ValueLayout.OfInt I_BE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-    private static final ValueLayout.OfInt I_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-
     /**
      * Second-level decode cache: entries indexed by a hash of the instruction word, two ways per
      * set. Sized for a whole Linux userland's worth of distinct instruction words: a miss costs
@@ -146,7 +140,6 @@ public final class Interpreter {
     final CpuState s;
     final RadixMmu mmu;
     private final PhysicalMemory pm;
-    private final MemorySegment seg;
     private final DecodeTable table;
     private final Clock clock;
     /** The CPUs this one shares time, TLB invalidation and wide atomics with. */
@@ -181,7 +174,7 @@ public final class Interpreter {
     /** Set by {@code wait}: idle until an interrupt is pending. */
     boolean waiting;
 
-    /** DETERMINISTIC clock only: virtual nanoseconds per instruction = 1 << icountShift. */
+    /** DETERMINISTIC clock only: virtual nanoseconds per instruction = {@code 1 << icountShift}. */
     public volatile int icountShift = 0;
     /** Optional per-instruction hook; null for full speed. */
     public volatile TraceHook trace;
@@ -252,7 +245,6 @@ public final class Interpreter {
         PhysicalMemory mem = domain.memory();
         this.s = s;
         this.pm = mem;
-        this.seg = mem.segment();
         this.table = table;
         this.domain = domain;
         this.clock = domain.clock();
@@ -623,7 +615,7 @@ public final class Interpreter {
                     continue;
                 }
             }
-            int insn = fetchLe ? seg.get(I_LE, pa) : seg.get(I_BE, pa);
+            int insn = fetchLe ? pm.read32le(pa) : pm.read32be(pa);
             int li = (int) (pa >>> 2) & ((1 << LCACHE_BITS) - 1);
             long entry = lcache[li];
             if ((int) (entry >>> 32) != insn) {
@@ -919,7 +911,7 @@ public final class Interpreter {
         final int n;
         /** First tier: the real address just past the block (the store guard's end). */
         final long paEnd;
-        /** The words the code covers, as raw memory (native-order ints) from rawPa. */
+        /** The words the code covers, as raw memory (little-endian ints) from rawPa. */
         final long rawPa;
         final int[] rawWords;
         /** Code generation of the page when the words were last known to be current. */
@@ -1117,18 +1109,16 @@ public final class Interpreter {
         int[] w = c.rawWords;
         long a = c.rawPa;
         for (int j = 0; j < w.length; j++) {
-            if (seg.get(ValueLayout.JAVA_INT_UNALIGNED, a + 4L * j) != w[j]) {
+            if (pm.read32le(a + 4L * j) != w[j]) {
                 return false;
             }
         }
         return true;
     }
 
-    private static final boolean NATIVE_LE = java.nio.ByteOrder.nativeOrder() == java.nio.ByteOrder.LITTLE_ENDIAN;
-
-    /** Instruction word from a raw (native-order) memory word, in this chunk's fetch order. */
+    /** Instruction word from a raw (little-endian) memory word, in this chunk's fetch order. */
     private int fetchOrder(int raw) {
-        return fetchLe == NATIVE_LE ? raw : Integer.reverseBytes(raw);
+        return fetchLe ? raw : Integer.reverseBytes(raw);
     }
 
     /** Code for a hot entry: a region directly, or a first-tier block (found in the domain or compiled). */
@@ -1189,14 +1179,14 @@ public final class Interpreter {
         long pa = b.pa;
         // Watch the page before reading the code: any later write to it advances the generation.
         int gen = pm.watchCode(pa);
-        long room = Math.min(0x1000 - (pa & 0xfff), seg.byteSize() - pa) / 4;
+        long room = Math.min(0x1000 - (pa & 0xfff), pm.size() - pa) / 4;
         int max = (int) Math.min(BlockCompiler.MAX_LENGTH, room);
         int[] raw = new int[max];
         int[] words = new int[max];
         int[] slots = new int[max];
         int n = 0;
         while (n < max) {
-            raw[n] = seg.get(ValueLayout.JAVA_INT_UNALIGNED, pa + 4L * n);
+            raw[n] = pm.read32le(pa + 4L * n);
             int insn = fetchOrder(raw[n]);
             int slot = (int) lookupEntry(insn);
             words[n] = insn;
@@ -1222,13 +1212,13 @@ public final class Interpreter {
      */
     private Code compileRegion(Block b) {
         long page = b.pa & ~0xfffL;
-        if (page + 0x1000 > seg.byteSize()) {
+        if (page + 0x1000 > pm.size()) {
             return null;
         }
         int gen = pm.watchCode(page);
         int[] raw = new int[1024];
         for (int j = 0; j < 1024; j++) {
-            raw[j] = seg.get(ValueLayout.JAVA_INT_UNALIGNED, page + 4L * j);
+            raw[j] = pm.read32le(page + 4L * j);
         }
         RegionCompiler.Source src = new RegionCompiler.Source() {
             @Override

@@ -1,8 +1,5 @@
 package org.boxtheta.javapower.cpu;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.ByteOrder;
 import java.util.Arrays;
 
 import org.boxtheta.javapower.core.CpuState;
@@ -80,12 +77,8 @@ public final class RadixMmu implements GuestMemory {
     private static final int EPOCH_MASK = 0xfff;
     private static final long PAGE_MASK = ~0xfffL;
 
-    private static final ValueLayout.OfLong L_BE =
-            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
-
     private final CpuState s;
     private final PhysicalMemory pm;
-    private final MemorySegment seg;
     private final long ramSize;
 
     /** Tags and addends, indexed by ((ctx * 3 + type) << TLB_BITS) | (vpn & mask). */
@@ -118,7 +111,6 @@ public final class RadixMmu implements GuestMemory {
     public RadixMmu(CpuState s, PhysicalMemory pm) {
         this.s = s;
         this.pm = pm;
-        this.seg = pm.segment();
         this.ramSize = pm.size();
     }
 
@@ -300,7 +292,7 @@ public final class RadixMmu implements GuestMemory {
         if (pa < 0 || pa > ramSize - 8) {
             return 0; // Unbacked table memory reads as invalid entries.
         }
-        return seg.get(L_BE, pa);
+        return pm.read64be(pa);
     }
 
     /** Tree shapes POWER9 supports (QEMU ppc_radix64_is_valid_level). */

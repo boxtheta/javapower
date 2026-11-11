@@ -416,11 +416,30 @@ class BlockCompilerTest {
 
     @Test
     void icbiDropsCodeChangedBehindTheTracking() {
-        // A write straight to the segment is not tracked (like a store racing with the compile on
-        // another CPU); icbi on the changed block makes the change visible.
-        rewriteBetweenRuns((m, a, v) -> m.pm.segment().set(m.le ? java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED
-                .withOrder(java.nio.ByteOrder.LITTLE_ENDIAN) : java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED
-                .withOrder(java.nio.ByteOrder.BIG_ENDIAN), a, v), true);
+        // A write straight to the backing array is not tracked (like a store racing with the
+        // compile on another CPU); icbi on the changed block makes the change visible.
+        rewriteBetweenRuns((m, a, v) -> untrackedWrite32(m.pm, a, m.le ? Integer.reverseBytes(v) : v), true);
+    }
+
+    /** Store big-endian {@code v} at {@code a} behind PhysicalMemory's code-write tracking. */
+    private static void untrackedWrite32(org.boxtheta.javapower.core.PhysicalMemory pm, long a, int v) {
+        // Through the backing store: byte[] chunks on Java 21, a MemorySegment on 22 and later
+        // (reached reflectively, as this code is compiled for 21).
+        Object b = pm.jitBacking();
+        java.nio.ByteBuffer buf;
+        long off = a;
+        if (b instanceof byte[][] chunks) {
+            buf = java.nio.ByteBuffer.wrap(chunks[(int) (a >>> 30)]);
+            off = RamAccess.bias() + (a & ((1 << 30) - 1));
+        } else {
+            try {
+                buf = (java.nio.ByteBuffer) Class.forName("java.lang.foreign.MemorySegment").getMethod("asByteBuffer")
+                        .invoke(b);
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError(e);
+            }
+        }
+        buf.putInt((int) off, v); // a fresh buffer view's byte order is big-endian
     }
 
     /**

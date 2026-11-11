@@ -4,7 +4,8 @@ A Power ISA emulator for the JVM. It models a PAPR `pseries` machine (POWER9, ra
 VIO console and v-scsi) closely enough to run QEMU's stock SLOF firmware and boot FreeBSD 15.1
 (ppc64le, and big-endian powerpc64 including its 32-bit compatibility layer) and openSUSE
 Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
-as a library. Java 25 or later; no runtime dependencies.
+as a library. Java 21 or later; no runtime dependencies (the JIT's bytecode library is bundled, see
+[Third-party code](#third-party-code)).
 
 ## Embedding
 
@@ -72,6 +73,26 @@ class Boot {
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
 
+Where guest RAM lives depends on the Java version, and the JVM limit for it must exceed the RAM
+of every machine alive at once:
+
+- Java 22 and later: off the Java heap, as direct memory, which the JVM caps with
+  `-XX:MaxDirectMemorySize` (by default the maximum heap size, `-Xmx`). For one 2 GiB guest run
+  with e.g. `-XX:MaxDirectMemorySize=3g`, or an `-Xmx` above 2 GiB.
+- Java 21: on the Java heap, in 1 GiB `byte[]` chunks, so `-Xmx` must exceed the guest RAM by
+  the emulator's own needs (about 1 GiB): e.g. `-Xmx3g` for one 2 GiB guest.
+
+If the RAM cannot be allocated, `new Emulator(...)` throws an `OutOfMemoryError` saying which
+limit to raise. The memory is returned when the machine becomes unreachable.
+
+`javapower-core` and `javapower-cpu-int` are multi-release jars: on Java 22 and later the JVM
+picks the versions of guest RAM and of the JIT's memory accesses built on `MemorySegment`
+(`META-INF/versions/22`); on Java 21 it uses equivalent ones built on heap arrays (as Java 21
+has no final foreign-memory API), which are slower: in our measurements the CPU time of a
+FreeBSD boot is about 5% higher on Java 21 than on Java 27. Keep the jars intact: repackaging
+that drops `META-INF/versions` or the `Multi-Release` manifest attribute leaves the Java 21
+classes, which refuse to load on a JVM without atomic access to byte arrays (JDK 27 among them).
+
 ## Command line
 
 ```
@@ -98,7 +119,11 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--no-code-sharing` | Compile code separately for each CPU and address space instead of sharing it |
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
-instructions, hypercalls and RTAS calls) go to stderr.
+instructions, hypercalls and RTAS calls) go to stderr. Guest RAM counts against the JVM's direct
+memory limit on Java 22 and later, and against its heap on Java 21 (see [Embedding](#embedding));
+for large `--ram` values raise the limit in `JAVA_OPTS`, e.g.
+`JAVA_OPTS=-XX:MaxDirectMemorySize=9g app --ram 8192 ...` (Java 22+) or `JAVA_OPTS=-Xmx10g`
+(Java 21).
 
 ## Supported guests
 
@@ -113,8 +138,12 @@ against our CLI or QEMU (see `scripts/guest/README.md`).
 
 ## Building and testing
 
-Builds use Gradle with a JDK 27 toolchain, compiling for Java 25 with `-Werror`. Tests are JUnit 5;
-instruction tests compare against values produced by QEMU.
+Builds use Gradle with a JDK 21 toolchain, compiling for Java 21 with `-Werror`. Tests are JUnit 5;
+instruction tests compare against values produced by QEMU. `gradle check` runs every test twice:
+on JDK 21 (`test`, which exercises the Java 21 classes of the multi-release jars) and on JDK 27
+(`test27`, the `src/main/java22` ones); Gradle finds both JDKs among the installed ones. It also
+runs `jar --validate` on the multi-release jars, which fails if the two versions of a class differ
+in public API.
 
 ```
 gradle :core:test :platform:test :emulator:test   # unit and machine tests
@@ -130,6 +159,15 @@ project the builds run on the shared dev server through `scripts/remote.sh <work
 Modules: `core` (shared contracts), `cpu-int` (integer, branch, system instructions, MMU, run
 loop), `cpu-fpvec` (floating point, VMX, VSX), `platform` (machine model, hypercalls, RTAS,
 devices), `emulator` (the embedding entry point), `app` (the CLI).
+
+## Third-party code
+
+`javapower-cpu-int` bundles [ASM](https://asm.ow2.io/) 9.11.1, which its JIT uses to generate
+bytecode. ASM is licensed under the BSD 3-Clause license; the text is in
+[cpu-int/LICENSE-ASM](cpu-int/LICENSE-ASM) and in the jar as `META-INF/LICENSE-ASM`. Its classes
+are relocated to the internal package `org.boxtheta.javapower.cpu.internal.asm` at build time, so
+the published POM declares no dependency on ASM and it cannot clash with another copy of ASM on
+the class path. The relocated package is not part of javapower's API.
 
 ## License
 

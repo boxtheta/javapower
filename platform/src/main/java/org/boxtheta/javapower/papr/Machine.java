@@ -426,8 +426,17 @@ public final class Machine implements Hypervisor, AutoCloseable {
         return rngSeed;
     }
 
+    /**
+     * The real mode area: the largest power of two not above the RAM size, at most 1 TiB. QEMU
+     * gets the same through its implicit NUMA node 0 ({@code spapr_node0_size} rounds the node
+     * down to a power of two).
+     */
     long rmaSize() {
-        return Math.min(config.ramSize, 1L << 40);
+        return rmaSize(config.ramSize);
+    }
+
+    static long rmaSize(long ramSize) {
+        return Math.min(Long.highestOneBit(ramSize), 1L << 40);
     }
 
     Random random() {

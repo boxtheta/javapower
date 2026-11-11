@@ -1,11 +1,22 @@
 package org.boxtheta.javapower.app;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 import org.boxtheta.javapower.Emulator;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Spr;
@@ -26,7 +37,8 @@ public final class Main {
 
     private static final String USAGE = "usage: javapower [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]"
             + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
-            + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]";
+            + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
+            + " [--persistent] [--load-state file] [--save-state file]";
 
     public static void main(String[] args) throws Exception {
         MachineConfig cfg = new MachineConfig().console(new StdioCharBackend())
@@ -41,14 +53,21 @@ public final class Main {
         String jit = "regions";
         boolean shareCode = true;
         Path firmware = null;
+        boolean persistent = false;
+        Path loadState = null;
+        Path saveState = null;
+        java.util.List<MachineConfig.Disk> disks = new java.util.ArrayList<>();
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
                     case "--ram" -> cfg.ram(Long.parseLong(args[++i]) << 20);
                     case "--smp" -> smp = Integer.parseInt(args[++i]);
                     case "--firmware" -> firmware = Path.of(args[++i]);
-                    case "--disk" -> cfg.addDisk(Path.of(args[++i]));
-                    case "--disk4k" -> cfg.addDisk(Path.of(args[++i])).blockSize(4096).physicalBlockSize(4096);
+                    case "--disk" -> disks.add(cfg.addDisk(Path.of(args[++i])));
+                    case "--disk4k" -> disks.add(cfg.addDisk(Path.of(args[++i])).blockSize(4096).physicalBlockSize(4096));
+                    case "--persistent" -> persistent = true;
+                    case "--load-state" -> loadState = Path.of(args[++i]);
+                    case "--save-state" -> saveState = Path.of(args[++i]);
                     case "--cdrom" -> cfg.addCdrom(Path.of(args[++i]));
                     case "--clock-scale" -> clockScale = Double.parseDouble(args[++i]);
                     case "--deterministic" -> clock = Interpreter.Clock.DETERMINISTIC;
@@ -67,6 +86,9 @@ public final class Main {
                 }
             }
             cfg.cpus(smp);
+            for (MachineConfig.Disk d : disks) {
+                d.persistent(persistent);
+            }
             if (clock == Interpreter.Clock.DETERMINISTIC && (smp != 1 || clockScale != 1.0)) {
                 throw new IllegalArgumentException("--deterministic needs --smp 1 and no --clock-scale");
             }
@@ -95,7 +117,33 @@ public final class Main {
             System.err.println("javapower: " + e.getMessage());
             return;
         }
+        if (saveState != null && !persistent && !disks.isEmpty()) {
+            System.err.println("[javapower] warning: the disks are snapshots whose writes are discarded at exit;"
+                    + " use --persistent so they match the saved state");
+        }
+        CountDownLatch saved = new CountDownLatch(1);
         try (Emulator emu = emulator) {
+            if (loadState != null) {
+                long t0 = System.nanoTime();
+                try (InputStream in = open(loadState)) {
+                    emu.loadState(in);
+                } catch (IOException e) {
+                    System.err.println("javapower: cannot load " + loadState + ": " + e.getMessage());
+                    return;
+                }
+                System.err.printf("[javapower] loaded %s in %d ms%n", loadState, (System.nanoTime() - t0) / 1_000_000);
+            }
+            if (saveState != null) {
+                // SIGTERM or SIGINT: stop the guest; the main thread saves it, then exits.
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    emu.stop();
+                    try {
+                        saved.await(10, TimeUnit.MINUTES);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, "javapower-save-on-exit"));
+            }
             for (Interpreter interp : emu.interpreters()) {
                 int n = interp.state().index;
                 interp.icountShift = icountShift;
@@ -121,6 +169,13 @@ public final class Main {
             }
             Machine m = emu.machine();
             System.out.flush();
+            if (saveState != null) {
+                if (why == Machine.ShutdownReason.NONE) {
+                    save(emu, saveState);
+                } else {
+                    System.err.printf("%n[javapower] guest stopped (%s): no state saved%n", why);
+                }
+            }
             CpuState cpu = emu.cpu();
             long total = 0;
             for (CpuState c : emu.cpus()) {
@@ -139,7 +194,28 @@ public final class Main {
             for (Map.Entry<String, Long> e : emu.log().unimplementedCounts().entrySet()) {
                 System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());
             }
+        } finally {
+            saved.countDown(); // also when the run or the save failed
         }
+    }
+
+    /** A state file, gunzipped if its name ends in .gz. */
+    private static InputStream open(Path p) throws IOException {
+        InputStream in = new BufferedInputStream(Files.newInputStream(p), 1 << 16);
+        return p.toString().endsWith(".gz") ? new GZIPInputStream(in, 1 << 16) : in;
+    }
+
+    /** Save to a temporary file next to {@code p}, then move it into place; gzip if the name ends in .gz. */
+    private static void save(Emulator emu, Path p) throws IOException {
+        long t0 = System.nanoTime();
+        Path tmp = p.resolveSibling(p.getFileName() + ".tmp");
+        try (OutputStream f = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 16);
+                OutputStream out = p.toString().endsWith(".gz") ? new GZIPOutputStream(f, 1 << 16) : f) {
+            emu.saveState(out);
+        }
+        Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        System.err.printf("%n[javapower] saved %s (%d bytes) in %d ms%n", p, Files.size(p),
+                (System.nanoTime() - t0) / 1_000_000);
     }
 
     /**

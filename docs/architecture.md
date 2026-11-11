@@ -16,9 +16,22 @@ console.
   powerpc64 kernel and userland are BE (ELFv2) and run 32-bit BE powerpc binaries (COMPAT_FREEBSD32,
   MSR[SF]=0) with LPCR[ILE]=0; the other kernels are LE.
 - Radix MMU only: the guests negotiate radix through CAS. Hash/SLB is out of scope for now.
-- XICS interrupts via hcalls. VIO devices only (vty, v-scsi); no PCI devices.
+- XICS interrupts via hcalls. VIO devices only (nvram, vty, v-scsi, then any devices added through
+  `MachineConfig`); no PCI devices.
 - Memory-mapped I/O: real addresses outside RAM reach the regions of an `MmioBus`, which
   embedders fill through `MachineConfig.addMmio` (see [Memory-mapped I/O](#memory-mapped-io)).
+
+## VIO devices
+
+Every VIO device is a `VioDevice` subclass in one ordered list: nvram, vty and v-scsi at unit
+addresses 0x71000000 to 0x71000002, then the devices the configuration adds, at the following
+addresses in the order they were added (`MachineConfig.addedVio`, which every kind of added VIO
+device goes through). The machine assigns each one its interrupt source and TCE table, routes
+the CRQ, TCE and H_VIO_SIGNAL hypercalls to it by unit address, generates its device tree node,
+resets, quiesces, saves and loads it, and describes the added ones in the hardware check.
+Embedders' own devices are added the same way (`MachineConfig.addVioDevice`); the members of
+`VioDevice` they may use and override, and the threads that call them, are documented on the
+class.
 
 ## Modules
 

@@ -92,6 +92,44 @@ class Boot {
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
 
+### Adding VIO devices of your own
+
+A machine always has the NVRAM, the console `vty` and `v-scsi` on its virtual I/O bus, at unit
+addresses 0x71000000, 0x71000001 and 0x71000002. Add more devices by subclassing `VioDevice` and
+giving `MachineConfig.addVioDevice` a factory for them:
+
+```java
+int reg = cfg.addVioDevice(() -> new MyCard());   // 0x71000003, the next one 0x71000004, ...
+try (Emulator emu = new Emulator(cfg)) {
+    MyCard card = emu.machine().vioDevice(reg, MyCard.class);
+    ...
+}
+```
+
+- Devices get unit addresses in the order they are added. Each one gets an interrupt source, a
+  TCE table if `dmaWindowSize()` is not 0, and a node `/vdevice/<dtName>@<unit address>` with
+  its `device_type`, `compatible`, `reg`, `interrupts`, DMA window and whatever properties
+  `addDeviceProps` adds, the same as the built-in devices.
+- The guest talks to a device through a CRQ (command/response queue), the transport of PAPR's own
+  virtual SCSI, Fibre Channel and TPM adapters: it sends 16-byte entries with H_SEND_CRQ, which
+  reach `handleCrq` on the calling CPU's thread, and the device replies with `sendCrq`, moves
+  data with `dmaRead` and `dmaWrite` through the TCE table the guest maps, and raises its
+  interrupt with `pulseIrq` (`sendCrq` does when the guest enabled it with H_VIO_SIGNAL). Other
+  hypercalls are not routed to devices: their numbers belong to the platform.
+- `VioDevice`'s class comment lists the hooks (`startDevice`, `resetDevice`, `quiesceDevice`,
+  `closeDevice`, `saveDevice`, `loadDevice`, `addDeviceProps`) and which thread calls each. The
+  machine holds the device's lock (`lock()`) around every call into it; a device that also acts
+  on threads of its own, such as host input arriving, holds the same lock around `sendCrq` and
+  its own state, and leaves guest memory alone while the machine is saved or loaded.
+- The factory is called once for every machine built from the configuration and must return a
+  new device each time: a device belongs to one machine, and attaching it to a second one fails
+  with `IllegalStateException`. The machine closes its devices (`closeDevice`) in `close()`, and
+  also when its construction fails after they were created.
+- Added devices are part of the saved state. The hardware check compares, for each one, its node
+  name and unit address, `device_type`, `compatible` string, DMA window size and the text its
+  `hardwareIdentity()` returns, so a device can name anything else a state must agree on
+  (`"ports=4"`), and lists any difference in the `StateMismatchException`.
+
 ### Memory-mapped devices
 
 An embedder can put devices of its own into the guest's real address space without javapower
@@ -188,8 +226,10 @@ try (Emulator emu = new Emulator(cfg);
   is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
 - The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
   host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
-  block size, size, read-only) and the same MMIO regions (name, base, size, byte order,
-  interrupt). Otherwise `loadState` throws `StateMismatchException` listing
+  block size, size, read-only), the same added VIO devices in the same order (see
+  [Adding VIO devices of your own](#adding-vio-devices-of-your-own)) and the same MMIO regions
+  (name, base, size, byte order, interrupt). Otherwise `loadState` throws
+  `StateMismatchException` listing
   the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
   need not match: the guest's view of them is in its RAM and saved device tree. The clock and
   time scale may differ.

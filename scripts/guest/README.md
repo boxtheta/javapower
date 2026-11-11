@@ -14,9 +14,12 @@ patterns and types input (`console.py`, stdlib only). Everything runs on the mac
 | `kyua` | BE ISO: shell, tmpfs+unionfs layers over `/usr`, `/etc`, `/libexec`, the tests, kyua and atf packages from the disc's offline repo, `kyua test` for each `--tests` path; writes `test_program:case result` lines to `--out` |
 | `progs` | BE ISO plus a second disc (`--cdrom2`): installs the lib32 runtime and runs the disc's `RUN` script; output to `--out` |
 | `resume` | `--guest le`, `be` or `suse` (default `be`): boot to a shell (openSUSE: GRUB entry edited to skip the first-boot wizard and open a root shell on the console), write a file to a disk, stop with SIGTERM so the CLI saves the machine (`--save-state`), resume it in a new process (`--load-state`), check the file, write another, show the clock and uptime, run a loop pinned to each CPU, and for FreeBSD check the file system with `fsck` |
+| `net` | `--guest le`, `be` or `suse` with a network device on a small segment: `netpeer.py` (a hub with a host at 10.0.2.99 that answers ARP and ping) and QEMU's user-mode network (TCP to this machine at 10.0.2.2). Pings both ways, fragmented pings, a burst of `--net-burst` pings, a download and an upload of `--net-mib` MiB with checksums. `--nics 2` adds a second device on a second segment; `--peer-guest le\|be\|suse` boots that guest under QEMU with spapr-vlan on the first segment and pings between the guests. FreeBSD's ppc64le `llan` driver reads the big-endian receive queue in host order and receives nothing, under QEMU as well |
 | `regress` | `prompt-le`, `prompt-be`, `kyua` (short subset), `suse`; exit status 1 if any fails, or if `--baseline` (QEMU's kyua results) passed a test that ours did not |
 
 Examples:
+
+    scripts/remote.sh be 'python3 scripts/guest/drive.py net --guest be --nics 2 --peer-guest suse'
 
     scripts/remote.sh be 'python3 scripts/guest/drive.py regress --ram 4096 --baseline ~/javapower/ref/kyua-regress-qemu.txt'
     scripts/remote.sh be 'python3 scripts/guest/drive.py kyua --vm qemu --ram 4096 --tests lib/libc --out /tmp/libc-qemu.txt'

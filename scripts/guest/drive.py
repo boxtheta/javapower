@@ -17,17 +17,30 @@ Scenarios:
   resume         --guest le, be or suse: boot to a shell, write a file to a disk, save the machine
                  on exit (SIGTERM), resume it in a new process, check the file, write more, check
                  the clock, uptime and that every CPU still runs
+  net            --guest le, be or suse with a network device on a small segment (netpeer.py: a
+                 host that answers ARP and ping, plus QEMU's user-mode network for TCP to this
+                 machine): ping both ways (also fragmented, and a burst), download and upload
+                 --net-mib MiB over TCP and compare checksums; --nics 2 adds a second device on
+                 a second segment; --peer-guest le|be|suse also boots that guest under QEMU with
+                 spapr-vlan on the same segment and pings between the two guests
   regress        prompt-le, prompt-be + a short kyua subset, suse; non-zero exit on failure
   compare        compare kyua results: --baseline (QEMU) against --out (ours), per directory
 
 Logs (raw console, emulator stderr) go to --logdir. Exit status 0 on success.
 """
 import argparse
+import functools
+import hashlib
+import http.server
 import os
 import re
+import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -199,6 +212,8 @@ def scenario(a):
             progs(a, c)
     elif a.scenario == "resume":
         resume(a)
+    elif a.scenario == "net":
+        net(a)
     elif a.scenario == "regress":
         return regress(a)
     elif a.scenario == "compare":
@@ -329,6 +344,287 @@ def resume(a):
     say(a, "state %s: %d bytes" % (state, os.path.getsize(state)))
 
 
+# ---- network checks
+
+def free_ports(n):
+    """n free ports on 127.0.0.1 (asked of the kernel, then released)."""
+    socks = []
+    for _ in range(n):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        socks.append(s)
+    ports = [s.getsockname()[1] for s in socks]
+    for s in socks:
+        s.close()
+    return ports
+
+
+def dgram(local, remote):
+    return ("dgram,local.type=inet,local.host=127.0.0.1,local.port=%d,remote.type=inet,remote.host=127.0.0.1,"
+            "remote.port=%d" % (local, remote))
+
+
+def net_args(vm, k, local, remote, mac):
+    """Arguments for network device k with address `mac` on the UDP link local -> remote."""
+    if vm == "ours":
+        return ["--net", "dgram,local=127.0.0.1:%d,remote=127.0.0.1:%d,mac=%s" % (local, remote, mac)]
+    return ["-netdev", "%s,id=n%d" % (dgram(local, remote), k), "-device", "spapr-vlan,netdev=n%d,mac=%s" % (k, mac)]
+
+
+# The guest's devices, and the QEMU guest on its segment (each needs an address of its own there).
+NET_MACS = ["02:00:00:00:00:15", "02:00:00:00:01:15"]
+PEER_GUEST_MAC = "02:00:00:00:00:16"
+
+
+class NetPeer:
+    """netpeer.py as a child process: a hub with a host that answers ARP and ping."""
+
+    def __init__(self, a, name, links, ip):
+        self.log = open(os.path.join(a.logdir, name + ".netpeer.log"), "w")
+        argv = [sys.executable, os.path.join(HERE, "netpeer.py"), "--ip", ip]
+        for l in links:
+            argv += ["--link", "%d:%d" % l]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True)
+        if "ready" not in self.proc.stdout.readline():
+            raise Exited("netpeer did not start")
+
+    def cmd(self, line):
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        return self.proc.stdout.readline().strip()
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(10)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+        self.log.close()
+
+
+class HostServices:
+    """This machine's side of the TCP checks: an HTTP server with a random blob and a sink that
+    reads uploads to the end; QEMU's user-mode network makes both reachable at 10.0.2.2."""
+
+    def __init__(self, a, mib):
+        self.dir = tempfile.mkdtemp(dir=a.logdir)
+        blob = os.urandom(mib << 20)
+        with open(os.path.join(self.dir, "blob"), "wb") as f:
+            f.write(blob)
+        self.sha = hashlib.sha256(blob).hexdigest()
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        self.http = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=self.dir))
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
+        self.sink = socket.socket()
+        self.sink.bind(("127.0.0.1", 0))
+        self.sink.listen(4)
+        self.uploads = []
+        threading.Thread(target=self._sink, daemon=True).start()
+
+    def _sink(self):
+        while True:
+            try:
+                conn, _ = self.sink.accept()
+            except OSError:
+                return
+            h = hashlib.sha256()
+            n = 0
+            with conn:
+                while True:
+                    b = conn.recv(1 << 16)
+                    if not b:
+                        break
+                    h.update(b)
+                    n += len(b)
+            self.uploads.append((n, h.hexdigest()))
+
+    def ports(self):
+        return self.http.server_address[1], self.sink.getsockname()[1]
+
+    def close(self):
+        self.http.shutdown()
+        self.sink.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+NET_GUEST = {
+    # guest: boot media, ping summary pattern (group 1: received), download, checksum, upload
+    "be": dict(cdroms=[ISO_BE], received=r"(\d+) packets received",
+               get="fetch -q -o /tmp/blob http://10.0.2.2:%d/blob", sha="sha256 -q /tmp/blob",
+               put="nc -N 10.0.2.2 %d < /tmp/blob"),
+    "le": dict(cdroms=[ISO_LE], received=r"(\d+) packets received",
+               get="fetch -q -o /tmp/blob http://10.0.2.2:%d/blob", sha="sha256 -q /tmp/blob",
+               put="nc -N 10.0.2.2 %d < /tmp/blob"),
+    "suse": dict(disk4k=SUSE, received=r"(\d+) received",
+                 get="curl -s -o /tmp/blob http://10.0.2.2:%d/blob", sha="sha256sum /tmp/blob | cut -c1-64",
+                 put="cat /tmp/blob > /dev/tcp/10.0.2.2/%d"),
+}
+
+
+def net_ifaces(c, guest, macs):
+    """The guest's interface names for the devices with these MAC addresses. (FreeBSD numbers
+    its llan interfaces in reverse device tree order, under QEMU too, so go by address.)"""
+    if guest == "suse":
+        cmd = "for i in /sys/class/net/*; do echo ${i##*/} $(cat $i/address); done"
+    else:
+        cmd = "ifconfig -a | awk '/^[a-z]/ {i = $1} /ether/ {print i, $2}'"
+    st, o = c.sh(cmd, timeout=120)
+    by_mac = {}
+    for line in o.splitlines():
+        p = line.split()
+        if len(p) == 2:
+            by_mac[p[1].lower()] = p[0].rstrip(":")
+    if any(m not in by_mac for m in macs):
+        raise Exited("expected interfaces with %s, found %s" % (macs, by_mac))
+    return [by_mac[m] for m in macs]
+
+
+def net_up(c, guest, ifname, cidr):
+    if guest == "suse":
+        cmd = "ip link set %s up && ip addr replace %s dev %s && ip -br addr show %s" % (ifname, cidr, ifname, ifname)
+    else:
+        cmd = "ifconfig %s inet %s up && ifconfig %s" % (ifname, cidr, ifname)
+    st, o = c.sh(cmd, timeout=120)
+    print("$ %s   [status %d]\n%s" % (cmd, st, o), flush=True)
+    if st:
+        raise Exited("cannot configure %s" % ifname)
+
+
+def guest_ping(a, c, g, args, want):
+    """Ping from the guest; returns packets received, fails if fewer than `want`."""
+    cmd = "ping %s" % args
+    t0 = time.time()
+    st, o = c.sh(cmd, timeout=900)
+    m = re.findall(g["received"], o)
+    got = int(m[-1]) if m else 0
+    say(a, "guest: %s -> %d received (%.0fs)" % (cmd, got, time.time() - t0))
+    if got < want:
+        raise Exited("%s: %d received, wanted %d:\n%s" % (cmd, got, want, o[-1500:]))
+    return got
+
+
+def peer_ping(a, peer, ip, count, size, want):
+    t0 = time.time()
+    r = peer.cmd("ping %s %d %d" % (ip, count, size))
+    say(a, "peer: %s (%.0fs)" % (r, time.time() - t0))
+    m = re.search(r"received (\d+)", r)
+    if not m or int(m.group(1)) < want:
+        raise Exited("peer ping %s: %s" % (ip, r))
+
+
+def net(a):
+    """Bring the guest's network devices up and exercise them; see the module docstring."""
+    os.makedirs(a.logdir, exist_ok=True)
+    g = NET_GUEST[a.guest]
+    tag = "net-%s" % a.guest
+    # Segment 1: the guest, netpeer's host and hub, QEMU's user-mode network, maybe a QEMU guest.
+    p = free_ports(12)
+    guest_l, hub_g, hub_s, slirp_l, hub_q, peer_l, hub2_g, guest2_l = p[:8]
+    links = [(hub_g, guest_l), (hub_s, slirp_l)]
+    if a.peer_guest:
+        links.append((hub_q, peer_l))
+    services = HostServices(a, a.net_mib)
+    http_port, sink_port = services.ports()
+    peer = NetPeer(a, tag, links, "10.0.2.99")
+    peer2 = NetPeer(a, tag + "-2", [(hub2_g, guest2_l)], "10.0.3.99") if a.nics > 1 else None
+    slirp_log = open(os.path.join(a.logdir, tag + ".slirp.log"), "w")
+    slirp = subprocess.Popen(["qemu-system-ppc64", "-M", "none", "-nodefaults", "-display", "none", "-monitor", "none",
+                              "-netdev", "%s,id=d" % dgram(slirp_l, hub_s), "-netdev", "user,id=u,net=10.0.2.0/24",
+                              "-netdev", "hubport,id=h0,hubid=0,netdev=d", "-netdev", "hubport,id=h1,hubid=0,netdev=u"],
+                             stdout=slirp_log, stderr=slirp_log)
+    b = argparse.Namespace(**vars(a))
+    b.extra = list(a.extra) + net_args(a.vm, 0, guest_l, hub_g, NET_MACS[0])
+    if a.nics > 1:
+        b.extra += net_args(a.vm, 1, guest2_l, hub2_g, NET_MACS[1])
+    if a.guest == "suse" and a.vm == "ours" and not a.clock_scale:
+        b.clock_scale = 4
+    try:
+        with start(b, tag, g.get("cdroms", []), g.get("disk4k")) as c:
+            guest_shell(a, c)
+            try:
+                net_checks(a, c, g, b, peer, peer2, services, http_port, sink_port, tag, peer_l, hub_q)
+            except (Timeout, Exited):
+                say(a, "segment: %s" % peer.cmd("stats"))
+                try:
+                    run_cmds(a, c, ["netstat -i; sysctl dev.llan 2>/dev/null" if a.guest != "suse" else "ip -s link"],
+                             timeout=60)
+                except (Timeout, Exited):
+                    pass
+                raise
+    finally:
+        for x in (peer, peer2):
+            if x:
+                x.close()
+        slirp.terminate()
+        slirp.wait()
+        slirp_log.close()
+        services.close()
+    say(a, "net %s: passed" % a.guest)
+
+
+def net_checks(a, c, g, b, peer, peer2, services, http_port, sink_port, tag, peer_l, hub_q):
+    ifs = net_ifaces(c, a.guest, NET_MACS[:a.nics])
+    if a.guest == "suse":
+        c.sh("systemctl stop NetworkManager wicked 2>/dev/null; true", timeout=120)
+    run_cmds(a, c, ["dmesg | grep -i -e llan -e ibmveth | head -20"])
+    net_up(c, a.guest, ifs[0], "10.0.2.15/24")
+    guest_ping(a, c, g, "-c 5 10.0.2.99", 5)
+    peer_ping(a, peer, "10.0.2.15", 20, 56, 20)
+    guest_ping(a, c, g, "-c 3 -s 4000 10.0.2.99", 3)
+    peer_ping(a, peer, "10.0.2.15", 5, 3000, 5)
+    got = guest_ping(a, c, g, "-q -c %d -i 0.01 -s 1400 10.0.2.99" % a.net_burst, a.net_burst * 95 // 100)
+    if got < a.net_burst:
+        say(a, "note: the burst lost %d of %d" % (a.net_burst - got, a.net_burst))
+    t0 = time.time()
+    st, o = c.sh("%s && %s" % (g["get"] % http_port, g["sha"]), timeout=3600)
+    dt = time.time() - t0
+    say(a, "guest: downloaded %d MiB in %.1fs (%.0f KiB/s): %s" % (a.net_mib, dt, (a.net_mib << 10) / dt,
+                                                                  o.strip()[-64:]))
+    if services.sha not in o:
+        raise Exited("download checksum mismatch: %s, wanted %s" % (o.strip(), services.sha))
+    t0 = time.time()
+    st, o = c.sh(g["put"] % sink_port, timeout=3600)
+    dt = time.time() - t0
+    for _ in range(50):
+        if services.uploads:
+            break
+        time.sleep(0.2)
+    say(a, "guest: uploaded in %.1fs (%.0f KiB/s): %s" % (dt, (a.net_mib << 10) / dt, services.uploads))
+    if not services.uploads or services.uploads[-1] != (a.net_mib << 20, services.sha):
+        raise Exited("upload mismatch: %s, wanted %d bytes %s" % (services.uploads, a.net_mib << 20,
+                                                                   services.sha))
+    if peer2:
+        net_up(c, a.guest, ifs[1], "10.0.3.15/24")
+        guest_ping(a, c, g, "-c 5 10.0.3.99", 5)
+        peer_ping(a, peer2, "10.0.3.15", 20, 56, 20)
+        guest_ping(a, c, g, "-c 5 10.0.2.99", 5)  # the first device still works
+    if a.peer_guest:
+        net_with_qemu_guest(a, c, g, tag, peer_l, hub_q)
+    run_cmds(a, c, ["netstat -i" if a.guest != "suse" else "ip -s link"])
+    say(a, "segment: %s" % peer.cmd("stats"))
+
+
+def net_with_qemu_guest(a, c, g, tag, local, remote):
+    """Boot --peer-guest under QEMU with spapr-vlan on the same segment and ping both ways."""
+    q = argparse.Namespace(**vars(a))
+    q.vm, q.guest, q.clock_scale, q.smp, q.name = "qemu", a.peer_guest, None, 1, None
+    qg = NET_GUEST[a.peer_guest]
+    q.extra = net_args("qemu", 0, local, remote, PEER_GUEST_MAC)
+    with start(q, tag + "-peer", qg.get("cdroms", []), qg.get("disk4k")) as qc:
+        guest_shell(q, qc)
+        ifs = net_ifaces(qc, a.peer_guest, [PEER_GUEST_MAC])
+        if a.peer_guest == "suse":
+            qc.sh("systemctl stop NetworkManager wicked 2>/dev/null; true", timeout=120)
+        net_up(qc, a.peer_guest, ifs[0], "10.0.2.16/24")
+        guest_ping(q, qc, qg, "-c 5 10.0.2.15", 5)
+        guest_ping(a, c, g, "-c 5 10.0.2.16", 5)
+        guest_ping(a, c, g, "-c 3 -s 4000 10.0.2.16", 3)
+
+
 def regress(a):
     failed = []
     for name in ["prompt-le", "prompt-be", "kyua", "suse"]:
@@ -418,7 +714,11 @@ def main():
     p.add_argument("--out", help="results file")
     p.add_argument("--name", help="log file prefix (default: the scenario)")
     p.add_argument("--baseline", help="regress: kyua results from QEMU to compare against")
-    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="resume: which guest")
+    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="resume, net: which guest")
+    p.add_argument("--nics", type=int, default=1, choices=[1, 2], help="net: network devices")
+    p.add_argument("--net-mib", type=int, default=4, help="net: MiB to download and upload")
+    p.add_argument("--net-burst", type=int, default=500, help="net: pings in the burst")
+    p.add_argument("--peer-guest", choices=["le", "be", "suse"], help="net: a QEMU guest on the same segment")
     p.add_argument("--gzip", action="store_true", help="resume: gzip the state file")
     p.add_argument("--logdir", default=os.path.join(HOME, "javapower", "work", "guest-logs"))
     p.add_argument("--boot-timeout", type=int, default=1800)

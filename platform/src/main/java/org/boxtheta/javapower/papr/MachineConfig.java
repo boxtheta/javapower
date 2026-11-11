@@ -14,8 +14,8 @@ import org.boxtheta.javapower.core.MmioHandler;
 /**
  * Configuration of a {@link Machine}: the equivalent of QEMU's
  * {@code -M pseries,ic-mode=xics -cpu power9 -smp <cpus> -m <ram> -nodefaults} plus one spapr-vty, one
- * spapr-vscsi and its SCSI devices. Plain mutable fields with fluent setters; read once when the
- * machine is constructed.
+ * spapr-vscsi and its SCSI devices, and a spapr-vlan for each network device. Plain mutable fields
+ * with fluent setters; read once when the machine is constructed.
  *
  * <p>What an embedder usually sets: {@link #ram}, {@link #cpus}, the {@link #console} backend
  * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk})
@@ -128,6 +128,75 @@ public final class MachineConfig {
     }
 
     /**
+     * One virtual Ethernet device ({@code spapr-vlan}, {@link LLan}), added with
+     * {@link #addNetwork}.
+     */
+    public static final class Network {
+        final NetBackend backend;
+        byte[] mac;
+
+        private Network(NetBackend backend) {
+            this.backend = backend;
+        }
+
+        /**
+         * The device's MAC address, six bytes, a unicast address (the low bit of the first byte
+         * clear) other than all zeros. By default the machine gives each network device the first
+         * of 52:54:00:12:34:56, 52:54:00:12:34:57, ... that no other of its devices uses, as QEMU
+         * does; set one when the guest should keep its address across different machines or when
+         * machines share a network. Addresses must differ between the devices of one machine.
+         *
+         * @throws IllegalArgumentException if the address is not six bytes, multicast or zero
+         */
+        public Network mac(byte[] address) {
+            if (address.length != 6 || (address[0] & 1) != 0 || LLan.macToLong(address) == 0) {
+                throw new IllegalArgumentException("not a unicast MAC address: " + java.util.Arrays.toString(address));
+            }
+            this.mac = address.clone();
+            return this;
+        }
+
+        /**
+         * The MAC address as text, six hexadecimal bytes separated by colons or dashes, e.g.
+         * {@code "52:54:00:12:34:56"}; see {@link #mac(byte[])}.
+         *
+         * @throws IllegalArgumentException if the text is not such an address
+         */
+        public Network mac(String address) {
+            String[] parts = address.split("[:-]", -1);
+            if (parts.length != 6) {
+                throw new IllegalArgumentException("not a MAC address: " + address);
+            }
+            byte[] b = new byte[6];
+            for (int i = 0; i < 6; i++) {
+                if (!parts[i].matches("[0-9A-Fa-f]{1,2}")) {
+                    throw new IllegalArgumentException("not a MAC address: " + address);
+                }
+                b[i] = (byte) Integer.parseInt(parts[i], 16);
+            }
+            return mac(b);
+        }
+    }
+
+    /**
+     * The place of a network device in {@link #addedVio}. The machine creates its network devices
+     * together, since their default MAC addresses depend on one another, and puts each where
+     * its slot is.
+     */
+    static final class NetworkSlot implements Supplier<VioDevice> {
+        final Network network;
+
+        NetworkSlot(Network network) {
+            this.network = network;
+        }
+
+        @Override
+        public VioDevice get() {
+            throw new IllegalStateException("network devices are created by the machine");
+        }
+    }
+
+    /**
      * One embedder MMIO region ({@link #addMmio}): its address range, handler, byte order, and
      * optionally a device tree node and an interrupt.
      */
@@ -222,6 +291,7 @@ public final class MachineConfig {
     CharBackend console;
     final List<Disk> disks = new ArrayList<>();
     final List<Mmio> mmios = new ArrayList<>();
+    final List<Network> networks = new ArrayList<>();
     Path nvramFile;
     String bootDevice;
     String kernelCmdline;
@@ -397,6 +467,23 @@ public final class MachineConfig {
         }
         addedVio.add(factory);
         return VioDevice.REG_BASE + 3 + addedVio.size() - 1;
+    }
+
+    /**
+     * Add a virtual Ethernet device ({@code spapr-vlan}: {@code l-lan} in the device tree, Linux's
+     * {@code ibmveth}, FreeBSD's {@code llan}) connected to {@code backend}. Call once per device;
+     * each takes the next unit address on the VIO bus after the devices added before it, of any
+     * kind (the first added device is at 0x71000003; see {@link #addVioDevice}). The machine
+     * starts the backend when it is built and closes it when it is closed. At most 64 network
+     * devices.
+     *
+     * @throws IllegalStateException if {@link #MAX_ADDED_VIO_DEVICES} devices were already added
+     */
+    public Network addNetwork(NetBackend backend) {
+        Network n = new Network(java.util.Objects.requireNonNull(backend, "backend"));
+        addVio(new NetworkSlot(n));
+        networks.add(n);
+        return n;
     }
 
     /** Back the NVRAM with a file (8 KiB .. 1 MiB) that receives every store. */

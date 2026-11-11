@@ -20,8 +20,8 @@ import org.boxtheta.javapower.core.Spr;
 
 /**
  * The PAPR {@code pseries} machine: guest RAM, the SLOF firmware image, the device tree, XICS,
- * the VIO devices (nvram, vty, v-scsi and those added with {@link MachineConfig#addVioDevice}) and
- * the hypervisor itself. Mirrors QEMU's
+ * the VIO devices (nvram, vty, v-scsi, and the network and other devices added through
+ * {@link MachineConfig}) and the hypervisor itself. Mirrors QEMU's
  * {@code -M pseries,ic-mode=xics,usb=off -cpu power9 -smp N -nodefaults} closely enough for the
  * stock SLOF binary.
  *
@@ -48,7 +48,8 @@ import org.boxtheta.javapower.core.Spr;
  *
  * <h2>Threading and locking</h2>
  * Every CPU runs on its own host thread and calls {@link #hcall} on that thread; console input
- * arrives on backend threads and {@link #pump} runs on whatever thread the application chooses.
+ * and received network frames arrive on backend threads, and {@link #pump} runs on whatever thread
+ * the application chooses.
  * The locks, always taken in this order (a thread holding one never waits for an earlier one):
  * <ol>
  * <li>The <b>machine lock</b> ({@code lock}): partition-wide state. RTAS calls, CAS,
@@ -58,7 +59,10 @@ import org.boxtheta.javapower.core.Spr;
  *     happens under it, so a CPU's {@link CpuState#halted} flag only changes with it held.</li>
  * <li>A <b>device lock</b> per VIO device: CRQ registration and traffic (H_REG_CRQ,
  *     H_FREE_CRQ, H_SEND_CRQ including the whole SCSI command), H_VIO_SIGNAL, device reset. The
- *     vty has separate input and output locks instead, so console output never waits for input.</li>
+ *     vty has separate input and output locks instead, so console output never waits for input.
+ *     A network device's lock guards its receive side (H_REGISTER_LOGICAL_LAN,
+ *     H_ADD_LOGICAL_LAN_BUFFER, frames its backend delivers from its own threads); sending
+ *     (H_SEND_LOGICAL_LAN, which calls the backend) holds a transmit lock of its own instead.</li>
  * <li>Leaf locks: the {@link Xics} monitor (all ICS and ICP state; H_CPPR, H_IPI, H_XIRR,
  *     H_XIRR_X, H_EOI, H_IPOLL and every interrupt source change) and each {@link TceTable}.
  *     Holders of a leaf lock only call {@link CpuState#setExternalIrq}, which takes no lock.</li>
@@ -146,6 +150,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final Nvram nvram;
     private final Vty vty;
     private final VScsi vscsi;
+    private final List<LLan> networks = new ArrayList<>();
+    /** Set while a save or load has stopped the network devices' deliveries; see {@link #freezeNetworks}. */
+    private volatile boolean networksFrozen;
     private final List<VioDevice> vio = new ArrayList<>();
     /** The devices from {@code MachineConfig.addedVio} this machine attached, in that order. */
     private final List<VioDevice> addedVio = new ArrayList<>();
@@ -278,6 +285,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
         CharBackend console = config.console != null ? config.console : new BufferCharBackend();
         vty = new Vty(console);
         vscsi = new VScsi();
+        networks.addAll(LLan.create(config.networks));
         try {
             buildDevices();
         } catch (IOException | RuntimeException | Error e) {
@@ -286,6 +294,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         rtas = new Rtas(this);
         vty.start();
+        for (LLan n : networks) {
+            n.start();
+        }
         for (VioDevice d : addedVio) {
             try {
                 d.startDevice();
@@ -334,7 +345,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         // Devices added through the configuration, in the order they were added.
         for (java.util.function.Supplier<? extends VioDevice> f : config.addedVio) {
-            VioDevice d = f.get();
+            // Network devices were created together (see LLan.create); the others are built here.
+            VioDevice d = f instanceof MachineConfig.NetworkSlot slot
+                    ? networks.get(config.networks.indexOf(slot.network)) : f.get();
             if (d == null) {
                 throw new IllegalArgumentException("a VIO device factory returned null");
             }
@@ -443,6 +456,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     public Nvram nvram() {
         return nvram;
+    }
+
+    /** The virtual Ethernet devices, in the order they were added to the configuration. */
+    public List<LLan> networks() {
+        return Collections.unmodifiableList(networks);
     }
 
     /**
@@ -734,6 +752,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             for (VioDevice d : vio) {
                 d.reset();
             }
+            networksFrozen = false;
             if (phbTce != null) {
                 phbTce.reset();
             }
@@ -908,7 +927,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     // ---- asynchronous work, shutdown ---------------------------------------------------------
 
     /**
-     * Run timer-driven device work (the H_WATCHDOG timers). Safe to call from any thread at any
+     * Run timer-driven device work (the H_WATCHDOG timers, and giving up on received frames no
+     * guest buffer fits). Safe to call from any thread at any
      * rate; the application calls it periodically (e.g. from its run loop or a timer thread).
      * Console input needs no pumping: it is delivered as soon as the backend produces it.
      */
@@ -945,6 +965,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 }
             }
         }
+        for (LLan n : networks) {
+            n.pump();
+        }
     }
 
     /**
@@ -969,7 +992,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Release the host resources: close the disk backends (deleting snapshot overlays), the NVRAM
-     * file, the console backend and the added VIO devices ({@link VioDevice#closeDevice}). Idempotent. The CPUs must not be running. Guest RAM is
+     * file, the console backend, the network backends and the added VIO devices
+     * ({@link VioDevice#closeDevice}). Idempotent. The CPUs must not be running. Guest RAM is
      * off-heap memory the JVM reclaims once the machine is unreachable.
      *
      * @throws IOException the first failure to close a backend (the others are still closed and
@@ -991,8 +1015,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     /**
      * Close every backend, collecting failures: into {@code primary} if given, otherwise into the
-     * returned exception. The console is left alone when construction fails, since it was never
-     * started.
+     * returned exception. The console and network backends are left alone when construction
+     * fails, since they were never started.
      */
     private IOException closeBackends(Throwable primary, boolean console) {
         IOException first = null;
@@ -1005,6 +1029,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
         all.add(nvram::close);
         if (console) {
             all.add(vty.backend()::close);
+            for (LLan n : networks) {
+                all.add(n::closeBackend);
+            }
         }
         for (VioDevice d : addedVio) {
             all.add(d::closeDevice);
@@ -1033,17 +1060,23 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * loaded), then a {@code "PAPR"} record with the hypervisor state (shutdown state, CAS
      * results, the device tree the guest holds, process table, VPA/SLB shadow/DTL registrations,
      * watchdogs), XICS, RTAS, the DR connectors and every VIO device (CRQ, TCE tables, NVRAM
-     * contents, console input not yet read by the guest, SCSI sense state), and, if the machine
-     * has MMIO regions, an {@code "MMIO"} record with each region handler's own state. Guest RAM
-     * and the CPUs
+     * contents, console input not yet read by the guest, SCSI sense state, network device
+     * registration, receive buffers and filters), and, if the machine has MMIO regions, an
+     * {@code "MMIO"} record with each region handler's own state. Guest RAM and the CPUs
      * are not written here: they belong to {@code PhysicalMemory} and the CPU module, and
      * {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
      * console and the other host resources stay outside the state.
+     *
+     * <p>Received frames waiting for the guest's receive buffers are dropped, and the network
+     * devices take no frames from their backends from here until a CPU next runs (or the machine
+     * is reset), so the RAM saved after this call agrees with their state. {@link #loadState}
+     * does the same once the hardware check has passed.
      *
      * <p>No CPU may be running.
      */
     public void saveState(org.boxtheta.javapower.core.StateOutput out) throws IOException {
         synchronized (lock) {
+            freezeNetworks();
             out.record("PHW ", this::saveHardware);
             out.record("PAPR", d -> {
                 d.writeByte(shutdown.ordinal());
@@ -1198,6 +1231,22 @@ public final class Machine implements Hypervisor, AutoCloseable {
     }
 
     /**
+     * Stop the network devices delivering frames into guest memory (their backends run on their
+     * own threads) until a CPU next enters the guest ({@link #cpuExecEnter}) or the machine is
+     * reset, so that a save or load sees device state and RAM that agree. Frames waiting for the
+     * guest are dropped.
+     */
+    private void freezeNetworks() {
+        if (networks.isEmpty()) {
+            return;
+        }
+        networksFrozen = true;
+        for (LLan n : networks) {
+            n.freeze();
+        }
+    }
+
+    /**
      * Read the records written by {@link #saveState}. The hardware description is checked first:
      * if it differs from this machine's, nothing is changed and a
      * {@link org.boxtheta.javapower.core.StateMismatchException} lists every difference. The
@@ -1215,6 +1264,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
     public void loadState(org.boxtheta.javapower.core.StateInput in) throws IOException {
         synchronized (lock) {
             checkHardware(in.record("PHW "));
+            freezeNetworks();
             org.boxtheta.javapower.core.StateInput.Record r = in.record("PAPR");
             int sd = r.readUnsignedByte();
             if (sd >= ShutdownReason.values().length) {
@@ -1432,11 +1482,20 @@ public final class Machine implements Hypervisor, AutoCloseable {
         bumpDispatchCounter(s, 1);
     }
 
-    /** Clears a pending prod and marks the vCPU dispatched (even), as QEMU's cpu_exec_enter hook. */
+    /**
+     * Clears a pending prod and marks the vCPU dispatched (even), as QEMU's cpu_exec_enter hook.
+     * The first CPU to run after a save or load lets the network devices deliver frames again.
+     */
     @Override
     public void cpuExecEnter(CpuState s) {
         s.prodded = false;
         bumpDispatchCounter(s, 0);
+        if (networksFrozen) {
+            networksFrozen = false;
+            for (LLan n : networks) {
+                n.thaw();
+            }
+        }
     }
 
     private void bumpDispatchCounter(CpuState s, int parity) {
@@ -1603,6 +1662,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 }
             }
             case H.ENABLE_CRQ -> vioByReg(arg(s, 0)) == null ? H.PARAMETER : H.SUCCESS;
+            case H.REGISTER_LOGICAL_LAN, H.FREE_LOGICAL_LAN, H.ADD_LOGICAL_LAN_BUFFER, H.SEND_LOGICAL_LAN,
+                    H.MULTICAST_CTRL, H.CHANGE_LOGICAL_LAN_MAC -> hLogicalLan(s, (int) op);
             case H.VIO_SIGNAL -> {
                 VioDevice d = vioByReg(arg(s, 0));
                 if (d == null || (arg(s, 1) & ~d.signalMask()) != 0) {
@@ -1664,6 +1725,24 @@ public final class Machine implements Hypervisor, AutoCloseable {
             }
         }
         return null;
+    }
+
+    /** The l-lan hypercalls; each takes the device's locks it needs (see {@link LLan}). */
+    private long hLogicalLan(CpuState s, int op) {
+        VioDevice d = vioByReg(arg(s, 0));
+        if (!(d instanceof LLan n)) {
+            // QEMU's H_MULTICAST_CTRL accepts any VIO device and does nothing.
+            return op == H.MULTICAST_CTRL && d != null ? H.SUCCESS : H.PARAMETER;
+        }
+        return switch (op) {
+            case H.REGISTER_LOGICAL_LAN -> n.register(arg(s, 1), arg(s, 2), arg(s, 3));
+            case H.FREE_LOGICAL_LAN -> n.free();
+            case H.ADD_LOGICAL_LAN_BUFFER -> n.addBuffer(arg(s, 1));
+            case H.SEND_LOGICAL_LAN -> n.send(new long[] {arg(s, 1), arg(s, 2), arg(s, 3), arg(s, 4), arg(s, 5),
+                arg(s, 6)}, arg(s, 7));
+            case H.MULTICAST_CTRL -> n.multicastCtrl(arg(s, 1), arg(s, 2));
+            default -> n.changeMac(arg(s, 1));
+        };
     }
 
     /** vty_lookup: the vty at {@code reg}, or the default vty for reg 0 (early debug consoles). */

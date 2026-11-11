@@ -66,6 +66,12 @@ final class H {
     public static final int CONFER = 0xe4;
     public static final int PROD = 0xe8;
     public static final int REG_CRQ = 0xfc;
+    public static final int REGISTER_LOGICAL_LAN = 0x114;
+    public static final int FREE_LOGICAL_LAN = 0x118;
+    public static final int ADD_LOGICAL_LAN_BUFFER = 0x11c;
+    public static final int SEND_LOGICAL_LAN = 0x120;
+    public static final int MULTICAST_CTRL = 0x130;
+    public static final int CHANGE_LOGICAL_LAN_MAC = 0x14c;
     public static final int FREE_CRQ = 0x100;
     public static final int VIO_SIGNAL = 0x104;
     public static final int SEND_CRQ = 0x108;

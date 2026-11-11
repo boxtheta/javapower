@@ -14,6 +14,9 @@ Scenarios:
                  write per-test results (one "test_program:case result" line each) to --out
   progs          BE ISO with --cdrom2 attached: run every program listed in the second disc's
                  RUN file, write their output to --out
+  resume         --guest le, be or suse: boot to a shell, write a file to a disk, save the machine
+                 on exit (SIGTERM), resume it in a new process, check the file, write more, check
+                 the clock, uptime and that every CPU still runs
   regress        prompt-le, prompt-be + a short kyua subset, suse; non-zero exit on failure
   compare        compare kyua results: --baseline (QEMU) against --out (ours), per directory
 
@@ -23,6 +26,7 @@ import argparse
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -193,6 +197,8 @@ def scenario(a):
         with start(a, "progs", [ISO_BE] + a.cdrom2) as c:
             to_shell(a, c)
             progs(a, c)
+    elif a.scenario == "resume":
+        resume(a)
     elif a.scenario == "regress":
         return regress(a)
     elif a.scenario == "compare":
@@ -213,6 +219,114 @@ def progs(a, c):
     with open(out, "w") as f:
         f.write(o)
     say(a, "progs: status %d, %d lines -> %s" % (st, o.count("\n"), out))
+
+
+def suse_shell(a, c):
+    """openSUSE from GRUB to a root shell on the console: the boot entry is edited to mask the
+    first-boot wizard and the serial getty and to start systemd's debug shell on hvc0, so the
+    whole system comes up and the shell needs no password."""
+    c.expect(r"highlighted entry will be executed", timeout=a.boot_timeout)
+    c.drain(1.0, 5)
+    c.send("e")
+    c.expect(r"Ctrl-x or F10 to boot", timeout=60)
+    c.drain(1.0, 5)
+    c.send("\x1b[B" * 8)       # down to the linux line
+    c.send("\x05")              # end of line
+    c.send(" systemd.mask=jeos-firstboot.service systemd.mask=serial-getty@hvc0.service"
+           " systemd.debug_shell=hvc0", delay=0.02)
+    c.send("\x18")              # Ctrl-x: boot
+    c.expect(r"[#$] $", timeout=a.boot_timeout)
+    c.drain(5.0, 120)
+    c.send("\r")
+    c.expect(r"# $", timeout=120)
+    c.sh("export PS1='# '; stty -echoctl cols 300", timeout=120)
+    say(a, "shell after %.0fs" % c.elapsed())
+
+
+RESUME = {
+    # guest: (directory on the disk, how to get it, checksum command, CPU-pinning prefix)
+    "be": ("/tmp/m", "newfs -U /dev/da0 >/dev/null && mkdir -p /tmp/m && mount /dev/da0 /tmp/m", "sha256 -q",
+           "cpuset -l %d"),
+    "le": ("/tmp/m", "newfs -U /dev/da0 >/dev/null && mkdir -p /tmp/m && mount /dev/da0 /tmp/m", "sha256 -q",
+           "cpuset -l %d"),
+    "suse": ("/root/m", "mkdir -p /root/m", "sha256sum", "taskset -c %d"),
+}
+
+
+def guest_shell(a, c):
+    if a.guest == "suse":
+        suse_shell(a, c)
+    else:
+        to_shell(a, c)
+
+
+def timings(path):
+    t = open(path, errors="replace").read()
+    return re.findall(r"\[javapower\] (saved|loaded) \S+ (?:\((\d+) bytes\) )?in (\d+) ms", t)
+
+
+def resume(a):
+    """Use a guest, save it on SIGTERM, resume it in a new process and keep using it."""
+    os.makedirs(a.logdir, exist_ok=True)
+    state = os.path.join(a.logdir, "resume-%s.state%s" % (a.guest, ".gz" if a.gzip else ""))
+    if a.guest == "suse":
+        disk = os.path.join(a.logdir, "resume-suse.raw")
+        subprocess.check_call(["cp", "--sparse=always", SUSE, disk])
+        boot = dict(disk4k=disk)
+        cdroms = []
+    else:
+        disk = os.path.join(a.logdir, "resume-%s-scratch.raw" % a.guest)
+        with open(disk, "wb") as f:
+            f.truncate(256 << 20)
+        boot = {}
+        cdroms = [ISO_BE if a.guest == "be" else ISO_LE]
+    d, setup, sha, pin = RESUME[a.guest]
+    extra = list(a.extra) + ["--persistent"]
+    if a.guest != "suse":
+        extra += ["--disk", disk]
+    if os.path.exists(state):
+        os.remove(state)
+    sums = "%s %s/blob | cut -c1-64" % (sha, d)
+
+    b = argparse.Namespace(**vars(a))
+    b.extra = extra + ["--save-state", state]
+    b.name = "resume-%s-1" % a.guest
+    with start(b, "resume", cdroms, **boot) as c:
+        guest_shell(a, c)
+        run_cmds(a, c, [setup, "dd if=/dev/random of=%s/blob bs=64k count=64 2>/dev/null && sync" % d,
+                        sums + " > %s/blob.sum && sync && cat %s/blob.sum" % (d, d),
+                        "date -u +%s; uptime", "getconf NPROCESSORS_ONLN"])
+        t0 = time.time()
+        c.close(grace=1800)
+    say(a, "first run ended (save took %.0fs including exit): %s" % (time.time() - t0, timings(
+        os.path.join(a.logdir, b.name + "-%s.stderr.log" % a.vm))))
+    if not os.path.exists(state):
+        raise Exited("no state saved")
+
+    b.extra = extra + ["--load-state", state]
+    b.name = "resume-%s-2" % a.guest
+    with start(b, "resume", cdroms, **boot) as c:
+        time.sleep(2)
+        c.send("\r")
+        c.expect(r"# $", timeout=600)
+        say(a, "shell again after %.0fs" % c.elapsed())
+        out = run_cmds(a, c, [
+            sums + "; cat %s/blob.sum" % d,
+            "dd if=/dev/random of=%s/blob2 bs=64k count=64 2>/dev/null && sync && ls -l %s" % (d, d),
+            "date -u +%s; uptime; sleep 10; date -u +%s; uptime",
+            "getconf NPROCESSORS_ONLN",
+        ] + [(pin % k) + " sh -c 'i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; echo ran on cpu %d'" % k
+             for k in range(a.smp)])
+        got = out[0][2].split()
+        if len(got) != 2 or got[0] != got[1]:
+            raise Exited("the file written before the save reads back differently: %s" % got)
+        for k in range(a.smp):
+            if "ran on cpu %d" % k not in out[4 + k][2]:
+                raise Exited("CPU %d did not run" % k)
+        if a.guest != "suse":
+            out = run_cmds(a, c, ["umount /tmp/m && fsck -t ufs -n /dev/da0"])
+    say(a, "resumed run: %s" % timings(os.path.join(a.logdir, b.name + "-%s.stderr.log" % a.vm)))
+    say(a, "state %s: %d bytes" % (state, os.path.getsize(state)))
 
 
 def regress(a):
@@ -304,6 +418,8 @@ def main():
     p.add_argument("--out", help="results file")
     p.add_argument("--name", help="log file prefix (default: the scenario)")
     p.add_argument("--baseline", help="regress: kyua results from QEMU to compare against")
+    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="resume: which guest")
+    p.add_argument("--gzip", action="store_true", help="resume: gzip the state file")
     p.add_argument("--logdir", default=os.path.join(HOME, "javapower", "work", "guest-logs"))
     p.add_argument("--boot-timeout", type=int, default=1800)
     p.add_argument("--test-timeout", type=int, default=6 * 3600)

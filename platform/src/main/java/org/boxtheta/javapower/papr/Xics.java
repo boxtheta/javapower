@@ -34,6 +34,14 @@ public final class Xics {
     public static final int IRQ_EPOW = IRQ_BASE;
     public static final int IRQ_HOTPLUG = IRQ_BASE + 1;
     public static final int IRQ_PCI_LSI = IRQ_BASE + 0x200;
+    /**
+     * First source number of the embedder's MMIO regions ({@link MachineConfig.Mmio#interrupt}),
+     * at the top of the source space, away from the MSIs QEMU allocates upwards from
+     * {@code IRQ_BASE + 0x300}.
+     */
+    public static final int IRQ_MMIO = IRQ_BASE + 0xf00;
+    /** Number of sources from {@link #IRQ_MMIO}. */
+    public static final int MMIO_IRQS = IRQ_BASE + NR_IRQS - IRQ_MMIO;
 
     private static final int XISR_MASK = 0x00ffffff;
 

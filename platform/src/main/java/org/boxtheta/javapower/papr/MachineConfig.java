@@ -1,11 +1,14 @@
 package org.boxtheta.javapower.papr;
 
+import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Random;
 import java.util.function.Consumer;
+import org.boxtheta.javapower.core.MmioHandler;
 
 /**
  * Configuration of a {@link Machine}: the equivalent of QEMU's
@@ -17,6 +20,9 @@ import java.util.function.Consumer;
  * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk})
  * and the {@link #logSink} for diagnostics (default: the {@link System.Logger}
  * {@value PaprLog#LOGGER_NAME}).
+ *
+ * <p>Embedders can map devices of their own into the guest's real address space with
+ * {@link #addMmio}.
  *
  * <p>There is no default firmware: set one with {@link #firmware(byte[])} or
  * {@link #firmware(Path)}. The SLOF image the machine is built for ships in the separate artifact
@@ -115,12 +121,101 @@ public final class MachineConfig {
         }
     }
 
+    /**
+     * One embedder MMIO region ({@link #addMmio}): its address range, handler, byte order, and
+     * optionally a device tree node and an interrupt.
+     */
+    public static final class Mmio {
+        final String name;
+        final long base;
+        final long size;
+        final MmioHandler handler;
+        ByteOrder order = ByteOrder.BIG_ENDIAN;
+        String[] compatible;
+        Consumer<Fdt.Node> deviceTree;
+        /** 0: no interrupt; 1: level-triggered; 2: edge-triggered. */
+        int interrupt;
+
+        private Mmio(String name, long base, long size, MmioHandler handler) {
+            this.name = name;
+            this.base = base;
+            this.size = size;
+            this.handler = handler;
+        }
+
+        /**
+         * The byte order of the handler's values: how they map onto the bytes at the region's
+         * addresses (see {@link MmioHandler}). Default {@link ByteOrder#BIG_ENDIAN}, the order
+         * of the device tree and of {@code H_LOGICAL_CI_LOAD}; PCI-style devices are usually
+         * {@link ByteOrder#LITTLE_ENDIAN}. Guests of either byte order see the same bytes.
+         */
+        public Mmio byteOrder(ByteOrder o) {
+            this.order = Objects.requireNonNull(o, "order");
+            return this;
+        }
+
+        /**
+         * Describe the region in the device tree with a node {@code /<name>@<base in hex>} whose
+         * {@code compatible} property holds {@code values}; it also has {@code reg} (the range;
+         * the root has two address and two size cells) and, with {@link #interrupt}, the
+         * {@code interrupts} (source number, 1 for level or 0 for edge) and
+         * {@code interrupt-parent} (the XICS) properties. Linux and FreeBSD match drivers to
+         * such nodes by {@code compatible}.
+         */
+        public Mmio compatible(String... values) {
+            if (values.length == 0) {
+                throw new IllegalArgumentException("MMIO region " + name + ": compatible needs at least one value");
+            }
+            this.compatible = values.clone();
+            return this;
+        }
+
+        /**
+         * Add to the region's device tree node (created as for {@link #compatible} if that is not
+         * set): {@code props} is called with the node, after the machine's own properties, each
+         * time the machine builds its device tree (at reset and when the guest negotiates its
+         * features), on the thread doing that. It must add the same properties every time.
+         */
+        public Mmio deviceTree(Consumer<Fdt.Node> props) {
+            this.deviceTree = Objects.requireNonNull(props, "props");
+            return this;
+        }
+
+        /**
+         * Give the region an interrupt source of the XICS, level-triggered (an LSI: pending while
+         * raised) or edge-triggered (an MSI: each raising edge is one interrupt). The machine
+         * numbers the sources from {@link Xics#IRQ_MMIO} in the order the regions were added;
+         * {@link Machine#mmioInterrupt} returns the number, and
+         * {@link Xics#setIrq Machine.xics().setIrq(number, level)} drives it from any thread.
+         */
+        public Mmio interrupt(boolean levelTriggered) {
+            this.interrupt = levelTriggered ? 1 : 2;
+            return this;
+        }
+
+        boolean hasNode() {
+            return compatible != null || deviceTree != null;
+        }
+    }
+
+    /**
+     * Real addresses QEMU's {@code pseries} keeps for the windows of its PCI host bridges
+     * ({@code SPAPR_PCI_BASE} 32 TiB to {@code SPAPR_PCI_LIMIT} 64 TiB); no MMIO region may lie
+     * there.
+     */
+    public static final long PCI_WINDOWS_BASE = 1L << 45;
+    /** End of the PCI host bridge windows; see {@link #PCI_WINDOWS_BASE}. */
+    public static final long PCI_WINDOWS_END = 1L << 46;
+    /** MMIO regions lie below this real address, the end of what the radix MMU translates to. */
+    public static final long MMIO_LIMIT = 1L << 57;
+
     long ramSize = 2L << 30;
     int cpus = 1;
     Path firmware;
     byte[] firmwareImage;
     CharBackend console;
     final List<Disk> disks = new ArrayList<>();
+    final List<Mmio> mmios = new ArrayList<>();
     Path nvramFile;
     String bootDevice;
     String kernelCmdline;
@@ -210,6 +305,57 @@ public final class MachineConfig {
         d.persistent = true;
         disks.add(d);
         return d;
+    }
+
+    /**
+     * Map a device of the embedder's into the guest's real address space: data loads and stores
+     * the guest makes to {@code [base, base + size)}, with MMU translation or in real mode, from
+     * the interpreter or compiled code, and through {@code H_LOGICAL_CI_LOAD} and
+     * {@code H_LOGICAL_CI_STORE} (how SLOF reaches devices), call {@code handler} on the CPU's
+     * thread. See {@link MmioHandler} for the calls and the threads, and the returned
+     * {@link Mmio} for the byte order, a device tree node and an interrupt. The handler's
+     * {@link MmioHandler#saveState state} is part of the saved machine state, and the regions'
+     * names, ranges, byte orders and interrupts are part of the hardware a saved state must
+     * match.
+     *
+     * <p>The range must not overlap guest RAM (checked when the machine is built, since the RAM
+     * size may still change), the PCI host bridge windows ({@link #PCI_WINDOWS_BASE} to
+     * {@link #PCI_WINDOWS_END}) or another region, and must lie below {@link #MMIO_LIMIT}.
+     * Accesses outside every region and outside RAM raise a machine check, as before.
+     *
+     * @param name the region's name in messages and saved states, and the name of its device
+     *     tree node: 1 to 31 letters, digits and {@code , . _ + -}, starting with a letter, and
+     *     unique among the regions
+     * @throws IllegalArgumentException if the name, the range or an overlap is invalid
+     */
+    public Mmio addMmio(String name, long base, long size, MmioHandler handler) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(handler, "handler");
+        if (!name.matches("[A-Za-z][A-Za-z0-9,._+-]{0,30}")) {
+            throw new IllegalArgumentException("MMIO region name \"" + name + "\" is not a device tree node name: 1 to 31"
+                    + " letters, digits and , . _ + -, starting with a letter");
+        }
+        String what = String.format("MMIO region %s (0x%x bytes at 0x%x)", name, size, base);
+        if (size <= 0 || base < 0 || base >= MMIO_LIMIT || size > MMIO_LIMIT - base) {
+            throw new IllegalArgumentException(what + " must be a non-empty range below 0x"
+                    + Long.toHexString(MMIO_LIMIT));
+        }
+        if (base < PCI_WINDOWS_END && PCI_WINDOWS_BASE < base + size) {
+            throw new IllegalArgumentException(what + " overlaps the PCI host bridge windows [0x"
+                    + Long.toHexString(PCI_WINDOWS_BASE) + ", 0x" + Long.toHexString(PCI_WINDOWS_END) + ")");
+        }
+        for (Mmio m : mmios) {
+            if (m.name.equals(name)) {
+                throw new IllegalArgumentException("there is already an MMIO region named " + name);
+            }
+            if (base < m.base + m.size && m.base < base + size) {
+                throw new IllegalArgumentException(String.format("%s overlaps MMIO region %s (0x%x bytes at 0x%x)", what,
+                        m.name, m.size, m.base));
+            }
+        }
+        Mmio m = new Mmio(name, base, size, handler);
+        mmios.add(m);
+        return m;
     }
 
     /** Back the NVRAM with a file (8 KiB .. 1 MiB) that receives every store. */

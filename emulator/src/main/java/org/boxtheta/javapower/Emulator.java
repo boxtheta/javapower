@@ -125,8 +125,8 @@ public final class Emulator implements AutoCloseable {
             if (clock == Interpreter.Clock.DETERMINISTIC && machine.cpuCount() > 1) {
                 throw new IllegalArgumentException("the deterministic clock supports one CPU only");
             }
-            domain = seed == null ? new CpuDomain(machine.memory(), clock, timeScale)
-                    : new CpuDomain(machine.memory(), clock, timeScale, seed);
+            domain = new CpuDomain(machine.memory(), machine.mmio(), clock, timeScale,
+                    seed != null ? seed : System.nanoTime() ^ 0x5DEECE66DL);
             DecodeTable table = new DecodeTable();
             table.addAll(new IntInsns());
             FpuSets.registerAll(table);

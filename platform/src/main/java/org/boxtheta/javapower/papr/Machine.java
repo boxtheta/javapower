@@ -11,6 +11,9 @@ import java.util.Random;
 import java.util.function.Consumer;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Hypervisor;
+import org.boxtheta.javapower.core.MmioBus;
+import org.boxtheta.javapower.core.MmioHandler;
+import org.boxtheta.javapower.core.MmioRegion;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PhysicalMemory;
 import org.boxtheta.javapower.core.Spr;
@@ -62,7 +65,8 @@ import org.boxtheta.javapower.core.Spr;
  * The frequent calls therefore never take the machine lock: H_CEDE, H_CONFER, H_PROD and H_JOIN
  * touch only {@code CpuState} volatiles and this CPU's own fields; the XICS calls hold the short
  * XICS lock; H_PUT_TERM_CHAR/H_GET_TERM_CHAR hold only the vty locks; TCE calls lock one table;
- * H_LOGICAL_* and H_PAGE_INIT touch only guest memory.
+ * H_LOGICAL_* and H_PAGE_INIT touch only guest memory and MMIO regions, whose handlers are
+ * called with no lock held.
  *
  * <p>Other CPUs' state: a CPU's plain fields are written only by its own thread, with one
  * exception: start-cpu (holding the machine lock) writes the entry state into the stopped target,
@@ -146,6 +150,13 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private TceTable phbTce;
     private final List<Drc> drcs = new ArrayList<>();
     private final Rtas rtas;
+    /** The MMIO regions every CPU and H_LOGICAL_CI_* reach outside RAM. */
+    private final MmioBus mmio = new MmioBus();
+    /** The embedder's regions ({@link MachineConfig#addMmio}), in the order they were added. */
+    private final List<MmioDevice> mmioDevices = new ArrayList<>();
+
+    /** An embedder MMIO region as this machine built it: its interrupt source, or 0 for none. */
+    record MmioDevice(MachineConfig.Mmio config, MmioRegion region, int irq) {}
 
     /** Per-vCPU hypervisor state, indexed by CPU number. */
     private final VCpu[] vcpus;
@@ -255,6 +266,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
             }
         }
 
+        buildMmio();
+
         // VIO devices in creation order: nvram (always first), vty, v-scsi.
         nvram = config.nvramFile != null ? new Nvram(config.nvramFile) : new Nvram();
         CharBackend console = config.console != null ? config.console : new BufferCharBackend();
@@ -268,6 +281,31 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
         rtas = new Rtas(this);
         vty.start();
+    }
+
+    /**
+     * Map the embedder's MMIO regions and claim their interrupt sources. Checks what
+     * {@link MachineConfig#addMmio} could not: that no region overlaps RAM.
+     */
+    private void buildMmio() {
+        int nextIrq = Xics.IRQ_MMIO;
+        for (MachineConfig.Mmio c : config.mmios) {
+            if (c.base < config.ramSize) {
+                throw new IllegalArgumentException(String.format("MMIO region %s (0x%x bytes at 0x%x) overlaps guest RAM"
+                        + " (0x%x bytes at 0)", c.name, c.size, c.base, config.ramSize));
+            }
+            int irq = 0;
+            if (c.interrupt != 0) {
+                if (nextIrq >= Xics.IRQ_BASE + Xics.NR_IRQS) {
+                    throw new IllegalArgumentException("more than " + Xics.MMIO_IRQS + " MMIO regions with an interrupt");
+                }
+                irq = nextIrq++;
+                xics.claim(irq, c.interrupt == 1);
+            }
+            MmioRegion r = new MmioRegion(c.name, c.base, c.size, c.order, c.handler);
+            mmio.map(r);
+            mmioDevices.add(new MmioDevice(c, r, irq));
+        }
     }
 
     /** The rest of the constructor: everything that may fail after the NVRAM file is open. */
@@ -378,6 +416,41 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     public Nvram nvram() {
         return nvram;
+    }
+
+    /**
+     * The MMIO regions the CPUs reach outside RAM: the embedder's ({@link MachineConfig#addMmio})
+     * and any the platform maps. Whoever runs the CPUs gives it to their MMUs (the
+     * {@code emulator} module does). Platform code may map and unmap regions on it while the
+     * CPUs run; such regions are not in the device tree or the saved state unless their owner
+     * puts them there.
+     */
+    public MmioBus mmio() {
+        return mmio;
+    }
+
+    /**
+     * The XICS source number of the interrupt of the MMIO region {@code name}
+     * ({@link MachineConfig.Mmio#interrupt}). Drive it with
+     * {@link Xics#setIrq xics().setIrq(number, level)} from any thread, or
+     * {@link Xics#pulse xics().pulse(number)} for an edge-triggered one.
+     *
+     * @throws IllegalArgumentException if there is no such region or it has no interrupt
+     */
+    public int mmioInterrupt(String name) {
+        for (MmioDevice d : mmioDevices) {
+            if (d.region().name().equals(name)) {
+                if (d.irq() == 0) {
+                    throw new IllegalArgumentException("MMIO region " + name + " has no interrupt");
+                }
+                return d.irq();
+            }
+        }
+        throw new IllegalArgumentException("no MMIO region named " + name);
+    }
+
+    List<MmioDevice> mmioDevices() {
+        return Collections.unmodifiableList(mmioDevices);
     }
 
     List<VioDevice> vioDevices() {
@@ -628,6 +701,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
             }
             xics.reset();
             rtas.reset();
+            for (MmioDevice d : mmioDevices) {
+                d.region().handler().reset();
+            }
 
             if (firmware != null) {
                 mem.write(0, firmware, 0, firmware.length);
@@ -913,7 +989,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * loaded), then a {@code "PAPR"} record with the hypervisor state (shutdown state, CAS
      * results, the device tree the guest holds, process table, VPA/SLB shadow/DTL registrations,
      * watchdogs), XICS, RTAS, the DR connectors and every VIO device (CRQ, TCE tables, NVRAM
-     * contents, console input not yet read by the guest, SCSI sense state). Guest RAM and the CPUs
+     * contents, console input not yet read by the guest, SCSI sense state), and, if the machine
+     * has MMIO regions, an {@code "MMIO"} record with each region handler's own state. Guest RAM
+     * and the CPUs
      * are not written here: they belong to {@code PhysicalMemory} and the CPU module, and
      * {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
      * console and the other host resources stay outside the state.
@@ -964,6 +1042,17 @@ public final class Machine implements Hypervisor, AutoCloseable {
                     phbTce.saveState(d);
                 }
             });
+            if (!mmioDevices.isEmpty()) {
+                out.record("MMIO", d -> {
+                    for (MmioDevice m : mmioDevices) {
+                        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+                        java.io.DataOutputStream o = new java.io.DataOutputStream(b);
+                        m.region().handler().saveState(o);
+                        o.flush();
+                        org.boxtheta.javapower.core.StateOutput.writeBytes(d, b.toByteArray());
+                    }
+                });
+            }
         }
     }
 
@@ -984,6 +1073,19 @@ public final class Machine implements Hypervisor, AutoCloseable {
             d.writeInt(disk.blockSize());
             d.writeLong(disk.backend().size());
             d.writeBoolean(disk.backend().readOnly());
+        }
+        // Absent (not even a count) without MMIO regions, so such states are as before.
+        if (!mmioDevices.isEmpty()) {
+            d.writeInt(mmioDevices.size());
+            for (MmioDevice m : mmioDevices) {
+                MmioRegion r = m.region();
+                d.writeUTF(r.name());
+                d.writeLong(r.base());
+                d.writeLong(r.size());
+                d.writeBoolean(r.order() == java.nio.ByteOrder.BIG_ENDIAN);
+                d.writeInt(m.irq());
+                d.writeByte(m.config().interrupt);
+            }
         }
     }
 
@@ -1076,7 +1178,30 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (phbTce != null) {
                 phbTce.loadState(r);
             }
+            if (!mmioDevices.isEmpty()) {
+                loadMmio(in.record("MMIO"));
+            }
             vty.afterLoad();
+        }
+    }
+
+    /** Give each MMIO region's handler the state it saved. */
+    private void loadMmio(org.boxtheta.javapower.core.StateInput.Record r) throws IOException {
+        for (MmioDevice m : mmioDevices) {
+            byte[] b = r.readBytes(org.boxtheta.javapower.core.StateOutput.MAX_RECORD);
+            if (b == null) {
+                throw r.corrupt("MMIO region " + m.region().name());
+            }
+            java.io.ByteArrayInputStream bin = new java.io.ByteArrayInputStream(b);
+            try {
+                m.region().handler().loadState(new java.io.DataInputStream(bin));
+            } catch (java.io.EOFException e) {
+                throw r.corrupt("MMIO region " + m.region().name() + ": its state ends early");
+            }
+            if (bin.available() != 0) {
+                throw r.corrupt("MMIO region " + m.region().name() + ": " + bin.available() + " bytes of its state"
+                        + " left unread");
+            }
         }
     }
 
@@ -1102,10 +1227,32 @@ public final class Machine implements Hypervisor, AutoCloseable {
             compare(diff, what + "bytes", r.readLong(), cur.readLong());
             compare(diff, what + "read-only", r.readBoolean(), cur.readBoolean());
         }
+        // The MMIO regions follow the disks; with another disk count they cannot be found.
+        int sm = n != m ? 0 : r.remaining() > 0 ? r.readInt("MMIO region count", 0, 1 << 16) : 0;
+        int mm = n != m ? 0 : cur.available() > 0 ? cur.readInt() : 0;
+        compare(diff, "MMIO regions", sm, mm);
+        for (int i = 0; i < Math.min(sm, mm); i++) {
+            String name = cur.readUTF();
+            String what = "MMIO region " + i + " (" + name + "): ";
+            compare(diff, what + "name", r.readUTF(), name);
+            compare(diff, what + "base", hex(r.readLong()), hex(cur.readLong()));
+            compare(diff, what + "size", hex(r.readLong()), hex(cur.readLong()));
+            compare(diff, what + "byte order", order(r.readBoolean()), order(cur.readBoolean()));
+            compare(diff, what + "interrupt", hex(r.readInt()), hex(cur.readInt()));
+            compare(diff, what + "interrupt type", r.readUnsignedByte(), cur.readUnsignedByte());
+        }
         if (!diff.isEmpty()) {
             throw new org.boxtheta.javapower.core.StateMismatchException(
                     "the machine state was saved from different hardware: " + String.join("; ", diff));
         }
+    }
+
+    private static String hex(long v) {
+        return "0x" + Long.toHexString(v);
+    }
+
+    private static String order(boolean big) {
+        return big ? "big-endian" : "little-endian";
     }
 
     private static void compare(List<String> diff, String what, Object saved, Object now) {
@@ -1609,6 +1756,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             return H.PARAMETER;
         }
         long v = 0;
+        MmioRegion r;
         if (mem.contains(addr, size)) {
             v = switch ((int) size) {
                 case 1 -> mem.read8(addr);
@@ -1616,6 +1764,12 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 case 4 -> mem.read32be(addr) & 0xffffffffL;
                 default -> mem.read64be(addr);
             };
+        } else if ((r = mmio.regionFor(addr, (int) size)) != null) {
+            try {
+                v = r.read(addr - r.base(), (int) size, java.nio.ByteOrder.BIG_ENDIAN);
+            } catch (MmioHandler.BusError e) {
+                log.once("logical-load-bus-error", String.format("addr 0x%x: %s", addr, e.getMessage()));
+            }
         } else {
             log.once("logical-load-unassigned", String.format("addr 0x%x", addr));
         }
@@ -1630,12 +1784,19 @@ public final class Machine implements Hypervisor, AutoCloseable {
         if (size != 1 && size != 2 && size != 4 && size != 8) {
             return H.PARAMETER;
         }
+        MmioRegion r;
         if (mem.contains(addr, size)) {
             switch ((int) size) {
                 case 1 -> mem.write8(addr, (int) val);
                 case 2 -> mem.write16be(addr, (int) val);
                 case 4 -> mem.write32be(addr, (int) val);
                 default -> mem.write64be(addr, val);
+            }
+        } else if ((r = mmio.regionFor(addr, (int) size)) != null) {
+            try {
+                r.write(addr - r.base(), (int) size, val, java.nio.ByteOrder.BIG_ENDIAN);
+            } catch (MmioHandler.BusError e) {
+                log.once("logical-store-bus-error", String.format("addr 0x%x: %s", addr, e.getMessage()));
             }
         } else {
             log.once("logical-store-unassigned", String.format("addr 0x%x", addr));

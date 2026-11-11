@@ -121,7 +121,30 @@ final class DeviceTree {
         ic.setEmpty("interrupt-controller");
         ic.setString("compatible", "IBM,ppc-xicp");
         ic.setString("device_type", "PowerPC-External-Interrupt-Presentation");
+
+        for (Machine.MmioDevice d : m.mmioDevices()) {
+            if (d.config().hasNode()) {
+                mmioNode(root, d);
+            }
+        }
         return root;
+    }
+
+    /** The node of an embedder MMIO region, last among the root's children. */
+    private static void mmioNode(Fdt.Node root, Machine.MmioDevice d) {
+        MachineConfig.Mmio c = d.config();
+        Fdt.Node n = root.addChild(String.format("%s@%x", c.name, c.base));
+        n.setU64s("reg", c.base, c.size);
+        if (c.compatible != null) {
+            n.setStrings("compatible", c.compatible);
+        }
+        if (d.irq() != 0) {
+            n.setCells("interrupts", d.irq(), c.interrupt == 1 ? 1 : 0);
+            n.setCell("interrupt-parent", PHANDLE_INTC);
+        }
+        if (c.deviceTree != null) {
+            c.deviceTree.accept(n);
+        }
     }
 
     /** {@code ibm,drc-types/names/power-domains/indexes} for a set of connectors (spapr_dt_drc). */

@@ -268,6 +268,53 @@ class PciTest {
     }
 
     @Test
+    void barMovedWhileAnotherCpuUsesIt() throws Exception {
+        Dev d = new Dev();
+        Rig r = new Rig(cfg(d).cpus(2));
+        long a = MEM32_CPU + 0x1000;
+        long b = MEM32_CPU + 0x8000;
+        put(r, 0, 0x10, 4, 0x80001000);
+        put(r, 0, 4, 2, PciDevice.COMMAND_MEMORY);
+        d.bar0.write(0, 4, 0x5a5a5a5aL);
+        java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicLong hits = new java.util.concurrent.atomic.AtomicLong();
+        java.util.concurrent.ConcurrentLinkedQueue<String> errors = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        // CPU 1 loads from both addresses while CPU 0 moves the BAR between them and disables it.
+        Thread cpu1 = new Thread(() -> {
+            while (!stop.get()) {
+                for (long addr : new long[] {a, b}) {
+                    long st = r.hcallOn(r.cpus[1], H.LOGICAL_CI_LOAD, 4, addr);
+                    long v = r.cpus[1].gpr[4];
+                    if (st != H.SUCCESS) {
+                        errors.add("status " + st);
+                    } else if (v == 0x5a5a5a5aL) {
+                        hits.incrementAndGet();
+                    } else if (v != 0) { // 0: nothing mapped there at that moment
+                        errors.add("read 0x" + Long.toHexString(v));
+                    }
+                }
+            }
+        });
+        cpu1.start();
+        for (int i = 0; i < 2000; i++) {
+            put(r, 0, 0x10, 4, i % 2 == 0 ? 0x80008000 : 0x80001000);
+            if (i % 7 == 0) {
+                put(r, 0, 4, 2, 0);
+                put(r, 0, 4, 2, PciDevice.COMMAND_MEMORY);
+            }
+        }
+        stop.set(true);
+        cpu1.join();
+        assertTrue(errors.isEmpty(), errors.toString());
+        assertTrue(hits.get() > 0);
+        // It ended at a: only that address reaches the device.
+        assertEquals(a, d.barAddress(0));
+        assertEquals(0x5a5a5a5aL, load(r, a, 4));
+        assertNull(load(r, b, 4));
+        assertEquals(1, r.m.mmio().regions().size());
+    }
+
+    @Test
     void overlappingBarsAreNotMapped() {
         Dev a = new Dev();
         Dev b = new Dev();

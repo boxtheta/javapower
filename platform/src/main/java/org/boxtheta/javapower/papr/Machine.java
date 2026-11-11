@@ -210,9 +210,6 @@ public final class Machine implements Hypervisor, AutoCloseable {
     public Machine(MachineConfig config) throws IOException {
         this.config = config;
         this.log = new PaprLog(config.logSink);
-        if (config.ramSize < (256L << 20) || config.ramSize % (256L << 20) != 0) {
-            throw new IllegalArgumentException("RAM size must be a non-zero multiple of 256 MiB");
-        }
         byte[] fw;
         if (config.firmwareImage != null) {
             fw = config.firmwareImage.clone();

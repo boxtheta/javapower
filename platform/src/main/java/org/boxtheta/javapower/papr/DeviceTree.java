@@ -24,6 +24,7 @@ final class DeviceTree {
     static final long PHB0_DMA_WINDOW = 0x40000000L;
     static final int PHB0_LSI_BASE = Xics.IRQ_PCI_LSI;
     static final int MAX_PHBS = 31;
+    /** QEMU's logical memory block size (SPAPR_MEMORY_BLOCK_SIZE). */
     static final long LMB_SIZE = 256L << 20;
     static final int TIMEBASE_FREQ = 512000000;
     static final int CLOCK_FREQ = 1000000000;
@@ -200,6 +201,16 @@ final class DeviceTree {
         return ranges;
     }
 
+    /**
+     * The logical memory block size advertised in {@code ibm,lrdr-capacity}: QEMU's 256 MiB when
+     * the RAM size is a multiple of it, otherwise the largest power of two that divides the RAM
+     * size (at least {@link MachineConfig#RAM_GRANULE}), so the RAM is always a whole number of
+     * blocks. The machine has no hot-pluggable memory, so no block is ever added or removed.
+     */
+    static long lmbSize(long ramSize) {
+        return Math.min(LMB_SIZE, Long.lowestOneBit(ramSize));
+    }
+
     private static void rtas(Machine m, Fdt.Node r) {
         for (int i = RTAS_TOKENS.size() - 1; i >= 0; i--) {
             r.setCell(RTAS_TOKENS.get(i), Rtas.TOKEN_BASE + i);
@@ -210,8 +221,9 @@ final class DeviceTree {
         r.setCells("ibm,configure-kernel-dump-sizes", 1, 0, 16 + 12 + 4 + cpus * 79 * 16, 2, 0, 0);
         r.set("ibm,configure-kernel-dump-version", new byte[] {0x01, 0x00, 0x01, 0x00});
         long maxAddr = m.config().ramSize;
-        r.setCells("ibm,lrdr-capacity", (int) (maxAddr >>> 32), (int) maxAddr, (int) (LMB_SIZE >>> 32),
-                (int) LMB_SIZE, cpus);
+        long lmb = lmbSize(maxAddr);
+        r.setCells("ibm,lrdr-capacity", (int) (maxAddr >>> 32), (int) maxAddr, (int) (lmb >>> 32), (int) lmb,
+                cpus);
         r.setEmpty("ibm,extended-os-term");
         r.setEmpty("ibm,change-msix-capable");
         r.setCell("rtas-event-scan-rate", Rtas.EVENT_SCAN_RATE);

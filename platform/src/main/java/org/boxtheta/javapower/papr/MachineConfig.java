@@ -32,6 +32,17 @@ public final class MachineConfig {
      * reservation and the 2 MiB CAS buffer SLOF provides.
      */
     public static final int MAX_CPUS = 64;
+    /**
+     * Least guest RAM, 64 MiB. SLOF needs about 37 MiB of real mode area for itself, the ROM
+     * filesystem it copies out of the firmware image and the device tree, and the real mode area
+     * is the largest power of two not above the RAM size (see {@link #ram}).
+     */
+    public static final long MIN_RAM = 64L << 20;
+    /**
+     * Guest RAM is a whole number of these, 16 MiB: the smallest logical memory block size
+     * PowerVM offers, and Linux's memory section size on ppc64.
+     */
+    public static final long RAM_GRANULE = 16L << 20;
 
     /** One SCSI device on the v-scsi bus. */
     public static final class Disk {
@@ -122,8 +133,21 @@ public final class MachineConfig {
     Clock clock = Clock.systemUTC();
     Consumer<PaprLog.Entry> logSink;
 
-    /** Guest RAM in bytes (a multiple of 256 MiB; the reference uses 2 GiB). */
+    /**
+     * Guest RAM in bytes: at least {@link #MIN_RAM} (64 MiB) and a multiple of
+     * {@link #RAM_GRANULE} (16 MiB); default 2 GiB, as in the reference. Like QEMU, the machine
+     * makes the largest power of two not above the RAM size its real mode area ({@code memory@0}
+     * in the device tree, the only memory SLOF uses) and describes the rest in further
+     * {@code memory@} nodes. QEMU itself only accepts multiples of 256 MiB; for those the device
+     * tree is the same as QEMU's.
+     *
+     * @throws IllegalArgumentException if {@code bytes} is below 64 MiB or not a multiple of 16 MiB
+     */
     public MachineConfig ram(long bytes) {
+        if (bytes < MIN_RAM || bytes % RAM_GRANULE != 0) {
+            throw new IllegalArgumentException("RAM size must be at least " + (MIN_RAM >> 20)
+                    + " MiB and a multiple of " + (RAM_GRANULE >> 20) + " MiB, got " + bytes + " bytes");
+        }
         this.ramSize = bytes;
         return this;
     }

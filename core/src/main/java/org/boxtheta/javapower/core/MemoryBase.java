@@ -66,6 +66,98 @@ abstract class MemoryBase {
      */
     public abstract Object jitBacking();
 
+    /** Copy {@code len} bytes of RAM at {@code addr} into {@code dst}; documented in {@code PhysicalMemory}. */
+    public abstract void read(long addr, byte[] dst, int off, int len);
+
+    /** Copy {@code len} bytes from {@code src} into RAM at {@code addr}; documented in {@code PhysicalMemory}. */
+    public abstract void write(long addr, byte[] src, int off, int len);
+
+    // ---- saved state ----------------------------------------------------------------------------
+
+    /** Bytes of RAM per {@code "RAM "} record. */
+    static final int STATE_CHUNK = 1 << 20;
+    private static final int PAGE = 1 << CODE_PAGE_SHIFT;
+
+    /**
+     * Write the contents of RAM to {@code out}: a {@code "MEM "} record with the RAM size, then
+     * one {@code "RAM "} record per MiB, each holding the chunk's address and length, a bitmap of
+     * its 4 KiB pages that are not all zero, and the bytes of those pages. Zero pages take one
+     * bit. The machine must not run meanwhile.
+     */
+    public void saveState(StateOutput out) throws java.io.IOException {
+        out.record("MEM ", d -> d.writeLong(size));
+        byte[] buf = new byte[STATE_CHUNK];
+        byte[] zero = new byte[PAGE];
+        for (long base = 0; base < size; base += STATE_CHUNK) {
+            int len = (int) Math.min(STATE_CHUNK, size - base);
+            read(base, buf, 0, len);
+            int pages = (len + PAGE - 1) / PAGE;
+            byte[] map = new byte[(pages + 7) / 8];
+            for (int p = 0; p < pages; p++) {
+                int off = p * PAGE;
+                int n = Math.min(PAGE, len - off);
+                if (java.util.Arrays.mismatch(buf, off, off + n, zero, 0, n) >= 0) {
+                    map[p >>> 3] |= (byte) (1 << (p & 7));
+                }
+            }
+            long b = base;
+            out.record("RAM ", d -> {
+                d.writeLong(b);
+                d.writeInt(len);
+                d.write(map);
+                for (int p = 0; p < pages; p++) {
+                    if ((map[p >>> 3] & (1 << (p & 7))) != 0) {
+                        int off = p * PAGE;
+                        d.write(buf, off, Math.min(PAGE, len - off));
+                    }
+                }
+            });
+        }
+    }
+
+    /**
+     * Read RAM contents written by {@code saveState} into this memory, replacing all of it. The
+     * machine must not run meanwhile. Translations engines hold of the old contents become stale
+     * through code-write tracking, as after any write.
+     *
+     * @throws StateMismatchException if the state was saved from RAM of another size (nothing
+     *     is changed then)
+     * @throws StateFormatException if the input is truncated or corrupt; RAM is then partly
+     *     overwritten
+     */
+    public void loadState(StateInput in) throws java.io.IOException {
+        StateInput.Record r = in.record("MEM ");
+        long saved = r.readLong();
+        if (saved != size) {
+            throw new StateMismatchException("the machine state has " + saved + " bytes of RAM; this machine has "
+                    + size);
+        }
+        byte[] buf = new byte[STATE_CHUNK];
+        for (long base = 0; base < size; base += STATE_CHUNK) {
+            int len = (int) Math.min(STATE_CHUNK, size - base);
+            r = in.record("RAM ");
+            long b = r.readLong();
+            int l = r.readInt();
+            if (b != base || l != len) {
+                throw r.corrupt("chunk at 0x" + Long.toHexString(b) + " of " + l + " bytes, expected 0x"
+                        + Long.toHexString(base) + " of " + len);
+            }
+            int pages = (len + PAGE - 1) / PAGE;
+            byte[] map = new byte[(pages + 7) / 8];
+            r.readFully(map);
+            for (int p = 0; p < pages; p++) {
+                int off = p * PAGE;
+                int n = Math.min(PAGE, len - off);
+                if ((map[p >>> 3] & (1 << (p & 7))) != 0) {
+                    r.readFully(buf, off, n);
+                } else {
+                    java.util.Arrays.fill(buf, off, off + n, (byte) 0);
+                }
+            }
+            write(base, buf, 0, len);
+        }
+    }
+
     // ---- code-write tracking --------------------------------------------------------------------
 
     /**

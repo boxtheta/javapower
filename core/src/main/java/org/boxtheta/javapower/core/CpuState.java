@@ -146,6 +146,111 @@ public final class CpuState {
         }
     }
 
+    /**
+     * Write the architectural state to a saved machine state: registers, SPRs, the reservation,
+     * {@code procTable}, the idle and RTAS-stopped flags ({@code ceded}, {@code halted},
+     * {@code prodded}) and {@code icount}. Not written: {@code extIrq} (the interrupt controller's
+     * output, restored with it), {@code mem}, {@code hv}, {@code runner} and
+     * {@code stopRequested}, which belong to the host side. Work posted with {@link #runOnCpu}
+     * cannot be saved: run it first.
+     *
+     * @throws IllegalStateException if posted work is pending
+     */
+    public void saveState(java.io.DataOutput out) throws java.io.IOException {
+        if (workPending || !work.isEmpty()) {
+            throw new IllegalStateException("CPU " + index + " has posted work pending; run it before saving");
+        }
+        out.writeInt(index);
+        for (long v : gpr) {
+            out.writeLong(v);
+        }
+        out.writeLong(pc);
+        out.writeLong(npc);
+        out.writeLong(lr);
+        out.writeLong(ctr);
+        out.writeLong(msr);
+        out.writeInt(cr);
+        out.writeLong(getXer());
+        for (int i = 0; i < 64; i++) {
+            out.writeLong(vsrHi[i]);
+            out.writeLong(vsrLo[i]);
+        }
+        out.writeLong(fpscr);
+        out.writeInt(vscr);
+        int n = 0;
+        for (long v : spr) {
+            if (v != 0) {
+                n++;
+            }
+        }
+        out.writeShort(n);
+        for (int i = 0; i < spr.length; i++) {
+            if (spr[i] != 0) {
+                out.writeShort(i);
+                out.writeLong(spr[i]);
+            }
+        }
+        out.writeBoolean(resValid);
+        out.writeLong(resAddr);
+        out.writeInt(resLen);
+        out.writeLong(resVal);
+        out.writeLong(procTable);
+        out.writeBoolean(ceded);
+        out.writeBoolean(halted);
+        out.writeBoolean(prodded);
+        out.writeLong(icount);
+    }
+
+    /**
+     * Read the state written by {@link #saveState} into this object (see there for what it
+     * covers). Call only while no thread runs this CPU.
+     *
+     * @throws StateFormatException if the input is corrupt or was saved for another CPU index
+     */
+    public void loadState(StateInput.Record in) throws java.io.IOException {
+        int idx = in.readInt();
+        if (idx != index) {
+            throw in.corrupt("state of CPU " + idx + " where CPU " + index + " was expected");
+        }
+        for (int i = 0; i < 32; i++) {
+            gpr[i] = in.readLong();
+        }
+        pc = in.readLong();
+        npc = in.readLong();
+        lr = in.readLong();
+        ctr = in.readLong();
+        msr = in.readLong();
+        cr = in.readInt();
+        setXer(in.readLong());
+        for (int i = 0; i < 64; i++) {
+            vsrHi[i] = in.readLong();
+            vsrLo[i] = in.readLong();
+        }
+        fpscr = in.readLong();
+        vscr = in.readInt();
+        int n = in.readUnsignedShort();
+        if (n > spr.length) {
+            throw in.corrupt(n + " SPRs");
+        }
+        java.util.Arrays.fill(spr, 0);
+        for (int k = 0; k < n; k++) {
+            int i = in.readUnsignedShort();
+            if (i >= spr.length) {
+                throw in.corrupt("SPR " + i);
+            }
+            spr[i] = in.readLong();
+        }
+        resValid = in.readBoolean();
+        resAddr = in.readLong();
+        resLen = in.readInt();
+        resVal = in.readLong();
+        procTable = in.readLong();
+        ceded = in.readBoolean();
+        halted = in.readBoolean();
+        prodded = in.readBoolean();
+        icount = in.readLong();
+    }
+
     public long getXer() {
         return ((long) so << 31) | ((long) ov << 30) | ((long) ca << 29)
                 | ((long) ov32 << 19) | ((long) ca32 << 18) | (xerBc & 0x7f);

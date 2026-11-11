@@ -8,7 +8,8 @@ subprojects {
     apply plugin: 'java-library'
     apply plugin: 'maven-publish'
     group = 'org.boxtheta.javapower'
-    version = '0.1.0-SNAPSHOT'
+    // scripts/release.sh passes the release version; everything else builds a snapshot.
+    version = providers.gradleProperty('releaseVersion').getOrElse('0.1.0-SNAPSHOT')
     repositories { mavenCentral() }
     java {
         // Compiled and tested with JDK 21, the oldest supported runtime; `test27` also runs the
@@ -29,6 +30,14 @@ subprojects {
         options.addStringOption('Xdoclint:none', '-quiet')
     }
     publishing {
+        // A plain directory in Maven layout; scripts/release.sh signs it and turns it into the
+        // bundle Maven Central's portal accepts (publishAllPublicationsToStagingRepository).
+        repositories {
+            maven {
+                name = 'staging'
+                url = rootProject.layout.buildDirectory.dir('central-staging')
+            }
+        }
         publications {
             maven(MavenPublication) {
                 artifactId = "javapower-${project.name}"

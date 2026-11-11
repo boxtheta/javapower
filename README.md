@@ -194,6 +194,16 @@ smaller than `gzip -9`), so the output is bit-for-bit reproducible. The cross to
 `--install` copies the result into the resources. To move to a new SLOF release, change the tag
 and commit (and if needed the snapshot date) in `firmware-build/Containerfile`.
 
+### Releasing
+
+`scripts/release.sh <version> [--upload]` builds and checks the modules on the build server,
+fetches them, signs every artifact here with the release key (GPG
+`6E501D76959FFF2632BDEE5B8BE9EC452CDD18D3`) and writes
+`build/javapower-<version>-central.zip`, the bundle Maven Central's portal accepts. With `--upload`
+it sends the bundle to the portal (user token in `CENTRAL_TOKEN_USER` and `CENTRAL_TOKEN_PASSWORD`)
+as a deployment that is then released by hand in the portal. Run it from a terminal, on a clean
+checkout of the commit to release.
+
 ## Third-party code
 
 `javapower-cpu-int` bundles [ASM](https://asm.ow2.io/) 9.11.1, which its JIT uses to generate

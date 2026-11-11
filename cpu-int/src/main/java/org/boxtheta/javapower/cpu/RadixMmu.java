@@ -1,9 +1,13 @@
 package org.boxtheta.javapower.cpu;
 
+import java.nio.ByteOrder;
 import java.util.Arrays;
 
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.GuestMemory;
+import org.boxtheta.javapower.core.MmioBus;
+import org.boxtheta.javapower.core.MmioHandler;
+import org.boxtheta.javapower.core.MmioRegion;
 import org.boxtheta.javapower.core.Msr;
 import org.boxtheta.javapower.core.PhysicalMemory;
 import org.boxtheta.javapower.core.PpcException;
@@ -32,7 +36,16 @@ import org.boxtheta.javapower.core.Spr;
  * entries are read with single 8-byte loads and never written, so walks need no locking
  * (reference and change bits are the guest's to set, with its own atomic updates).
  *
- * <p>Accesses outside guest RAM raise a machine check with QEMU's POWER9 SRR1/DSISR codes.
+ * <p>Accesses outside guest RAM go to the {@link MmioBus} region they fall in, if any; the rest
+ * raise a machine check with QEMU's POWER9 SRR1/DSISR codes. Only the paths that find an access
+ * is not to RAM consult the bus (real mode's bounds check and the end of a table walk): MMIO
+ * pages never enter the TLB, so RAM accesses, the TLB's hit path and compiled code are as they
+ * were without MMIO. The access methods catch {@link MmioTrap} from {@link #xlate} and call the
+ * region's handler, swapping the value between the region's byte order and MSR[LE]'s. Only
+ * naturally aligned data accesses wholly inside a region reach it: others, and instruction
+ * fetches, raise the machine check of unassigned memory, as does a handler's
+ * {@link MmioHandler.BusError}. {@link #translateData} returns the real address of an MMIO
+ * access like any other; callers that use it to reach RAM directly check it is RAM.
  */
 public final class RadixMmu implements GuestMemory {
     // Radix PTE / PDE fields (Java bit numbering of the 64-bit big-endian entry).
@@ -80,6 +93,24 @@ public final class RadixMmu implements GuestMemory {
     private final CpuState s;
     private final PhysicalMemory pm;
     private final long ramSize;
+    private final MmioBus mmio;
+
+    /**
+     * Raised by {@link #xlate} for a data access to an MMIO region, with the region and real
+     * address in {@link #trap}; never leaves this class. One preallocated instance without a
+     * stack trace per MMU (an MMU has one thread).
+     */
+    private static final class MmioTrap extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        transient MmioRegion region;
+        long pa;
+
+        MmioTrap() {
+            super(null, null, false, false);
+        }
+    }
+
+    private final MmioTrap trap = new MmioTrap();
 
     /** Tags and addends, indexed by ((ctx * 3 + type) << TLB_BITS) | (vpn & mask). */
     final long[] tag = new long[4 * 3 * TLB_SIZE];
@@ -108,10 +139,17 @@ public final class RadixMmu implements GuestMemory {
     /** Statistics, for tests and tuning. */
     long walks;
 
+    /** An MMU with no MMIO: everything outside RAM is unassigned. */
     public RadixMmu(CpuState s, PhysicalMemory pm) {
+        this(s, pm, new MmioBus());
+    }
+
+    /** An MMU whose accesses outside RAM go to the regions of {@code mmio}. */
+    public RadixMmu(CpuState s, PhysicalMemory pm, MmioBus mmio) {
         this.s = s;
         this.pm = pm;
         this.ramSize = pm.size();
+        this.mmio = mmio;
     }
 
     public PhysicalMemory physical() {
@@ -172,7 +210,7 @@ public final class RadixMmu implements GuestMemory {
         if (!reloc) {
             long pa = ea & 0x0FFFFFFFFFFFFFFFL;
             if (pa > ramSize - size) {
-                throw machineCheck(ea, type);
+                throw notRam(ea, pa, type, size);
             }
             return pa;
         }
@@ -181,7 +219,7 @@ public final class RadixMmu implements GuestMemory {
         if (tag[slot] == ((ea & PAGE_MASK) | epoch[ctx])) {
             return addend[slot] + ea;
         }
-        return miss(ea, type, ctx);
+        return miss(ea, type, ctx, size);
     }
 
     private PpcException machineCheck(long ea, int type) {
@@ -189,7 +227,48 @@ public final class RadixMmu implements GuestMemory {
         return PpcException.machineCheck(ea);
     }
 
-    private long miss(long ea, int type, int ctx) {
+    /**
+     * The exception for a {@code size}-byte access at real address {@code pa} outside RAM:
+     * {@link #trap} if it is a data access to an MMIO region, else a machine check.
+     */
+    private RuntimeException notRam(long ea, long pa, int type, int size) {
+        if (type != EXEC) {
+            MmioRegion r = mmio.regionFor(pa, size);
+            if (r != null) {
+                trap.region = r;
+                trap.pa = pa;
+                return trap;
+            }
+        }
+        return machineCheck(ea, type);
+    }
+
+    /** The byte order of the guest's accesses. */
+    private ByteOrder order() {
+        return (s.msr & Msr.LE) != 0 ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+    }
+
+    /** The load {@link #trap} stands for, of {@code size} bytes at {@code ea}: the guest-order value. */
+    private long mmioRead(long ea, int size) {
+        MmioRegion r = trap.region;
+        try {
+            return r.read(trap.pa - r.base(), size, order());
+        } catch (MmioHandler.BusError e) {
+            throw machineCheck(ea, LOAD);
+        }
+    }
+
+    /** The store {@link #trap} stands for, of the guest-order value {@code v}. */
+    private void mmioWrite(long ea, int size, long v) {
+        MmioRegion r = trap.region;
+        try {
+            r.write(trap.pa - r.base(), size, v, order());
+        } catch (MmioHandler.BusError e) {
+            throw machineCheck(ea, STORE);
+        }
+    }
+
+    private long miss(long ea, int type, int ctx, int accessSize) {
         walks++;
         long q = ea >>> 62;
         if ((ea & 0x3FF0000000000000L) != 0 || q == 1 || q == 2) {
@@ -272,7 +351,7 @@ public final class RadixMmu implements GuestMemory {
 
         long pagePa = raddr & PAGE_MASK;
         if (pagePa > ramSize - 4096) {
-            throw machineCheck(ea, type);
+            throw notRam(ea, raddr, type, accessSize);
         }
         // Fill every access type the PTE grants (one QEMU TLB entry covers them all).
         long tagv = (ea & PAGE_MASK) | epoch[ctx];
@@ -369,12 +448,28 @@ public final class RadixMmu implements GuestMemory {
 
     @Override
     public long translateData(long ea, boolean store) {
-        return xlate(eaMode(ea), store ? STORE : LOAD, 1);
+        try {
+            return xlate(eaMode(ea), store ? STORE : LOAD, 1);
+        } catch (MmioTrap t) {
+            return t.pa;
+        }
+    }
+
+    /** Whether {@code len} bytes at real address {@code pa} (from {@link #translateData}) are RAM. */
+    boolean isRam(long pa, int len) {
+        return pm.contains(pa, len);
     }
 
     @Override
     public int read8(long ea) {
-        return pm.read8(xlate(eaMode(ea), LOAD, 1));
+        ea = eaMode(ea);
+        long pa;
+        try {
+            pa = xlate(ea, LOAD, 1);
+        } catch (MmioTrap t) {
+            return (int) mmioRead(ea, 1);
+        }
+        return pm.read8(pa);
     }
 
     @Override
@@ -383,7 +478,12 @@ public final class RadixMmu implements GuestMemory {
         if ((ea & 0xfff) > 0xffe) {
             return (int) readCross(ea, 2);
         }
-        long pa = xlate(ea, LOAD, 2);
+        long pa;
+        try {
+            pa = xlate(ea, LOAD, 2);
+        } catch (MmioTrap t) {
+            return (int) mmioRead(ea, 2);
+        }
         return (s.msr & Msr.LE) != 0 ? pm.read16le(pa) : pm.read16be(pa);
     }
 
@@ -393,7 +493,12 @@ public final class RadixMmu implements GuestMemory {
         if ((ea & 0xfff) > 0xffc) {
             return (int) readCross(ea, 4);
         }
-        long pa = xlate(ea, LOAD, 4);
+        long pa;
+        try {
+            pa = xlate(ea, LOAD, 4);
+        } catch (MmioTrap t) {
+            return (int) mmioRead(ea, 4);
+        }
         return (s.msr & Msr.LE) != 0 ? pm.read32le(pa) : pm.read32be(pa);
     }
 
@@ -403,13 +508,25 @@ public final class RadixMmu implements GuestMemory {
         if ((ea & 0xfff) > 0xff8) {
             return readCross(ea, 8);
         }
-        long pa = xlate(ea, LOAD, 8);
+        long pa;
+        try {
+            pa = xlate(ea, LOAD, 8);
+        } catch (MmioTrap t) {
+            return mmioRead(ea, 8);
+        }
         return (s.msr & Msr.LE) != 0 ? pm.read64le(pa) : pm.read64be(pa);
     }
 
     @Override
     public void write8(long ea, int v) {
-        long pa = xlate(eaMode(ea), STORE, 1);
+        ea = eaMode(ea);
+        long pa;
+        try {
+            pa = xlate(ea, STORE, 1);
+        } catch (MmioTrap t) {
+            mmioWrite(ea, 1, v);
+            return;
+        }
         guard(pa, 1);
         pm.write8(pa, v);
     }
@@ -421,7 +538,13 @@ public final class RadixMmu implements GuestMemory {
             writeCross(ea, 2, v);
             return;
         }
-        long pa = xlate(ea, STORE, 2);
+        long pa;
+        try {
+            pa = xlate(ea, STORE, 2);
+        } catch (MmioTrap t) {
+            mmioWrite(ea, 2, v);
+            return;
+        }
         guard(pa, 2);
         if ((s.msr & Msr.LE) != 0) {
             pm.write16le(pa, v);
@@ -437,7 +560,13 @@ public final class RadixMmu implements GuestMemory {
             writeCross(ea, 4, v);
             return;
         }
-        long pa = xlate(ea, STORE, 4);
+        long pa;
+        try {
+            pa = xlate(ea, STORE, 4);
+        } catch (MmioTrap t) {
+            mmioWrite(ea, 4, v);
+            return;
+        }
         guard(pa, 4);
         if ((s.msr & Msr.LE) != 0) {
             pm.write32le(pa, v);
@@ -453,7 +582,13 @@ public final class RadixMmu implements GuestMemory {
             writeCross(ea, 8, v);
             return;
         }
-        long pa = xlate(ea, STORE, 8);
+        long pa;
+        try {
+            pa = xlate(ea, STORE, 8);
+        } catch (MmioTrap t) {
+            mmioWrite(ea, 8, v);
+            return;
+        }
         guard(pa, 8);
         if ((s.msr & Msr.LE) != 0) {
             pm.write64le(pa, v);
@@ -465,10 +600,17 @@ public final class RadixMmu implements GuestMemory {
     /**
      * dcbz: zero the 128-byte block at {@code ea} (aligned, already truncated). One translation
      * (as the block's first doubleword store would make; the block never crosses a page) and one
-     * fill; faults exactly as the first of sixteen doubleword stores would.
+     * fill; faults exactly as the first of sixteen doubleword stores would. On an MMIO region
+     * it raises the alignment interrupt the architecture specifies for dcbz on caching-inhibited
+     * storage (QEMU stores zeros instead).
      */
     void zeroBlock(long ea) {
-        long pa = xlate(ea, STORE, 8);
+        long pa;
+        try {
+            pa = xlate(ea, STORE, 8);
+        } catch (MmioTrap t) {
+            throw PpcException.alignment(ea);
+        }
         guard(pa, 128);
         pm.fill(pa, 128, (byte) 0);
     }
@@ -485,13 +627,22 @@ public final class RadixMmu implements GuestMemory {
         }
     }
 
-    /** Access straddling a 4 KiB boundary: translate both pages, then move bytes. */
+    /**
+     * Access straddling a 4 KiB boundary: translate both pages, then move bytes. Being unaligned,
+     * it is unassigned memory if either part is MMIO.
+     */
     private long readCross(long ea, int size) {
         long mask = s.msr < 0 ? -1L : 0xffffffffL;
         long ea2 = ((ea | 0xfff) + 1) & mask;
         int n1 = (int) (0x1000 - (ea & 0xfff));
-        long pa1 = xlate(ea, LOAD, n1);
-        long pa2 = xlate(ea2, LOAD, size - n1);
+        long pa1;
+        long pa2;
+        try {
+            pa1 = xlate(ea, LOAD, n1);
+            pa2 = xlate(ea2, LOAD, size - n1);
+        } catch (MmioTrap t) {
+            throw machineCheck(ea, LOAD);
+        }
         boolean le = (s.msr & Msr.LE) != 0;
         long v = 0;
         for (int k = 0; k < size; k++) {
@@ -509,8 +660,14 @@ public final class RadixMmu implements GuestMemory {
         long mask = s.msr < 0 ? -1L : 0xffffffffL;
         long ea2 = ((ea | 0xfff) + 1) & mask;
         int n1 = (int) (0x1000 - (ea & 0xfff));
-        long pa1 = xlate(ea, STORE, n1);
-        long pa2 = xlate(ea2, STORE, size - n1);
+        long pa1;
+        long pa2;
+        try {
+            pa1 = xlate(ea, STORE, n1);
+            pa2 = xlate(ea2, STORE, size - n1);
+        } catch (MmioTrap t) {
+            throw machineCheck(ea, STORE);
+        }
         guard(pa1, n1);
         guard(pa2, size - n1);
         boolean le = (s.msr & Msr.LE) != 0;

@@ -275,21 +275,27 @@ final class SystemInsns {
 
     // ---------------------------------------------------------------- storage control
 
-    /** dcbf / dcbst: a one-byte load translation (QEMU), no other effect. */
+    /**
+     * dcbf / dcbst: translated as a one-byte load (QEMU loads the byte), no other effect; on an
+     * MMIO region the device sees no access.
+     */
     static void dcbfst(CpuState s, int i) {
-        s.mem.read8(Fields.ea(s, raOr0(s, i) + s.gpr[rb(i)]));
+        s.mem.translateData(Fields.ea(s, raOr0(s, i) + s.gpr[rb(i)]), false);
     }
 
     /**
-     * icbi: a word load of the start of the 128-byte block (QEMU). Translated code of the block's
-     * page is dropped on every CPU (the guest's cross-modification protocol; see
+     * icbi: translated as a word load of the start of the 128-byte block (QEMU loads the word;
+     * on an MMIO region the device sees no access). Translated code of the block's page is
+     * dropped on every CPU (the guest's cross-modification protocol; see
      * {@link org.boxtheta.javapower.core.PhysicalMemory#invalidateCode}).
      */
     static void icbi(CpuState s, int i) {
         long ea = Fields.ea(s, raOr0(s, i) + s.gpr[rb(i)]) & ~127L;
-        s.mem.read32(ea);
+        long pa = s.mem.translateData(ea, false);
         RadixMmu m = Interpreter.of(s).mmu;
-        m.physical().invalidateCode(s.mem.translateData(ea, false), 128);
+        if (m.isRam(pa, 128)) {
+            m.physical().invalidateCode(pa, 128);
+        }
     }
 
     static void slbia(CpuState s, int i) {

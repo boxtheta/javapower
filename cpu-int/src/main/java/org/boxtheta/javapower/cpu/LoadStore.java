@@ -442,11 +442,28 @@ final class LoadStore {
 
     // ---------------------------------------------------------------- larx / stcx
 
+    /** DSISR bit 37 (ISA numbering): an atomic or reserving access to caching-inhibited storage. */
+    static final int DSISR_CI_ATOMIC = 0x04000000;
+
+    /**
+     * Translate {@code ea} for a larx, stcx or atomic memory operation and return the real
+     * address, which is RAM: on an MMIO region these raise the data storage interrupt the
+     * architecture specifies for caching-inhibited storage (QEMU performs them on the device
+     * instead), before the device sees any access.
+     */
+    static long atomicRa(CpuState s, long ea, boolean store) {
+        long ra = s.mem.translateData(ea, store);
+        if (!Interpreter.of(s).mmu.isRam(ra, 1)) {
+            throw PpcException.dsi(ea, DSISR_CI_ATOMIC | (store ? PpcException.DSISR_ISSTORE : 0));
+        }
+        return ra;
+    }
+
     private static long reserve(CpuState s, long ea, int len) {
         if ((ea & (len - 1)) != 0) {
             throw PpcException.alignment(ea);
         }
-        long ra = s.mem.translateData(ea, false);
+        long ra = atomicRa(s, ea, false);
         long v = switch (len) {
             case 1 -> s.mem.read8(ea);
             case 2 -> s.mem.read16(ea);
@@ -485,7 +502,7 @@ final class LoadStore {
         if ((ea & 15) != 0) {
             throw PpcException.alignment(ea);
         }
-        long ra = s.mem.translateData(ea, false);
+        long ra = atomicRa(s, ea, false);
         Interpreter in = Interpreter.of(s);
         // Under the lock stqcx holds, so the two halves are one value with respect to stqcx.
         synchronized (in.domain.wideAtomicLock) {
@@ -529,7 +546,7 @@ final class LoadStore {
     private static boolean storeCond(CpuState s, long ea, int len, long v) {
         boolean ok = false;
         if (s.resValid && len == s.resLen) {
-            long ra = s.mem.translateData(ea, true);
+            long ra = atomicRa(s, ea, true);
             if (ra == s.resAddr) {
                 ok = casReal(s, ra, len, s.resVal, v);
             }
@@ -569,7 +586,7 @@ final class LoadStore {
         long ea = eaX(s, i);
         boolean ok = false;
         if (s.resValid && s.resLen == 16) {
-            long ra = s.mem.translateData(ea, true);
+            long ra = atomicRa(s, ea, true);
             if (ra == s.resAddr) {
                 Interpreter in = Interpreter.of(s);
                 boolean le = s.littleEndian();
@@ -788,8 +805,9 @@ final class LoadStore {
         long mask = word ? 0xffffffffL : -1L;
         int rt = rt(i);
         long src = s.gpr[(rt + 1) & 31] & mask;
+        atomicRa(s, ea, false);
         ld(s, ea, word); // QEMU's atomics probe for read first, then write
-        long pa = s.mem.translateData(ea, true);
+        long pa = atomicRa(s, ea, true);
         long result;
         switch (fc) {
             case 16 -> { // compare and swap not equal
@@ -804,7 +822,7 @@ final class LoadStore {
             }
             case 24, 25, 28 -> { // fetch and increment bounded / increment equal / decrement bounded
                 long ea2 = Fields.ea(s, ea + size);
-                s.mem.translateData(ea2, false);
+                atomicRa(s, ea2, false);
                 synchronized (Interpreter.of(s).domain.wideAtomicLock) {
                     long old;
                     boolean cond;
@@ -837,11 +855,12 @@ final class LoadStore {
         }
         long mask = word ? 0xffffffffL : -1L;
         long src = s.gpr[rt(i)] & mask;
+        atomicRa(s, ea, false);
         ld(s, ea, word); // QEMU's atomics probe for read first, then write
-        long pa = s.mem.translateData(ea, true);
+        long pa = atomicRa(s, ea, true);
         if (fc == 24) { // store twin
             long ea2 = Fields.ea(s, ea + size);
-            s.mem.translateData(ea2, true);
+            atomicRa(s, ea2, true);
             synchronized (Interpreter.of(s).domain.wideAtomicLock) {
                 long old = ld(s, ea, word);
                 long next = ld(s, ea2, word);

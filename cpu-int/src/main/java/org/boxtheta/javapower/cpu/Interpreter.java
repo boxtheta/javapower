@@ -248,7 +248,7 @@ public final class Interpreter {
         this.table = table;
         this.domain = domain;
         this.clock = domain.clock();
-        this.mmu = new RadixMmu(s, mem);
+        this.mmu = new RadixMmu(s, mem, domain.mmio());
         mmu.owner = this;
         s.mem = mmu;
         lastProcTable = s.procTable;

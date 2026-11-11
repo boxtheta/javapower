@@ -5,10 +5,12 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
+import org.boxtheta.javapower.core.MmioBus;
 import org.boxtheta.javapower.core.PhysicalMemory;
 
 /**
- * The CPUs of one machine and what they share besides guest memory: the timebase, TLB
+ * The CPUs of one machine and what they share besides guest memory and its MMIO regions (the
+ * {@link MmioBus} every CPU's MMU consults for accesses outside RAM): the timebase, TLB
  * invalidation broadcast ({@code tlbie}) and the lock behind the atomic operations wider than the
  * host can do in one step. Each {@link Interpreter} belongs to exactly one domain; an interpreter
  * built without one gets a private domain (a single-CPU machine).
@@ -34,6 +36,7 @@ import org.boxtheta.javapower.core.PhysicalMemory;
  */
 public final class CpuDomain {
     private final PhysicalMemory memory;
+    private final MmioBus mmio;
     private final Interpreter.Clock clock;
     private final double timeScale;
     private final double invScale;
@@ -85,6 +88,17 @@ public final class CpuDomain {
      *     reproducible runs
      */
     public CpuDomain(PhysicalMemory memory, Interpreter.Clock clock, double timeScale, long seed) {
+        this(memory, new MmioBus(), clock, timeScale, seed);
+    }
+
+    /**
+     * A domain whose CPUs reach the regions of {@code mmio} with accesses outside RAM. The bus
+     * may change while the CPUs run (see {@link MmioBus}).
+     *
+     * @param timeScale see {@link #CpuDomain(PhysicalMemory, Interpreter.Clock, double)}
+     * @param seed see {@link #CpuDomain(PhysicalMemory, Interpreter.Clock, double, long)}
+     */
+    public CpuDomain(PhysicalMemory memory, MmioBus mmio, Interpreter.Clock clock, double timeScale, long seed) {
         if (!(timeScale >= 1.0 / 1024) || Double.isInfinite(timeScale)) {
             throw new IllegalArgumentException("time scale must be a finite number >= 1/1024: " + timeScale);
         }
@@ -92,6 +106,7 @@ public final class CpuDomain {
             throw new IllegalArgumentException("the time scale applies to the wall clock only");
         }
         this.memory = memory;
+        this.mmio = java.util.Objects.requireNonNull(mmio, "mmio");
         this.clock = clock;
         this.timeScale = timeScale;
         this.invScale = 1.0 / timeScale;
@@ -100,6 +115,11 @@ public final class CpuDomain {
 
     public PhysicalMemory memory() {
         return memory;
+    }
+
+    /** The MMIO regions the CPUs reach outside RAM. */
+    public MmioBus mmio() {
+        return mmio;
     }
 
     public Interpreter.Clock clock() {

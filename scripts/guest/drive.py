@@ -7,7 +7,8 @@ Scenarios:
   prompt-le      FreeBSD 15.1 ppc64le ISO to "Console type [vt100]:"
   prompt-be      FreeBSD 15.1 powerpc64 (big-endian) ISO to the same prompt
   suse           openSUSE Tumbleweed (raw 4K disk) to its first-boot screen
-  shell          BE ISO to the installer's shell, then run each --cmd and print the output
+  shell          --guest le, be or suse (default be): boot to a shell (FreeBSD: the installer's;
+                 openSUSE: as for resume), then run each --cmd and print the output
                  (with --pkgs: writable layers and those packages first, as for kyua)
   kyua           BE ISO: shell, writable /usr, /etc, /libexec (tmpfs + unionfs), install the tests,
                  kyua and atf packages from the disc's offline repo, run kyua on --tests and
@@ -16,7 +17,8 @@ Scenarios:
                  RUN file, write their output to --out
   resume         --guest le, be or suse: boot to a shell, write a file to a disk, save the machine
                  on exit (SIGTERM), resume it in a new process, check the file, write more, check
-                 the clock, uptime and that every CPU still runs
+                 the clock, uptime and that every CPU still runs; each --cmd runs before the save and
+                 after the load
   net            --guest le, be or suse with a network device on a small segment (netpeer.py: a
                  host that answers ARP and ping, plus QEMU's user-mode network for TCP to this
                  machine): ping both ways (also fragmented, and a burst), download and upload
@@ -195,8 +197,12 @@ def scenario(a):
             c.expect(r"JeOS Firstboot", timeout=a.boot_timeout)
             say(a, "first-boot screen after %.0fs" % c.elapsed())
     elif a.scenario == "shell":
-        with start(a, "shell", [ISO_BE] + a.cdrom2) as c:
-            to_shell(a, c)
+        if a.guest == "suse":
+            ctx = start(a, "shell", a.cdrom2, disk4k=SUSE)
+        else:
+            ctx = start(a, "shell", [ISO_BE if a.guest == "be" else ISO_LE] + a.cdrom2)
+        with ctx as c:
+            guest_shell(a, c)
             if a.pkgs:
                 writable(a, c, a.pkgs.split(","))
             run_cmds(a, c, a.cmd, a.test_timeout)
@@ -310,7 +316,7 @@ def resume(a):
         guest_shell(a, c)
         run_cmds(a, c, [setup, "dd if=/dev/random of=%s/blob bs=64k count=64 2>/dev/null && sync" % d,
                         sums + " > %s/blob.sum && sync && cat %s/blob.sum" % (d, d),
-                        "date -u +%s; uptime", "getconf NPROCESSORS_ONLN"])
+                        "date -u +%s; uptime", "getconf NPROCESSORS_ONLN"] + a.cmd)
         t0 = time.time()
         c.close(grace=1800)
     say(a, "first run ended (save took %.0fs including exit): %s" % (time.time() - t0, timings(
@@ -338,6 +344,8 @@ def resume(a):
         for k in range(a.smp):
             if "ran on cpu %d" % k not in out[4 + k][2]:
                 raise Exited("CPU %d did not run" % k)
+        if a.cmd:
+            run_cmds(a, c, a.cmd)
         if a.guest != "suse":
             out = run_cmds(a, c, ["umount /tmp/m && fsck -t ufs -n /dev/da0"])
     say(a, "resumed run: %s" % timings(os.path.join(a.logdir, b.name + "-%s.stderr.log" % a.vm)))
@@ -706,7 +714,8 @@ def main():
     p.add_argument("--smp", type=int, default=1)
     p.add_argument("--clock-scale", type=float)
     p.add_argument("--cdrom2", action="append", default=[], help="extra CD-ROM image(s)")
-    p.add_argument("--cmd", action="append", default=[], help="shell scenario: command to run")
+    p.add_argument("--cmd", action="append", default=[], help="shell: command to run; resume: also run before the"
+                   " save and after the load")
     p.add_argument("--pkgs", help="shell scenario: comma-separated packages to install first "
                    "(e.g. tests,kyua,atf,atf-lib)")
     p.add_argument("--tests", action="append", default=[], help="kyua: test path under /usr/tests")
@@ -714,7 +723,7 @@ def main():
     p.add_argument("--out", help="results file")
     p.add_argument("--name", help="log file prefix (default: the scenario)")
     p.add_argument("--baseline", help="regress: kyua results from QEMU to compare against")
-    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="resume, net: which guest")
+    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="shell, resume, net: which guest")
     p.add_argument("--nics", type=int, default=1, choices=[1, 2], help="net: network devices")
     p.add_argument("--net-mib", type=int, default=4, help="net: MiB to download and upload")
     p.add_argument("--net-burst", type=int, default=500, help="net: pings in the burst")

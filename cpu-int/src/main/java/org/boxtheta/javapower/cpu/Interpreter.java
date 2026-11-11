@@ -155,7 +155,7 @@ public final class Interpreter {
     /** Between Hypervisor.cpuExecEnter and cpuExecExit. */
     private boolean executing;
     /** Source of {@code darn}; owned by this CPU's thread. */
-    final java.util.SplittableRandom random;
+    final DarnRandom random;
     /** lqarx: the second doubleword it observed (the first is CpuState.resVal). */
     long resValLo;
 
@@ -260,7 +260,7 @@ public final class Interpreter {
         }
         storeDec(0xffffffffL);
         int ordinal = domain.register(this);
-        this.random = new java.util.SplittableRandom(domain.seedFor(ordinal));
+        this.random = new DarnRandom(domain.seedFor(ordinal));
     }
 
     public RadixMmu mmu() {
@@ -415,6 +415,81 @@ public final class Interpreter {
             return 0;
         }
         return tbToNsCeil(ticks);
+    }
+
+    // ================================================================== saved state
+
+    /**
+     * Write this CPU's state: the architectural state ({@link CpuState#saveState}), the timebase
+     * and decrementer, the {@code darn} generator, the second doubleword of an lqarx reservation,
+     * a {@code wait} in progress and a pending global TLB flush. Work posted to the CPU is run
+     * first, as the run loop would before its next instruction, and the TLB is flushed with it,
+     * so the saved and the restored machine continue from the same state. Called by
+     * {@link CpuDomain#saveState} with every CPU of the domain stopped.
+     *
+     * @param wallNs the domain's guest time, frozen for all its CPUs (WALL clock)
+     */
+    void saveState(java.io.DataOutput out, long wallNs) throws java.io.IOException {
+        runPostedWork();
+        s.saveState(out);
+        long now = clock == Clock.DETERMINISTIC ? s.icount << icountShift : wallNs;
+        out.writeByte(clock.ordinal());
+        out.writeByte(icountShift);
+        out.writeLong(nsToTb(now) + tbOffset);
+        out.writeLong(decNext);
+        out.writeBoolean(decPending);
+        out.writeBoolean(decArmed);
+        out.writeLong(decEarliest);
+        out.writeLong(decDueIcount);
+        out.writeLong(decZeroIcount);
+        out.writeLong(random.state);
+        out.writeLong(resValLo);
+        out.writeBoolean(waiting);
+        out.writeBoolean(globalFlushPending);
+    }
+
+    /**
+     * Read the state written by {@link #saveState}. The timebase continues from its saved value:
+     * the offset is chosen so the guest reads the saved TB at {@code wallNs} (WALL) or at the
+     * restored instruction count (DETERMINISTIC). A state saved under the other clock, or with
+     * another {@link #icountShift}, loads too; the decrementer deadline is then converted.
+     * Cached translations and fetch state are dropped.
+     */
+    void loadState(org.boxtheta.javapower.core.StateInput.Record in, long wallNs) throws java.io.IOException {
+        s.loadState(in);
+        int savedClock = in.readUnsignedByte();
+        int savedShift = in.readUnsignedByte();
+        if (savedClock >= Clock.values().length || savedShift > 62) {
+            throw in.corrupt("clock " + savedClock + " shift " + savedShift);
+        }
+        long tb = in.readLong();
+        decNext = in.readLong();
+        decPending = in.readBoolean();
+        decArmed = in.readBoolean();
+        decEarliest = in.readLong();
+        long due = in.readLong();
+        long zero = in.readLong();
+        random.state = in.readLong();
+        resValLo = in.readLong();
+        waiting = in.readBoolean();
+        globalFlushPending = in.readBoolean();
+        long now = clock == Clock.DETERMINISTIC ? s.icount << icountShift : wallNs;
+        tbOffset = tb - nsToTb(now);
+        if (savedClock == clock.ordinal() && savedShift == icountShift) {
+            decDueIcount = due;
+            decZeroIcount = zero;
+        } else {
+            decDueIcount = Long.MAX_VALUE;
+            decZeroIcount = Long.MAX_VALUE;
+            if (decArmed && clock == Clock.DETERMINISTIC) {
+                long dueNs = tbToNsCeil(decNext - tbOffset);
+                decZeroIcount = icountShift == 0 ? dueNs : ((dueNs + (1L << icountShift) - 1) >>> icountShift);
+                decDueIcount = Math.max(decZeroIcount, decEarliest);
+            }
+        }
+        mmu.flushAll();
+        lastProcTable = s.procTable;
+        recheck = true;
     }
 
     // ================================================================== run loop

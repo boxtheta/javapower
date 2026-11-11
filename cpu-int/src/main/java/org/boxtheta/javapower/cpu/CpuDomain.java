@@ -37,7 +37,11 @@ public final class CpuDomain {
     private final Interpreter.Clock clock;
     private final double timeScale;
     private final double invScale;
-    private final long wallBase = System.nanoTime();
+    /**
+     * Host time at which the wall clock read zero. Written only by {@link #loadState}, while no
+     * CPU of the domain runs (the threads that run them later are started after it).
+     */
+    private long wallBase = System.nanoTime();
     private final long seed;
 
     /** Generation of global TLB flushes; see the class comment. */
@@ -188,6 +192,58 @@ public final class CpuDomain {
         shootdowns.increment();
         if (t0 != 0) {
             shootdownWaitNs.add(System.nanoTime() - t0);
+        }
+    }
+
+    // ---- saved state ----------------------------------------------------------------------------
+
+    /**
+     * Write the state of every CPU of the domain as one {@code "CPUS"} record: the domain's guest
+     * time, then each CPU's state in registration order (see {@link Interpreter}'s
+     * {@code saveState}: registers, SPRs, timebase, decrementer, reservation, idle and stopped
+     * state). Work posted to a CPU is run first. Compiled code, decode caches and TLBs are not
+     * saved. No CPU of the domain may be running.
+     */
+    public void saveState(org.boxtheta.javapower.core.StateOutput out) throws java.io.IOException {
+        Interpreter[] all = cpus;
+        long now = wallNs();
+        out.record("CPUS", d -> {
+            d.writeInt(all.length);
+            d.writeLong(now);
+            for (Interpreter in : all) {
+                in.saveState(d, now);
+            }
+        });
+    }
+
+    /**
+     * Read the record written by {@link #saveState} into the CPUs of this domain. Guest time
+     * resumes where it stopped: the wall clock (if this domain uses it) continues from the saved
+     * guest time, and each CPU's timebase from its saved value, so no time passes for the guest
+     * while the state is saved. The shared compiled-code cache is emptied. No CPU of the domain
+     * may be running.
+     *
+     * @throws org.boxtheta.javapower.core.StateMismatchException if the state holds another
+     *     number of CPUs (nothing is changed then)
+     * @throws org.boxtheta.javapower.core.StateFormatException if the record is corrupt; the CPUs
+     *     are then partly loaded
+     */
+    public void loadState(org.boxtheta.javapower.core.StateInput in) throws java.io.IOException {
+        org.boxtheta.javapower.core.StateInput.Record r = in.record("CPUS");
+        Interpreter[] all = cpus;
+        int n = r.readInt();
+        if (n != all.length) {
+            throw new org.boxtheta.javapower.core.StateMismatchException("the machine state has " + n
+                    + " CPUs; this machine has " + all.length);
+        }
+        long now = r.readLong();
+        if (now < 0) {
+            throw r.corrupt("guest time " + now);
+        }
+        wallBase = System.nanoTime() - hostNs(now);
+        compiledCode.clear();
+        for (Interpreter cpu : all) {
+            cpu.loadState(r, now);
         }
     }
 

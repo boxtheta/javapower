@@ -71,7 +71,8 @@ class Boot {
 
 - `MachineConfig` configures the machine: RAM, CPU count, firmware, console, disks (`addCdrom`,
   `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), NVRAM file, kernel command
-  line, log sink.
+  line, log sink, and devices of your own in the guest's address space (`addMmio`; see
+  [Memory-mapped devices](#memory-mapped-devices)).
 - Firmware has no default: pass the image as bytes (`firmware(SlofFirmware.image())` from
   `javapower-firmware-slof`, which decompresses a fresh copy on each call) or as a file
   (`firmware(Path)`, e.g. `/usr/share/qemu/slof.bin`). Without one, the `Machine` constructor throws
@@ -90,6 +91,70 @@ class Boot {
 
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
+
+### Memory-mapped devices
+
+An embedder can put devices of its own into the guest's real address space without javapower
+modelling them. `MachineConfig.addMmio` maps a range of real addresses to an `MmioHandler` (in
+`javapower-core`), and every guest load and store in the range calls it:
+
+```java
+MmioHandler uart = new MmioHandler() {
+    @Override public long read(long offset, int size) { ... }              // on CPU threads
+    @Override public void write(long offset, int size, long value) { ... }
+};
+cfg.addMmio("serial", 0x1000_0000_0000L, 0x1000, uart)
+        .compatible("acme,uart")      // device tree node /serial@100000000000
+        .interrupt(true);             // a level-triggered interrupt source
+try (Emulator emu = new Emulator(cfg)) {
+    int irq = emu.machine().mmioInterrupt("serial");
+    // From the device's own thread: emu.machine().xics().setIrq(irq, true), later false.
+    emu.run();
+}
+```
+
+- The handler sees the data loads and stores the guest makes in the range: in real mode and with
+  translation, from the interpreter and from compiled code, in either byte order, and through
+  the `H_LOGICAL_CI_LOAD` and `H_LOGICAL_CI_STORE` hypercalls, which SLOF uses for its `rb@`,
+  `rl@`, `rb!`, `rl!` and friends. Each call is one naturally aligned access of 1, 2, 4 or 8
+  bytes that lies inside the region. Wider instructions arrive as their parts: a vector load or
+  store as two 8-byte accesses, `lmw` and `stmw` as one access per word.
+- Values are the bytes at the region's addresses read in the region's byte order
+  (`byteOrder(...)`, big-endian by default; PCI-style devices are usually little-endian). The
+  guest's byte order and the byte-reversed instructions only decide which bytes are stored, as
+  with a real device: a little-endian guest's `stw` of 0x11223344 stores the bytes 44 33 22 11,
+  so a big-endian region's handler receives 0x44332211 and a little-endian one 0x11223344.
+- These accesses never reach the handler: an unaligned access, one that leaves the region, and an
+  instruction fetch take the machine check the guest gets for an address nothing is mapped at
+  (as every access outside RAM did before). `lwarx` and the other reservation and atomic
+  instructions take a data storage interrupt, and `dcbz` an alignment interrupt, as the
+  architecture specifies for caching-inhibited storage. `dcbf`, `dcbst` and `icbi` do not touch
+  the device. A handler fails an access by throwing `MmioHandler.BusError`: the guest takes the
+  machine check, and a hypercall load returns 0 (a store is dropped), as for unassigned memory.
+- Threads: `read` and `write` run on the CPU threads, on several at once in a machine with more
+  than one CPU, with no lock of the machine held, so the handler synchronises itself. The CPU
+  waits for the call, so it should be quick. It may raise and lower its interrupt.
+  `reset` (at every machine reset), `saveState` and `loadState` are called while no CPU runs.
+- The range may not overlap guest RAM, the windows QEMU's `pseries` reserves for PCI host
+  bridges (32 TiB to 64 TiB, `MachineConfig.PCI_WINDOWS_BASE` and `PCI_WINDOWS_END`) or another
+  region, and lies below `MachineConfig.MMIO_LIMIT` (2^57). `addMmio`, or for RAM the
+  `Emulator` constructor, throws `IllegalArgumentException` otherwise. The name is also the
+  device tree node's name.
+- A region alone is invisible to an operating system. `compatible(...)` adds a node
+  `/<name>@<base>` under the root with `reg`, `compatible` and, with `interrupt`, `interrupts`
+  and `interrupt-parent`; `deviceTree(node -> ...)` adds more properties with the public
+  `Fdt.Node` API. FreeBSD matches drivers to such nodes by `compatible`; a Linux driver finds the
+  node with `of_find_compatible_node`.
+- `interrupt(levelTriggered)` claims an XICS source (numbered from `Xics.IRQ_MMIO`, 0x1f00, in
+  the order the regions were added); `Machine.mmioInterrupt(name)` returns its number.
+  `xics().setIrq(number, level)` drives it from any thread: a level-triggered source is pending
+  while raised, an edge-triggered one interrupts once per rising edge (`xics().pulse(number)`).
+- A handler's `saveState` output is part of the saved machine and comes back to `loadState`
+  (see below). Without `addMmio` the machine, its device tree and its saved state are exactly as
+  before.
+- `Machine.mmio()` is the `MmioBus` the CPUs consult outside RAM. Platform code may map and
+  unmap regions on it while the guest runs (PCI BARs move when the guest programs them); such
+  regions are not checked, described in the device tree or saved by the machine.
 
 ### Saving and restoring a machine
 
@@ -113,7 +178,8 @@ try (Emulator emu = new Emulator(cfg);
 - The state holds every CPU (registers, timebase and decrementer, reservations, idle and
   RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
   process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
-  console input the guest has not read yet, SCSI sense state. v-scsi commands complete inside
+  console input the guest has not read yet, SCSI sense state, and what each MMIO region's
+  handler saves. v-scsi commands complete inside
   the hypercall that submits them, so no request is ever in flight at a save. Compiled code,
   decode caches and TLBs are rebuilt as the guest runs.
 - Outside the state, and the embedder's to keep: disk contents (reattach the images as the guest
@@ -121,8 +187,9 @@ try (Emulator emu = new Emulator(cfg);
   copy-on-write snapshots are discarded at `close()`), the console backend, the NVRAM file (it
   is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
 - The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
-  host bridge and `rng` settings, NVRAM size and the same SCSI devices (type, target id, LUN,
-  block size, size, read-only). Otherwise `loadState` throws `StateMismatchException` listing
+  host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
+  block size, size, read-only) and the same MMIO regions (name, base, size, byte order,
+  interrupt). Otherwise `loadState` throws `StateMismatchException` listing
   the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
   need not match: the guest's view of them is in its RAM and saved device tree. The clock and
   time scale may differ.
@@ -166,7 +233,7 @@ classes, which refuse to load on a JVM without atomic access to byte arrays (JDK
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
-    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file]
+    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file] [--test-mmio addr]
 ```
 
 | Flag | Meaning |
@@ -187,6 +254,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--persistent` | Write guest changes to the `--disk` images instead of a discarded snapshot |
 | `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |
 | `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
+| `--test-mmio addr` | For testing only: 4 KiB of scratch registers at real address `addr` (node `/test-mmio@addr`), reporting every access on stderr; see `scripts/guest/mmio` |
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr. Guest RAM counts against the JVM's direct

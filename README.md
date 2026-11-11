@@ -69,7 +69,8 @@ class Boot {
 }
 ```
 
-- `MachineConfig` configures the machine: RAM, CPU count, firmware, console, disks (`addCdrom`,
+- `MachineConfig` configures the machine: RAM, CPU count, firmware, consoles (`console`,
+  `addConsole`; see [More consoles](#more-consoles)), disks (`addCdrom`,
   `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), network devices
   (`addNetwork(backend)`, see [Networking](#networking)), NVRAM file, kernel command line, log
   sink, devices of your own in the guest's address space (`addMmio`; see
@@ -89,10 +90,98 @@ class Boot {
 - Diagnostics belong to each machine: `emu.log()` holds the sink and the once-per-key counts, so
   machines in one JVM never share log state. The sink is called from emulator threads.
 - `close()` stops a running guest, waits for `run` to return, and releases disk images, snapshot
-  overlays, the NVRAM file, the console backend and the network backends. It is idempotent.
+  overlays, the NVRAM file, the console backends and the network backends. It is idempotent.
 
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
+
+### More consoles
+
+The console set with `MachineConfig.console` is the console of SLOF, the boot loader and the
+operating system. `addConsole` adds more, each another `vty` on the virtual I/O bus, for serial
+ports or for channels to programs in the guest:
+
+```java
+MachineConfig.Console rpc = cfg.addConsole(rpcBackend).name("oc2.rpc.0");   // vty@71000003
+cfg.addConsole(serialBackend);                                               // vty@71000004
+try (Emulator emu = new Emulator(cfg)) {
+    Vty v = emu.machine().vioDevice(rpc.unitAddress(), Vty.class);  // or emu.machine().vtys().get(1)
+    ...
+}
+```
+
+- A console added this way is a VIO device like those of
+  [Adding VIO devices of your own](#adding-vio-devices-of-your-own): it takes the next unit
+  address, in the order consoles and other devices are added. Each one has its own interrupt
+  source and its own input buffer, and the guest reaches it with H_PUT_TERM_CHAR and
+  H_GET_TERM_CHAR at its unit address. Its device tree node is the one QEMU gives another
+  `-device spapr-vty`, plus a `label` property with the console's name if it has one.
+  `/chosen/stdout-path` stays the first console, so SLOF, the boot loaders and the operating
+  systems keep using it; a guest uses the others only when told to.
+- A machine has at most 8 consoles, counting the first (`MachineConfig.MAX_CONSOLES`): Linux
+  reaches them through its `hvc` tty driver, which has eight devices, `/dev/hvc0` to
+  `/dev/hvc7`.
+- Each console needs a backend of its own: `addConsole` and `console` throw
+  `IllegalArgumentException` for a backend another console already has. The machine starts the
+  backends while it is built (the first console's, then the others in the order they were
+  added) and closes them in `close()`. If construction fails, it closes the backends it already
+  started and leaves the others to you.
+- Input a guest has not read yet, on every console, is part of the saved state. The number of
+  consoles, their place among the added VIO devices and their names are part of the hardware a
+  saved state must match.
+
+A guest finds a console by its name rather than its position, since Linux and FreeBSD number
+them differently:
+
+- **Linux** (`hvc_vio`): `/dev/hvc0` is the console `/chosen/linux,stdout-path` names, and the
+  others are `/dev/hvc1`, `/dev/hvc2` and so on in unit address order, which is the order they
+  were added. Linux has no link in sysfs from an `hvc` device to its vty, so this function
+  follows the kernel's numbering: `hvc_vio` gives each vty after the boot console the next
+  number in the order it binds them, the order of their unit addresses.
+
+  ```sh
+  hvc_by_name() {
+      boot=$(tr -d '\0' </proc/device-tree/chosen/linux,stdout-path)
+      n=1
+      for d in /sys/bus/vio/drivers/hvc_console/[0-9a-f]*; do
+          node=$(readlink -f "$d/of_node")
+          if [ "${node##*/}" = "${boot##*/}" ]; then k=0; else k=$n; n=$((n + 1)); fi
+          if [ -e "$node/label" ] && [ "$(tr -d '\0' <"$node/label")" = "$1" ]; then
+              echo "/dev/hvc$k"
+              return 0
+          fi
+      done
+      return 1
+  }
+  hvc_by_name oc2.rpc.0      # /dev/hvc1
+  ```
+
+  Linux reads an `hvc` device only while it is open, so input waits in the console until a
+  program opens it. It resets the device's terminal settings when the last program closes it:
+  open the device, then set it to raw mode (`stty -F /dev/hvc1 raw -echo`), and keep it open.
+- **FreeBSD** (`uart_phyp`): every console is a `uart`, `/dev/ttyuN` and `/dev/cuauN` (the
+  callout device, which does not wait for a carrier). The units follow the order in which the
+  firmware's device tree lists the children of `/vdevice`, and SLOF lists them in reverse: the
+  console added last is `uart0`, and the first console, FreeBSD's own console
+  (`sysctl kern.console`), has the highest unit. `ofwdump` shows the tree in the order FreeBSD
+  numbered it:
+
+  ```sh
+  uart_by_name() {
+      ofwdump -p -r /vdevice | awk -v want="$1" -v q="'" '
+          /^ *Node 0x[0-9a-f]*: / { v = ($3 == "vty"); if (v) k++; prop = ""; next }
+          /^ *[^ ]+:$/ { prop = $1; next }
+          v && prop == "label:" && index($0, q) {
+              lab = $0; gsub(q, "", lab); sub(/^ +/, "", lab)
+              if (lab == want) { print "/dev/cuau" (k - 1); found = 1; exit }
+          }
+          END { exit !found }'
+  }
+  uart_by_name oc2.rpc.0     # /dev/cuau1 with three consoles
+  ```
+
+  FreeBSD takes input from a console as soon as it arrives and drops it while the device is not
+  open, so a program opens the device before the host sends anything.
 
 ### Networking
 
@@ -362,7 +451,7 @@ try (Emulator emu = new Emulator(cfg);
 - The state holds every CPU (registers, timebase and decrementer, reservations, idle and
   RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
   process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
-  console input the guest has not read yet, SCSI sense state, each network device's
+  input the guest has not read yet on each console, SCSI sense state, each network device's
   registration, receive buffers, receive queue position, MAC address and multicast filters, PCI
   devices (configuration space, virtio queues and what each device saves), and what each MMIO
   region's handler saves. Frames waiting for the guest's receive buffers are dropped on save, as
@@ -377,12 +466,13 @@ try (Emulator emu = new Emulator(cfg);
   is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
 - The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
   host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
-  block size, size, read-only), the same added VIO devices in the same order (network devices
-  with the same MAC addresses, so give explicit addresses or add them in the same order; for
-  devices of your own see [Adding VIO devices of your own](#adding-vio-devices-of-your-own)),
-  the same PCI devices (slot, model, ids, class, BARs, and for virtio the device type and
-  queues) and the same MMIO regions (name, base, size, byte order, interrupt). Otherwise
-  `loadState` throws `StateMismatchException` listing
+  block size, size, read-only), the same added VIO devices in the same order (consoles with
+  the same names; network devices with the same MAC addresses, so give explicit addresses or
+  add them in the same order; for devices of your own see
+  [Adding VIO devices of your own](#adding-vio-devices-of-your-own)), the same PCI devices
+  (slot, model, ids, class, BARs, and for virtio the device type and queues) and the same MMIO
+  regions (name, base, size, byte order, interrupt). Otherwise `loadState` throws
+  `StateMismatchException` listing
   the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
   need not match: the guest's view of them is in its RAM and saved device tree. The clock and
   time scale may differ.
@@ -426,8 +516,8 @@ classes, which refuse to load on a JVM without atomic access to byte arrays (JDK
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
-    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file] [--net spec]...
-    [--virtio-rng] [--test-mmio addr]
+    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file]
+    [--console tcp:[host:]port[,name=NAME]]... [--net spec]... [--virtio-rng] [--test-mmio addr]
 ```
 
 | Flag | Meaning |
@@ -448,6 +538,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--persistent` | Write guest changes to the `--disk` images instead of a discarded snapshot |
 | `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |
 | `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
+| `--console tcp:[host:]port[,name=NAME]` | Another console (`addConsole`), on a TCP port of the loopback address or of `host`; repeat for more. One client at a time; the guest's output is dropped while none is connected. Give the same ones to `--load-state` |
 | `--net dgram,local=host:port,remote=host:port[,mac=addr]` | Add a network device whose frames travel as UDP datagrams: received at `local`, sent to `remote` (QEMU's `-netdev dgram` format; see below). Repeat for more devices |
 | `--net none[,mac=addr]` | Add a network device connected to nothing |
 | `--virtio-rng` | Add a virtio-rng PCI device (`virtio-rng-pci`) in the next free PCI slot; give it twice for two. Its bytes served are reported at exit |
@@ -460,7 +551,9 @@ Two guests can share a link by sending to each other's local port, e.g. one with
 The same QEMU `-netdev dgram` joined to `-netdev user` through a hub (`-M none -netdev hubport,...`)
 gives the guest QEMU's user-mode network, with DHCP and a way out to the host.
 
-The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
+The console is on stdin/stdout, and `--console` adds more on TCP ports (for example
+`nc 127.0.0.1 port`; see [More consoles](#more-consoles) for finding them in the guest). The TCP
+console is part of the CLI, not of the library. Diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr. Guest RAM counts against the JVM's direct
 memory limit on Java 22 and later, and against its heap on Java 21 (see [Embedding](#embedding));
 for large `--ram` values raise the limit in `JAVA_OPTS`, e.g.

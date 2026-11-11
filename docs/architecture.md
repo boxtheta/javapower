@@ -42,6 +42,16 @@ Embedders' own devices are added the same way (`MachineConfig.addVioDevice`); th
 `VioDevice` they may use and override, and the threads that call them, are documented on the
 class.
 
+Consoles after the first (`MachineConfig.addConsole`) are `Vty` devices in that same list, so
+they take unit addresses in the order consoles and other devices were added, and their
+interrupts, saved input and hardware description come from the generic code. A named console's
+node has a `label` property, which is also its `hardwareIdentity`. H_PUT_TERM_CHAR and
+H_GET_TERM_CHAR find the vty by unit address; address 0 means the first console, which also has
+the lowest address, as QEMU picks the vty with the lowest one. `/chosen/stdout-path` names the
+first console. A machine has at most eight vtys, the number of `hvc` devices Linux has, and each
+needs a `CharBackend` of its own; a vty starts its backend in `startDevice` and closes it in
+`closeDevice` only if it was started, as the machine does for the first console.
+
 ## Modules
 
 | Module | Package | Contents |

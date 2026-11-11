@@ -16,10 +16,18 @@ console.
   powerpc64 kernel and userland are BE (ELFv2) and run 32-bit BE powerpc binaries (COMPAT_FREEBSD32,
   MSR[SF]=0) with LPCR[ILE]=0; the other kernels are LE.
 - Radix MMU only: the guests negotiate radix through CAS. Hash/SLB is out of scope for now.
-- XICS interrupts via hcalls. VIO devices only (nvram, vty, v-scsi, then any devices added through
-  `MachineConfig`); no PCI devices.
+- XICS interrupts via hcalls. VIO devices only (nvram, vty, v-scsi, then the devices added through
+  `MachineConfig`: an l-lan virtual Ethernet device for each network, and embedders' own); no PCI
+  devices.
 - Memory-mapped I/O: real addresses outside RAM reach the regions of an `MmioBus`, which
   embedders fill through `MachineConfig.addMmio` (see [Memory-mapped I/O](#memory-mapped-io)).
+- Devices with host-side backends: the console (`CharBackend`), SCSI disks (`BlockBackend`) and
+  network devices (`NetBackend`). Guest output to a backend is a synchronous call on the CPU
+  thread that produced it; input arrives on the backend's own threads and goes straight to the
+  device (the console's buffer, or a network frame DMAed into a receive buffer the guest
+  posted) under the device's lock, which no backend call is made under. Network frames are
+  kept out of saved states: a save or load stops deliveries until a CPU runs again, so device
+  state and RAM agree.
 
 ## VIO devices
 

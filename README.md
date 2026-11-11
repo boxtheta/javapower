@@ -1,7 +1,7 @@
 # javapower
 
 A Power ISA emulator for the JVM. It models a PAPR `pseries` machine (POWER9, radix MMU, XICS,
-VIO console and v-scsi) closely enough to run the SLOF firmware QEMU uses, unmodified, and boot
+VIO console, v-scsi and virtual Ethernet) closely enough to run the SLOF firmware QEMU uses, unmodified, and boot
 FreeBSD 15.1 (ppc64le, and big-endian powerpc64 including its 32-bit compatibility layer) and
 openSUSE Tumbleweed (ppc64le) to an interactive console. It is usable as a command-line tool and
 as a library. Java 21 or later; no runtime dependencies (the JIT's bytecode library is bundled, see
@@ -70,8 +70,9 @@ class Boot {
 ```
 
 - `MachineConfig` configures the machine: RAM, CPU count, firmware, console, disks (`addCdrom`,
-  `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), NVRAM file, kernel command
-  line, log sink, and devices of your own in the guest's address space (`addMmio`; see
+  `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), network devices
+  (`addNetwork(backend)`, see [Networking](#networking)), NVRAM file, kernel command line, log
+  sink, and devices of your own in the guest's address space (`addMmio`; see
   [Memory-mapped devices](#memory-mapped-devices)).
 - Firmware has no default: pass the image as bytes (`firmware(SlofFirmware.image())` from
   `javapower-firmware-slof`, which decompresses a fresh copy on each call) or as a file
@@ -87,10 +88,67 @@ class Boot {
 - Diagnostics belong to each machine: `emu.log()` holds the sink and the once-per-key counts, so
   machines in one JVM never share log state. The sink is called from emulator threads.
 - `close()` stops a running guest, waits for `run` to return, and releases disk images, snapshot
-  overlays, the NVRAM file and the console backend. It is idempotent.
+  overlays, the NVRAM file, the console backend and the network backends. It is idempotent.
 
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
+
+### Networking
+
+`cfg.addNetwork(backend)` adds a virtual Ethernet device: PAPR's interpartition logical LAN
+(`l-lan` in the device tree, QEMU's `spapr-vlan`), which Linux drives with `ibmveth` and FreeBSD
+with `llan`. Call it once per device; each takes the next unit address on the VIO bus after the
+devices added before it, of any kind, the first added device at 0x71000003, as in QEMU. Each
+gets a MAC address: the one
+given with `.mac("02:00:00:00:00:01")` (or six bytes), or else the first of 52:54:00:12:34:56,
+52:54:00:12:34:57, ... that no other device of the machine uses, QEMU's default scheme. Set one
+when machines share a network.
+
+The `NetBackend` is the other end of the cable. The device hands it each frame the guest sends,
+and the backend delivers frames to the guest through the `FrameSink` it is given at start:
+
+```java
+class Port implements NetBackend {
+    final Queue<byte[]> outbox = new ConcurrentLinkedQueue<>();
+    volatile FrameSink sink;
+    @Override public void start(FrameSink s) { sink = s; }      // once, while the machine is built
+    @Override public void transmit(byte[] frame) {               // a frame from the guest:
+        outbox.offer(frame);                                     // the array is yours; don't block
+    }
+}
+Port port = new Port();
+cfg.addNetwork(port).mac("02:00:00:00:00:01");
+// Later, from any thread (e.g. the game's server thread):
+boolean taken = port.sink.receive(frame, 0, frame.length);      // copied; false if dropped
+```
+
+- Frames are whole Ethernet frames (destination address to the end of the payload, no frame
+  check sequence), at most 65536 bytes.
+- `transmit` is called on the guest CPU's thread that sent the frame, inside its hypercall.
+  Calls for one device never overlap and come in the order the guest sent the frames. The CPU,
+  and any other CPU sending on that device, waits for it, so queue the frame or drop it rather
+  than block. Receiving does not wait for it.
+- `FrameSink.receive` may be called from any thread, any number at once, whether the guest is
+  running or not. It copies the frame and writes it straight into a receive buffer the guest
+  posted, raising the device's interrupt, so no CPU has to be running and no CPU is waited for.
+  When the guest has no buffer free, frames wait in a queue of up to 512 frames (2 MiB). It
+  returns false when it drops the frame: the guest's driver has not opened the device, the queue
+  is full, the frame is too long, the machine is being saved or loaded, or it is closed. That is
+  the backpressure signal; like a real link, the device never blocks the sender. A frame too large
+  for every buffer the guest posts is dropped and counted by the guest's driver.
+- There is no link state: PAPR gives the guest no way to see the cable, and its drivers always
+  report the link up. A disconnected backend drops what the guest sends and delivers nothing.
+- The machine starts the backend while it is built and closes it in `close()`; afterwards the
+  sink drops everything. `emu.machine().networks()` lists the devices, with the MAC address the
+  guest currently uses (it may change it), whether the guest has the device open, and a count of
+  frames dropped on the host side.
+- Multicast frames go only where the guest asked for them (its driver's `H_MULTICAST_CTRL`
+  calls); unicast frames for other addresses are delivered, as in QEMU, so which frames reach a
+  port is up to the network behind the backend.
+
+`DatagramNetBackend` is a ready-made backend that carries each frame in one UDP datagram, the
+format of QEMU's `-netdev dgram` with inet addresses: a javapower guest can share a link with a
+QEMU guest or with another javapower guest.
 
 ### Adding VIO devices of your own
 
@@ -216,19 +274,24 @@ try (Emulator emu = new Emulator(cfg);
 - The state holds every CPU (registers, timebase and decrementer, reservations, idle and
   RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
   process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
-  console input the guest has not read yet, SCSI sense state, and what each MMIO region's
-  handler saves. v-scsi commands complete inside
+  console input the guest has not read yet, SCSI sense state, each network device's
+  registration, receive buffers, receive queue position, MAC address and multicast filters, and
+  what each MMIO region's handler saves. Frames waiting for the guest's receive buffers are
+  dropped on save, as a real link drops frames during a pause, and the network devices take no
+  frames from their backends from the start of a save or load until the guest runs again.
+  v-scsi commands complete inside
   the hypercall that submits them, so no request is ever in flight at a save. Compiled code,
   decode caches and TLBs are rebuilt as the guest runs.
 - Outside the state, and the embedder's to keep: disk contents (reattach the images as the guest
   left them; use `persistent(true)` disks or your own `BlockBackend`, since the default
-  copy-on-write snapshots are discarded at `close()`), the console backend, the NVRAM file (it
+  copy-on-write snapshots are discarded at `close()`), the console and network backends, the NVRAM file (it
   is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
 - The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
   host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
-  block size, size, read-only), the same added VIO devices in the same order (see
-  [Adding VIO devices of your own](#adding-vio-devices-of-your-own)) and the same MMIO regions
-  (name, base, size, byte order, interrupt). Otherwise `loadState` throws
+  block size, size, read-only), the same added VIO devices in the same order (network devices
+  with the same MAC addresses, so give explicit addresses or add them in the same order; for
+  devices of your own see [Adding VIO devices of your own](#adding-vio-devices-of-your-own)) and
+  the same MMIO regions (name, base, size, byte order, interrupt). Otherwise `loadState` throws
   `StateMismatchException` listing
   the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
   need not match: the guest's view of them is in its RAM and saved device tree. The clock and
@@ -273,7 +336,8 @@ classes, which refuse to load on a JVM without atomic access to byte arrays (JDK
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
-    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file] [--test-mmio addr]
+    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file] [--net spec]...
+    [--test-mmio addr]
 ```
 
 | Flag | Meaning |
@@ -294,7 +358,16 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--persistent` | Write guest changes to the `--disk` images instead of a discarded snapshot |
 | `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |
 | `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
+| `--net dgram,local=host:port,remote=host:port[,mac=addr]` | Add a network device whose frames travel as UDP datagrams: received at `local`, sent to `remote` (QEMU's `-netdev dgram` format; see below). Repeat for more devices |
+| `--net none[,mac=addr]` | Add a network device connected to nothing |
 | `--test-mmio addr` | For testing only: 4 KiB of scratch registers at real address `addr` (node `/test-mmio@addr`), reporting every access on stderr; see `scripts/guest/mmio` |
+
+Two guests can share a link by sending to each other's local port, e.g. one with
+`--net dgram,local=127.0.0.1:7000,remote=127.0.0.1:7001` and the other with
+`--net dgram,local=127.0.0.1:7001,remote=127.0.0.1:7000`; for a QEMU guest on the other end use
+`-netdev dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=7001,remote.type=inet,remote.host=127.0.0.1,remote.port=7000 -device spapr-vlan,netdev=n0`.
+The same QEMU `-netdev dgram` joined to `-netdev user` through a hub (`-M none -netdev hubport,...`)
+gives the guest QEMU's user-mode network, with DHCP and a way out to the host.
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr. Guest RAM counts against the JVM's direct

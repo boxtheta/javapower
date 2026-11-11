@@ -86,6 +86,55 @@ class Boot {
 `BufferCharBackend` (in-memory, for tests and scripting) and `StdioCharBackend` (standard input
 and output) are ready-made console backends.
 
+### Saving and restoring a machine
+
+A paused machine (before the first `run`, or after `run` has returned, e.g. after `stop()` or an
+instruction limit) can be written to a stream and continued later, in the same JVM or another:
+
+```java
+emu.stop();                                    // from any thread; run() returns
+try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(file))) {
+    emu.saveState(out);
+}
+
+// Later: a new emulator from the same configuration, with the same disks reattached.
+try (Emulator emu = new Emulator(cfg);
+     InputStream in = new GZIPInputStream(Files.newInputStream(file))) {
+    emu.loadState(in);
+    emu.run();                                 // the guest continues where it was saved
+}
+```
+
+- The state holds every CPU (registers, timebase and decrementer, reservations, idle and
+  RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
+  process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
+  console input the guest has not read yet, SCSI sense state. v-scsi commands complete inside
+  the hypercall that submits them, so no request is ever in flight at a save. Compiled code,
+  decode caches and TLBs are rebuilt as the guest runs.
+- Outside the state, and the embedder's to keep: disk contents (reattach the images as the guest
+  left them; use `persistent(true)` disks or your own `BlockBackend`, since the default
+  copy-on-write snapshots are discarded at `close()`), the console backend, the NVRAM file (it
+  is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
+- The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
+  host bridge and `rng` settings, NVRAM size and the same SCSI devices (type, target id, LUN,
+  block size, size, read-only). Otherwise `loadState` throws `StateMismatchException` listing
+  the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
+  need not match: the guest's view of them is in its RAM and saved device tree. The clock and
+  time scale may differ.
+- Guest time stops while a machine is saved: each CPU's timebase continues from its saved value,
+  so the guest's uptime and timers resume where they were and its time of day is behind the host
+  by the time spent saved, until the guest reads the RTC again or syncs with NTP (RTAS
+  get-time-of-day follows `MachineConfig.clock`, plus any offset the guest set).
+- The format has a magic and a version and checksums every record; RAM goes in records of at
+  most 1 MiB with all-zero 4 KiB pages left out, so the stream compresses well and is never held
+  in memory whole. A state of another version, a truncated or corrupt one is refused with
+  `StateFormatException`. A corrupt record found after loading has begun leaves the emulator
+  refusing to run until a good state is loaded or `reset()` is called. States are independent of
+  the Java version (one saved on Java 21 loads on Java 27 and back).
+- A state is always the whole machine; there is no incremental (dirty since the last save)
+  form. Guest stores reach RAM from the interpreter, compiled code and device DMA without a
+  common point at which to mark pages dirty cheaply.
+
 Where guest RAM lives depends on the Java version, and the JVM limit for it must exceed the RAM
 of every machine alive at once:
 
@@ -112,7 +161,7 @@ classes, which refuse to load on a JVM without atomic access to byte arrays (JDK
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
-    [--no-code-sharing]
+    [--no-code-sharing] [--persistent] [--load-state file] [--save-state file]
 ```
 
 | Flag | Meaning |
@@ -130,6 +179,9 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--status-secs n` | Print per-CPU progress to stderr every `n` seconds |
 | `--jit off\|blocks\|regions` | Compile hot guest code to JVM bytecode: not at all, basic blocks only, or blocks plus whole-page regions (default `regions`) |
 | `--no-code-sharing` | Compile code separately for each CPU and address space instead of sharing it |
+| `--persistent` | Write guest changes to the `--disk` images instead of a discarded snapshot |
+| `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |
+| `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
 
 The console is on stdin/stdout; diagnostics and the exit summary (including unimplemented
 instructions, hypercalls and RTAS calls) go to stderr. Guest RAM counts against the JVM's direct

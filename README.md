@@ -166,7 +166,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 
 | Flag | Meaning |
 |---|---|
-| `--ram MiB` | Guest RAM, a multiple of 256 (default 2048) |
+| `--ram MiB` | Guest RAM, at least 64 and a multiple of 16 (default 2048); see [Guest RAM](#guest-ram) |
 | `--smp n` | Guest CPUs (default 1) |
 | `--firmware file` | Firmware image (default: the bundled SLOF image) |
 | `--disk img` / `--disk4k img` | Raw disk image, 512- or 4096-byte sectors (snapshot mode) |
@@ -200,6 +200,23 @@ for large `--ram` values raise the limit in `JAVA_OPTS`, e.g.
 
 `scripts/guest/drive.py` checks these by driving the console through a pty,
 against our CLI or QEMU (see `scripts/guest/README.md`).
+
+### Guest RAM
+
+`MachineConfig.ram` and `--ram` take any multiple of 16 MiB from 64 MiB up. As in QEMU, the
+largest power of two not above the RAM size is the real mode area (`memory@0` in the device
+tree), and the rest of the RAM is described by further `memory@` nodes. SLOF only uses the real
+mode area and keeps about 37 MiB at its top for itself, so the boot loader and whatever it loads
+through SLOF have to fit in the rest of it; the kernels then use all of the RAM. Multiples of
+256 MiB, the only sizes QEMU accepts, give the same device tree as QEMU.
+
+The smallest sizes that work with the guests above:
+
+| Guest | Least RAM | Below that |
+|---|---|---|
+| SLOF alone | 64 MiB | 48 MiB leaves a 32 MiB real mode area, and SLOF stops with "Not enough memory for Open Firmware" |
+| FreeBSD 15.1, either ISO | 144 MiB | at 128 MiB the kernel boots, but the installer's processes are killed for lack of memory; below 128 MiB SLOF cannot load the FreeBSD loader, which is linked at 44 MiB, where SLOF itself sits ("Memory for ELF file is already in use!") |
+| openSUSE Tumbleweed Minimal | 704 MiB | from 512 to 640 MiB the kernel boots, but the out-of-memory killer stops the first-boot setup (at 512 MiB under QEMU too); below 512 MiB GRUB cannot fit the kernel and the initrd into the real mode area |
 
 ## Building and testing
 

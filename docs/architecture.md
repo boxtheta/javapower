@@ -16,9 +16,10 @@ console.
   powerpc64 kernel and userland are BE (ELFv2) and run 32-bit BE powerpc binaries (COMPAT_FREEBSD32,
   MSR[SF]=0) with LPCR[ILE]=0; the other kernels are LE.
 - Radix MMU only: the guests negotiate radix through CAS. Hash/SLB is out of scope for now.
-- XICS interrupts via hcalls. VIO devices only (nvram, vty, v-scsi, then the devices added through
-  `MachineConfig`: an l-lan virtual Ethernet device for each network, and embedders' own); no PCI
-  devices.
+- XICS interrupts via hcalls. VIO devices (nvram, vty, v-scsi, then the devices added through
+  `MachineConfig`: an l-lan virtual Ethernet device for each network, and embedders' own), and
+  on the PCI host bridge the PCI devices an embedder adds, virtio ones through a virtio PCI
+  transport (see [PCI devices](#pci-devices)).
 - Memory-mapped I/O: real addresses outside RAM reach the regions of an `MmioBus`, which
   embedders fill through `MachineConfig.addMmio` (see [Memory-mapped I/O](#memory-mapped-io)).
 - Devices with host-side backends: the console (`CharBackend`), SCSI disks (`BlockBackend`) and
@@ -48,7 +49,7 @@ class.
 | `core` | `org.boxtheta.javapower.core` | Shared contracts: `CpuState`, `Op`, `DecodeTable`, `GuestMemory`, `PhysicalMemory`, `MmioBus` (with `MmioRegion` and `MmioHandler`), `Hypervisor`, `PpcException`, `Msr`, `Spr`. Every other module builds on these, so change them with care. |
 | `cpu-int` | `org.boxtheta.javapower.cpu` | Integer/branch/system instructions, run loop, JIT, interrupt delivery, timebase/decrementer, radix MMU. |
 | `cpu-fpvec` | `org.boxtheta.javapower.fpvec` | Software float, FP, VMX (Altivec), VSX, DFP instructions. |
-| `platform` | `org.boxtheta.javapower.papr` | Machine, device tree, hcalls, RTAS, XICS, VIO devices, disk backends. |
+| `platform` | `org.boxtheta.javapower.papr` | Machine, device tree, hcalls, RTAS, XICS, VIO devices, PCI devices and the virtio PCI transport, disk backends. |
 | `emulator` | `org.boxtheta.javapower` | The embedding entry point: one artifact that pulls in the CPU and platform modules. |
 | `app` | `org.boxtheta.javapower.app` | CLI and integration wiring. |
 | `firmware-slof` | `org.boxtheta.javapower.firmware.slof` | The SLOF image (gzip resource, built by `firmware-build/`) and `SlofFirmware`. |
@@ -101,6 +102,72 @@ CPUs run, which PCI BARs need.
   nodes. The saved state's hardware record lists them (name, base, size, byte order, interrupt)
   only when there are any, and an `"MMIO"` record holds each handler's own state, so states of
   machines without regions are unchanged.
+
+## PCI devices
+
+PHB 0, the PCI host bridge QEMU's `pseries` always creates, holds the PCI devices an embedder
+adds with `MachineConfig.addPciDevice` (`Phb` in `platform`). There is no hot-plug: the devices
+are placed in their slots when the machine is built, those given a slot first, then the others
+in the order they were added, each into the lowest free slot.
+
+- Enumeration: like QEMU, the machine puts a node per device under the bridge's node (name from
+  the class code, `reg`, ids, `interrupts`, `ibm,loc-code`, `ibm,my-drc-index`, in QEMU's
+  property order) and keeps `qemu,phb-enumerated`, so SLOF does not scan the bus: it walks those
+  nodes, assigns BARs through RTAS from the windows in the bridge's `ranges`, writes
+  `assigned-addresses` and enables decoding. Linux and FreeBSD then read configuration space
+  through RTAS (`ibm,read-pci-config`; the forms without a BUID fail as in QEMU) and route
+  interrupts through the bridge's `interrupt-map`. The slot's PCI DR connector is populated.
+  The device tree of a machine without PCI devices is unchanged.
+- `PciDevice` holds the 256 bytes of conventional configuration space with QEMU's write masks:
+  writable command bits (I/O, memory, bus master, SERR, INTx disable), cache line size and
+  interrupt line, write-one-to-clear status error bits, BARs that keep their type bits and decode
+  a naturally aligned range, read-only capabilities, plain storage elsewhere after the header.
+  Accesses come from RTAS under the machine lock and the device's configuration lock.
+- BARs: when the guest writes a BAR or the command register, the device recomputes each BAR's
+  PCI address (QEMU's `pci_bar_address` rules) and remaps it on the machine's `MmioBus` at the
+  real address the bridge's windows give it: the I/O window (ports 0 to 0xffff at 32 TiB), the
+  32-bit memory window (PCI 2 to 4 GiB at 32 TiB + 2 GiB) or the 64-bit one (PCI 33 TiB to
+  34 TiB at the same real addresses). A BAR outside the windows or overlapping another BAR is
+  left unmapped. Remapping while CPUs run is safe because the bus never lets a translation to a
+  region outlive a lookup. BAR regions are little-endian.
+- Interrupts: INTx only. Pin p of slot s drives LSI `0x1200 + (s + p - 1) % 4`, QEMU's swizzle,
+  which the existing `interrupt-map` describes; the bridge counts the devices asserting each LSI
+  and drives the XICS source while any does. INTx disable in the command register masks a pin.
+  The `ibm,change-msi` family still answers as for a device without MSI: no guest driver we
+  support needs MSI (Linux's and FreeBSD's virtio drivers fall back to INTx, FreeBSD's `vtrnd`
+  even polls), so MSI-X was left out.
+- DMA: `PciDevice.dmaRead`/`dmaWrite` translate bus addresses through the bridge's TCE table
+  (LIOBN 0x80000000, a 1 GiB window of 4 KiB pages) while bus mastering is enabled. The DDW
+  calls (`ibm,query-pe-dma-window` and the rest) still fail with a parameter error, so Linux uses
+  that window instead of the 64-bit direct window QEMU would create.
+- The virtio PCI transport (`VirtioPciDevice`, virtio 1.1 section 4.1) builds what QEMU's
+  `virtio-*-pci,vectors=0` builds on a conventional PCI bus: one 16 KiB 64-bit BAR with the
+  common configuration, ISR, device configuration and notification areas (multiplier 4),
+  described by vendor capabilities plus the PCI configuration access capability. By default,
+  as in QEMU, a device type with a legacy interface is transitional: it also has the legacy
+  registers in I/O BAR 0 and the legacy device id; other types are modern only. It offers
+  VIRTIO_F_VERSION_1, RING_INDIRECT_DESC and RING_EVENT_IDX, not ACCESS_PLATFORM, so addresses
+  in the split rings are guest real addresses, as QEMU's virtio devices use by default and the
+  stock pseries drivers expect. As in QEMU, features the driver writes that were not offered
+  are dropped and VERSION_1 is not insisted on; without VERSION_1 the rings are in the legacy
+  byte order, that of the CPU that last reset the device (big-endian at a machine reset).
+  Linux uses the modern interface. FreeBSD uses the legacy interface of a transitional device;
+  its modern driver byte-swaps the registers twice on a big-endian kernel and so negotiates no
+  features and programs swapped ring addresses (under QEMU as well), which the transport
+  refuses as misaligned. The device-specific part is a `VirtioDevice`; `VirtioRng` is the
+  built-in one.
+- Threads and locks: each transport has one lock guarding its registers and every virtqueue;
+  `Virtqueue` and `VirtqueueRequest` take it for each call and read or write guest RAM under
+  it, so a device reset (which takes it) never races a copy into memory the guest reclaims, and
+  requests popped before a reset are stale afterwards. Device hooks are called without it, so a
+  device may take its own locks and call back into the transport. The lock order is machine
+  lock, device configuration lock, transport lock, INTx lock, bridge LSI lock, XICS.
+- Saved state: a `"PCI "` record after `"PAPR"`, only when there are PCI devices, holds each
+  device's configuration space, interrupt level and own state (for virtio: the transport
+  registers, each queue's addresses and indices, and the device's state). Requests popped and
+  not completed are saved as to be popped again; after a load `Machine.pump` tells the device
+  once the guest runs, since RAM is loaded after the platform. The hardware description gains a
+  `"PCI "` section (slot, model, ids, class, pin, BARs and the device's own description).
 
 ## Library API
 

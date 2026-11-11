@@ -72,8 +72,9 @@ class Boot {
 - `MachineConfig` configures the machine: RAM, CPU count, firmware, console, disks (`addCdrom`,
   `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), network devices
   (`addNetwork(backend)`, see [Networking](#networking)), NVRAM file, kernel command line, log
-  sink, and devices of your own in the guest's address space (`addMmio`; see
-  [Memory-mapped devices](#memory-mapped-devices)).
+  sink, devices of your own in the guest's address space (`addMmio`; see
+  [Memory-mapped devices](#memory-mapped-devices)) and PCI devices, virtio ones among them
+  (`addPciDevice`; see [PCI and virtio devices](#pci-and-virtio-devices)).
 - Firmware has no default: pass the image as bytes (`firmware(SlofFirmware.image())` from
   `javapower-firmware-slof`, which decompresses a fresh copy on each call) or as a file
   (`firmware(Path)`, e.g. `/usr/share/qemu/slof.bin`). Without one, the `Machine` constructor throws
@@ -252,6 +253,93 @@ try (Emulator emu = new Emulator(cfg)) {
   unmap regions on it while the guest runs (PCI BARs move when the guest programs them); such
   regions are not checked, described in the device tree or saved by the machine.
 
+### PCI and virtio devices
+
+The machine's PCI host bridge (PHB 0, `/pci@800000020000000`) takes up to 32 devices of the
+embedder's, added with `MachineConfig.addPciDevice` before the machine is built. Most embedders
+want a virtio device: implement the device-specific part as a `VirtioDevice` and put it on the
+bridge with the virtio PCI transport, `VirtioPciDevice`. A device that is not virtio subclasses
+`PciDevice` directly.
+
+```java
+class Beeper extends VirtioDevice {
+    Beeper() {
+        super(25, 64, 64, 64, 64);                 // device type, then each virtqueue's size
+    }
+    @Override protected long deviceFeatures() { return 0; }
+    @Override protected int configSize() { return 16; }
+    @Override protected long readConfig(int offset, int size) { ... }   // little-endian
+    @Override protected void queueNotified(Virtqueue q) {
+        wakeUpServiceThread();                     // on a CPU thread: keep it short
+    }
+    void service() {                               // the embedder's own thread
+        VirtqueueRequest r;
+        while ((r = queue(2).pop()) != null) {
+            byte[] pcm = new byte[(int) r.readableLength()];
+            r.read(0, pcm, 0, pcm.length);         // what the driver sent
+            play(pcm);
+            r.write(0, status, 0, status.length);  // the reply, into the writable buffers
+            r.complete(status.length);             // used ring, then an interrupt
+        }
+    }
+}
+cfg.addPciDevice(new VirtioPciDevice(new Beeper()));          // slot 0
+cfg.addPciDevice(new VirtioPciDevice(new VirtioRng()));       // slot 1
+```
+
+- Slots: devices given a slot (`addPciDevice(slot, device)`, 0 to 31) take it; the others take
+  the lowest free slot in the order they were added. Each is function 0 of its slot on bus 0.
+  `MachineConfig.phb(false)` with PCI devices is a configuration error.
+- The machine describes each device in the device tree under the bridge as QEMU does (node
+  name from the class code, `reg`, ids, `interrupts`, `ibm,loc-code`, `ibm,my-drc-index`) and
+  marks the bus enumerated, so SLOF only assigns the BARs. SLOF lists the devices at boot, and
+  Linux and FreeBSD find them by reading configuration space through RTAS.
+- `PciDevice` implements the 256 bytes of conventional configuration space with QEMU's rules
+  for the header, BARs (`addMemoryBar`, 32- or 64-bit, and `addIoBar`), capabilities
+  (`addCapability`), the interrupt pin and the subsystem ids. The guest programs the BARs; while
+  it enables decoding, the BAR's `MmioHandler` receives the CPUs' little-endian accesses at the
+  addresses the bridge's windows give it (PCI memory 2 to 4 GiB at real address 32 TiB + 2 GiB,
+  PCI memory from 33 TiB at the same real address, I/O ports from real address 32 TiB). A BAR
+  the guest moves or disables while CPUs run is unmapped at once.
+- Interrupts: `setIrq(level)` raises or lowers the device's INTx pin, from any thread. Pins are
+  swizzled onto the bridge's four LSIs as in QEMU (source `0x1200 + (slot + pin - 1) % 4`), which
+  devices may share. There is no MSI or MSI-X: the stock virtio drivers of Linux and FreeBSD
+  work with INTx, as with QEMU's `vectors=0`.
+- DMA: `dmaRead` and `dmaWrite` reach guest memory through the bridge's TCE table (the 1 GiB
+  window the guest maps with H_PUT_TCE), once the guest has enabled bus mastering. The bridge
+  offers no dynamic DMA window, so Linux logs `query_ddw failed` and keeps to that window.
+- The virtio transport is virtio 1.x over PCI as QEMU's `virtio-*-pci` builds it with
+  `vectors=0`: one 64-bit memory BAR with the common, ISR, device and notification structures,
+  split virtqueues with indirect descriptors and event index suppression. Like QEMU's default
+  it does not offer VIRTIO_F_ACCESS_PLATFORM: ring and buffer addresses are guest real
+  addresses. `new VirtioPciDevice(device)` makes the device QEMU makes by default on this bus:
+  transitional (with the legacy interface in an I/O BAR too, and the legacy device id) for the
+  types that have a legacy interface (network, block, console, entropy, balloon, SCSI, 9P),
+  modern only (device id `0x1040` plus the type) for the others, virtio-snd among them.
+  `new VirtioPciDevice(device, false)` asks for modern only. Linux uses the modern interface
+  either way; FreeBSD uses the legacy one of a transitional device, and its modern driver does
+  not work on a big-endian kernel (under QEMU neither), so FreeBSD powerpc64 needs a
+  transitional device.
+- `VirtioRng` is a complete device (virtio-rng): Linux reads it through `/dev/hwrng`
+  (`virtio_rng`), FreeBSD attaches `vtrnd` (module `virtio_random`) as an entropy source.
+  FreeBSD 15.1 hangs during boot with two virtio-rng devices, under QEMU too; one works.
+- Threads: BAR handlers and configuration hooks run on the CPU threads, with no machine lock
+  held, and must be quick. The `VirtioDevice` hooks (`queueNotified`, `readConfig`,
+  `writeConfig`, `featuresAccepted`, `driverReady`, `reset`) run on the CPU thread that made the
+  access with no lock of the transport held. `Virtqueue` and `VirtqueueRequest` methods,
+  `configChanged`, `needsReset`, `setIrq`, `dmaRead` and `dmaWrite` are thread-safe and may be
+  called from the embedder's own thread at any time. A request held across a device reset
+  becomes stale: its methods do nothing and say so.
+- Saved state: configuration space, BAR mappings (restored on load), the interrupt level, the
+  transport and every virtqueue are part of the saved machine, and `PciDevice.saveState` and
+  `VirtioDevice.saveState` add each device's own state. Requests the device had popped and not
+  completed when the machine was saved are popped again, as new, after a load; the device hears
+  of them through `queueNotified`, called from the thread that pumps the machine (the
+  `Emulator`'s), once it runs. The hardware check compares each device's slot, model, ids,
+  class, interrupt pin, BARs and what the device adds (`hardwareDescription`; for virtio the
+  device type, queue sizes, features and configuration size). Without PCI devices the machine,
+  its device tree and its saved state are exactly as before.
+
 ### Saving and restoring a machine
 
 A paused machine (before the first `run`, or after `run` has returned, e.g. after `stop()` or an
@@ -275,11 +363,12 @@ try (Emulator emu = new Emulator(cfg);
   RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
   process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
   console input the guest has not read yet, SCSI sense state, each network device's
-  registration, receive buffers, receive queue position, MAC address and multicast filters, and
-  what each MMIO region's handler saves. Frames waiting for the guest's receive buffers are
-  dropped on save, as a real link drops frames during a pause, and the network devices take no
-  frames from their backends from the start of a save or load until the guest runs again.
-  v-scsi commands complete inside
+  registration, receive buffers, receive queue position, MAC address and multicast filters, PCI
+  devices (configuration space, virtio queues and what each device saves), and what each MMIO
+  region's handler saves. Frames waiting for the guest's receive buffers are dropped on save, as
+  a real link drops frames during a pause, and the network devices take no frames from their
+  backends from the start of a save or load until the guest runs again. v-scsi commands
+  complete inside
   the hypercall that submits them, so no request is ever in flight at a save. Compiled code,
   decode caches and TLBs are rebuilt as the guest runs.
 - Outside the state, and the embedder's to keep: disk contents (reattach the images as the guest
@@ -290,9 +379,10 @@ try (Emulator emu = new Emulator(cfg);
   host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
   block size, size, read-only), the same added VIO devices in the same order (network devices
   with the same MAC addresses, so give explicit addresses or add them in the same order; for
-  devices of your own see [Adding VIO devices of your own](#adding-vio-devices-of-your-own)) and
-  the same MMIO regions (name, base, size, byte order, interrupt). Otherwise `loadState` throws
-  `StateMismatchException` listing
+  devices of your own see [Adding VIO devices of your own](#adding-vio-devices-of-your-own)),
+  the same PCI devices (slot, model, ids, class, BARs, and for virtio the device type and
+  queues) and the same MMIO regions (name, base, size, byte order, interrupt). Otherwise
+  `loadState` throws `StateMismatchException` listing
   the differences and changes nothing. Firmware, boot device, kernel command line, UUID and name
   need not match: the guest's view of them is in its RAM and saved device tree. The clock and
   time scale may differ.
@@ -337,7 +427,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
     [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
     [--no-code-sharing] [--persistent] [--load-state file] [--save-state file] [--net spec]...
-    [--test-mmio addr]
+    [--virtio-rng] [--test-mmio addr]
 ```
 
 | Flag | Meaning |
@@ -360,6 +450,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
 | `--net dgram,local=host:port,remote=host:port[,mac=addr]` | Add a network device whose frames travel as UDP datagrams: received at `local`, sent to `remote` (QEMU's `-netdev dgram` format; see below). Repeat for more devices |
 | `--net none[,mac=addr]` | Add a network device connected to nothing |
+| `--virtio-rng` | Add a virtio-rng PCI device (`virtio-rng-pci`) in the next free PCI slot; give it twice for two. Its bytes served are reported at exit |
 | `--test-mmio addr` | For testing only: 4 KiB of scratch registers at real address `addr` (node `/test-mmio@addr`), reporting every access on stderr; see `scripts/guest/mmio` |
 
 Two guests can share a link by sending to each other's local port, e.g. one with

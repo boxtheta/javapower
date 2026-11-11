@@ -2,7 +2,6 @@ build/
 .gradle/
 *.class
 .idea/
-# Local setup: the build server (see docs/development.md) and private notes.
+# Local setup for scripts/remote.sh (see docs/development.md).
 /local.env
-CLAUDE.local.md
 *.iml

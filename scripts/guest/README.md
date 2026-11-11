@@ -2,8 +2,8 @@
 
 `drive.py` boots a guest under our CLI (`--vm ours`, the default) or QEMU (`--vm qemu`, the
 same machine as `~/javapower/ref/run-qemu.sh`) with its console on a raw-mode pty, waits for
-patterns and types input (`console.py`, stdlib only). Everything runs on the dev server; build
-the CLI first (`gradle :app:installDist`). Raw console logs and emulator stderr go to `--logdir`
+patterns and types input (`console.py`, stdlib only). Everything runs on the machine that has the guest images
+(see `docs/development.md`); build the CLI first (`gradle :app:installDist`). Raw console logs and emulator stderr go to `--logdir`
 (default `~/javapower/work/guest-logs`).
 
 | Scenario | What it does |

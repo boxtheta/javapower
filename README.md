@@ -146,7 +146,7 @@ for large `--ram` values raise the limit in `JAVA_OPTS`, e.g.
 | FreeBSD 15.1 powerpc64 (big-endian) install ISO | boots to the installer; its kyua tests and 32-bit (COMPAT_FREEBSD32) programs give the same results as under QEMU | `app --ram 4096 --cdrom FreeBSD-15.1-RELEASE-powerpc-powerpc64-disc1.iso` |
 | openSUSE Tumbleweed ppc64le Minimal VM (4K-sector raw image) | boots to the first-boot configuration screen | `app --disk4k opensuse-tw-minimal.raw --clock-scale 4` |
 
-`scripts/guest/drive.py` checks these on the dev server by driving the console through a pty,
+`scripts/guest/drive.py` checks these by driving the console through a pty,
 against our CLI or QEMU (see `scripts/guest/README.md`).
 
 ## Building and testing
@@ -165,8 +165,8 @@ gradle :app:installDist                           # CLI in app/build/install/app
 gradle publishToMavenLocal                        # library artifacts
 ```
 
-In this project the builds run on the shared dev server through
-`scripts/remote.sh <workspace> <command>` (see [docs/development.md](docs/development.md)).
+See [docs/development.md](docs/development.md) for what else is needed to regenerate test vectors,
+run the guest checks and rebuild the firmware.
 
 Modules: `core` (shared contracts), `cpu-int` (integer, branch, system instructions, MMU, run
 loop), `cpu-fpvec` (floating point, VMX, VSX), `platform` (machine model, hypercalls, RTAS,
@@ -199,8 +199,8 @@ and commit (and if needed the snapshot date) in `firmware-build/Containerfile`.
 
 ### Releasing
 
-`scripts/release.sh <version> [--upload]` builds and checks the modules on the build server,
-fetches them, signs every artifact here with the release key (GPG
+`scripts/release.sh <version> [--upload]` builds and checks the modules, signs every artifact
+with the release key (GPG
 `6E501D76959FFF2632BDEE5B8BE9EC452CDD18D3`) and writes
 `build/javapower-<version>-central.zip`, the bundle Maven Central's portal accepts. With `--upload`
 it sends the bundle to the portal (user token in `CENTRAL_TOKEN_USER` and `CENTRAL_TOKEN_PASSWORD`)

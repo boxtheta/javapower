@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instruction coverage scan of real guest binaries (run on the dev server).
+"""Instruction coverage scan of real guest binaries (needs the guest images).
 
   python3 scan.py <file-or-dir>...
 

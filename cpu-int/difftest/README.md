@@ -17,7 +17,7 @@ DAR/DSISR, AIL), and the radix MMU, with the exact state QEMU leaves.
 | `gen.py` | Builds the firmware, assembles cases with llvm-mc, runs QEMU, writes golden lines |
 | `groups_*.py` | Case generators: `alu`, `alu32`, `branch`, `ldst`, `sys`, `spr`, `trace`, `mmu` (+ `selftest` in `groups.py`) |
 | `groups.py` | Registry, and the big-endian-firmware variants `selftestbe`, `sysbe`, `mmube`, `tracebe` (see below) |
-| `run.sh` / `fetch.sh` | Regenerate on the dev server / copy into `src/test/resources/golden-int/` |
+| `run.sh` / `fetch.sh` | Regenerate under QEMU / copy from JP_HOST into `src/test/resources/golden-int/` |
 | `scan.py` | Coverage scan: decodes every instruction word of real guest binaries |
 | `testsummary.py` | Prints failures from the last `:cpu-int:test` run |
 
@@ -49,7 +49,7 @@ prefix). Their golden lines carry `ile=0`, which `Golden.java` applies to LPCR.
 (an absolute path on the server for `run.sh`, relative to `~` for `fetch.sh`).
     scripts/remote.sh agent-a 'gradle -q :cpu-int:test; python3 cpu-int/difftest/testsummary.py'
 
-Coverage scan of guest binaries (paths on the dev server):
+Coverage scan of guest binaries (example paths):
 
     scripts/remote.sh agent-a 'gradle -q :cpu-int:testClasses && python3 cpu-int/difftest/scan.py <elf or dir>...'
 

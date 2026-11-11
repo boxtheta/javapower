@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerate golden vectors on the dev server. Usage (from the repo root, locally):
+# Regenerate golden vectors (needs QEMU and clang). Usage, here or through scripts/remote.sh:
 #   scripts/remote.sh agent-a sh cpu-int/difftest/run.sh [group...]
 # then run cpu-int/difftest/fetch.sh locally to copy them into src/test/resources/golden-int/.
 set -e

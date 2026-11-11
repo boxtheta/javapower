@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the big-endian FreeBSD test programs and pack them into an ISO for drive.py's `progs`
-# scenario (runs on the dev server).
+# scenario (needs QEMU and the guest images).
 #   sh scripts/guest/progs/build.sh [outdir]      -> <outdir>/progs.iso
 #
 # Sysroots come from the BE install disc's offline pkgbase repo: headers and 64-bit static

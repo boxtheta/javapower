@@ -1,5 +1,5 @@
 #!/bin/sh
-# Device tree diff against QEMU. Run on the dev server from the checkout root, e.g.
+# Device tree diff against QEMU. Needs QEMU and dtc; run from the checkout root, e.g.
 #   scripts/remote.sh agent-c platform/scripts/dt-diff.sh
 # Runs the platform DeviceTreeTest (which writes our blobs to platform/build/dt/), decompiles them
 # with dtc and diffs them against the trees QEMU produced for the same configuration. The only

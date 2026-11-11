@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerate golden vectors on the dev server. Usage (from the repo root, locally):
+# Regenerate golden vectors (needs QEMU and clang). Usage, here or through scripts/remote.sh:
 #   scripts/remote.sh agent-b sh cpu-fpvec/difftest/run.sh <group...>
 # then copy ~/javapower/work/agent-b-scratch/golden/*.txt.gz into
 # cpu-fpvec/src/test/resources/golden/ (see fetch.sh).

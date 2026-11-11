@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Differential test vector generator for cpu-fpvec.
 
-Pipeline (run on the dev server, see run.sh):
+Pipeline (needs QEMU and clang, see run.sh):
   1. A group module (groups_*.py) yields test cases: assembler text for ONE instruction plus
      overrides of the default register/memory state.
   2. All instructions of a group are assembled with llvm-mc (independent of our decoder).

@@ -3,16 +3,16 @@
 #
 #   scripts/release.sh <version> [--upload]
 #
-# 1. On the build server (scripts/remote.sh, workspace "release"): gradle check, then publish every
-#    module at <version> into a staging directory in Maven layout.
-# 2. Here: fetch that directory and sign every artifact with the release key. The private key
-#    never leaves this machine.
+# 1. gradle check, then publish every module at <version> into a staging directory in Maven
+#    layout. With JP_HOST set (environment or local.env) this runs on that machine through
+#    scripts/remote.sh, workspace "release", and the directory is fetched back; otherwise here.
+# 2. Sign every artifact with the release key. The private key never leaves this machine.
 # 3. Zip it into build/javapower-<version>-central.zip, the bundle Central's portal accepts.
 # 4. With --upload: send the bundle to the portal as a deployment that still has to be released by
 #    hand at https://central.sonatype.com/publishing/deployments (publishing cannot be undone).
 #    Needs a portal user token in CENTRAL_TOKEN_USER and CENTRAL_TOKEN_PASSWORD.
 #
-# JP_RELEASE_KEY overrides the signing key. The build server is JP_HOST, as for remote.sh.
+# JP_RELEASE_KEY overrides the signing key.
 set -eu
 KEY=${JP_RELEASE_KEY:-6E501D76959FFF2632BDEE5B8BE9EC452CDD18D3}
 VERSION=${1:?usage: release.sh <version> [--upload]}
@@ -29,9 +29,8 @@ if [ "$UPLOAD" = --upload ]; then
 fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-# The server is a local detail: JP_HOST, from the environment or the untracked local.env.
 if [ -f "$ROOT/local.env" ]; then . "$ROOT/local.env"; fi
-HOST=${JP_HOST:?set JP_HOST, or put JP_HOST=<build server> in local.env at the repository root}
+HOST=${JP_HOST:-}
 if [ -n "$(git status --porcelain)" ]; then
     echo "working tree is not clean; a release is built from a commit" >&2; exit 1
 fi
@@ -41,10 +40,14 @@ if [ -t 0 ]; then GPG_TTY=$(tty); export GPG_TTY; fi
 
 STAGING=build/central-staging
 BUNDLE=build/javapower-$VERSION-central.zip
-scripts/remote.sh release "rm -rf $STAGING && gradle -q -PreleaseVersion=$VERSION check publishAllPublicationsToStagingRepository"
 rm -rf "$STAGING" "$BUNDLE"
-mkdir -p "$STAGING"
-rsync -az "$HOST:javapower/work/release/$STAGING/" "$STAGING/"
+if [ -n "$HOST" ]; then
+    scripts/remote.sh release "rm -rf $STAGING && gradle -q -PreleaseVersion=$VERSION check publishAllPublicationsToStagingRepository"
+    mkdir -p "$STAGING"
+    rsync -az "$HOST:javapower/work/release/$STAGING/" "$STAGING/"
+else
+    gradle -q -PreleaseVersion="$VERSION" check publishAllPublicationsToStagingRepository
+fi
 
 # Central wants no repository metadata, and a signature next to every file but the checksums.
 find "$STAGING" -name 'maven-metadata.xml*' -delete

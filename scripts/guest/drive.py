@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guest console scenarios for javapower and the QEMU reference (runs on the dev server).
+"""Guest console scenarios for javapower and the QEMU reference (needs QEMU and the guest images).
 
     python3 scripts/guest/drive.py <scenario> [--vm ours|qemu] [options]
 

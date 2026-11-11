@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential test vector generator for cpu-int (runs on the dev server; see README.md).
+"""Differential test vector generator for cpu-int (needs QEMU and clang; see README.md).
 
   python3 gen.py <group> <outdir>
 

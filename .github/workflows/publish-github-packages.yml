@@ -1,0 +1,89 @@
+name: Publish to GitHub Packages
+
+# Builds a released version from its tag and publishes the Maven artifacts of every module to
+# GitHub Packages (https://maven.pkg.github.com/<owner>/<repository>). Runs when a GitHub release
+# is published, and by hand for a release tag that already exists. A version can be published
+# once: GitHub Packages refuses to replace it.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-github-packages-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Take the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "not a release tag (v<major>.<minor>.<patch>): $TAG" >&2
+            exit 1
+          fi
+          case "$TAG" in
+            *SNAPSHOT*) echo "snapshots are not published: $TAG" >&2; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+
+      # JDK 21 compiles and runs the tests; JDK 27 compiles the Java 22 classes of the
+      # multi-release jars and runs the tests a second time. The last one listed runs Gradle.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            27
+
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.8.2'
+
+      # The repository is added here and not in build.gradle, so that tags from before this
+      # workflow existed can be published too.
+      - name: Add GitHub Packages as a publishing repository
+        run: |
+          cat > "$RUNNER_TEMP/github-packages.init.gradle" <<'EOF'
+          allprojects { project ->
+              project.pluginManager.withPlugin('maven-publish') {
+                  project.extensions.getByName('publishing').repositories.maven {
+                      name = 'GitHubPackages'
+                      url = 'https://maven.pkg.github.com/' + System.getenv('GITHUB_REPOSITORY')
+                      credentials {
+                          username = System.getenv('GITHUB_ACTOR')
+                          password = System.getenv('GITHUB_TOKEN')
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Check and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gradle --init-script "$RUNNER_TEMP/github-packages.init.gradle" \
+            -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_27_X64 \
+            -PreleaseVersion="$VERSION" \
+            check publishAllPublicationsToGitHubPackagesRepository

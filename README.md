@@ -89,6 +89,8 @@ class Boot {
   a limit or `stop()`); reboots are followed inside `run`.
 - Diagnostics belong to each machine: `emu.log()` holds the sink and the once-per-key counts, so
   machines in one JVM never share log state. The sink is called from emulator threads.
+  `emu.appliedQuirks()` lists, by id, the workarounds for known guest bugs that the machine has
+  applied; [docs/guest-quirks.md](docs/guest-quirks.md) describes each one.
 - `close()` stops a running guest, waits for `run` to return, and releases disk images, snapshot
   overlays, the NVRAM file, the console backends and the network backends. It is idempotent.
 
@@ -198,7 +200,8 @@ FreeBSD's ppc64le `llan` driver reads the offset and length of each receive queu
 order, where PAPR has them big-endian, so under QEMU it receives nothing. The device recognises
 that driver by the byte-reversed MAC address it passes to H_REGISTER_LOGICAL_LAN and writes those
 two fields little-endian for it. Linux on either byte order and big-endian FreeBSD are not
-affected. A ppc64le FreeBSD guest whose MAC address ends in `:00:00` is not recognised.
+affected. A ppc64le FreeBSD guest whose MAC address ends in `:00:00` is not recognised. See
+[docs/guest-quirks.md](docs/guest-quirks.md).
 
 The `NetBackend` is the other end of the cable. The device hands it each frame the guest sends,
 and the backend delivers frames to the guest through the `FrameSink` it is given at start:
@@ -619,7 +622,8 @@ devices), `emulator` (the embedding entry point), `app` (the CLI), `firmware-slo
 image; depends on nothing else here, and only `app` and tests depend on it).
 
 The machine model and module layout are described in [docs/architecture.md](docs/architecture.md);
-conventions for changes are in [CONTRIBUTING.md](CONTRIBUTING.md).
+conventions for changes are in [CONTRIBUTING.md](CONTRIBUTING.md). Behaviour that works around a
+known guest bug is listed in [docs/guest-quirks.md](docs/guest-quirks.md).
 
 ### Rebuilding the firmware
 

@@ -357,7 +357,11 @@ class LLanTest {
     void aLittleEndianFreeBsdDriverGetsLittleEndianOffsetsAndLengths() {
         Peer p = new Peer();
         Rig r = bypass(p);
+        open(r, 2);
+        assertEquals(java.util.Set.of(), r.m.appliedQuirks(), "Linux's registration needs no quirk");
+        assertEquals(H.SUCCESS, r.hcall(H.FREE_LOGICAL_LAN, LAN0));
         openLe(r, 2);
+        assertEquals(java.util.Set.of(GuestQuirks.FREEBSD_LLAN_LE_RXQ), r.m.appliedQuirks());
         for (int i = 0; i < 4; i++) {
             post(r, i, 2048);
         }
@@ -384,6 +388,7 @@ class LLanTest {
         post(r, 5, 2048);
         p.give(frame(0x02, 100, 3));
         assertEquals(new Entry(0xc0, 8, 100, 0x1005), entry(r, 0));
+        assertEquals(java.util.Set.of(GuestQuirks.FREEBSD_LLAN_LE_RXQ), r.m.appliedQuirks(), "still listed");
     }
 
     @Test
@@ -393,7 +398,9 @@ class LLanTest {
         openLe(a, 4);
         byte[] state = save(a);
         Rig b = bypass(new Peer());
+        assertEquals(java.util.Set.of(), b.m.appliedQuirks());
         load(b, state);
+        assertEquals(java.util.Set.of(GuestQuirks.FREEBSD_LLAN_LE_RXQ), b.m.appliedQuirks(), "the loaded state has it");
         assertArrayEquals(state, save(b));
         assertEquals("52:54:00:12:34:56", mac(b.m.networks().get(0).macAddress()));
         b.m.cpuExecEnter(b.cpu);

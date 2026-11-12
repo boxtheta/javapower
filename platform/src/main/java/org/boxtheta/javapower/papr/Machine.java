@@ -1824,7 +1824,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             return op == H.MULTICAST_CTRL && d != null ? H.SUCCESS : H.PARAMETER;
         }
         return switch (op) {
-            case H.REGISTER_LOGICAL_LAN -> n.register(arg(s, 1), arg(s, 2), arg(s, 3));
+            case H.REGISTER_LOGICAL_LAN -> n.register(arg(s, 1), arg(s, 2), arg(s, 3), arg(s, 4));
             case H.FREE_LOGICAL_LAN -> n.free();
             case H.ADD_LOGICAL_LAN_BUFFER -> n.addBuffer(arg(s, 1));
             case H.SEND_LOGICAL_LAN -> n.send(new long[] {arg(s, 1), arg(s, 2), arg(s, 3), arg(s, 4), arg(s, 5),

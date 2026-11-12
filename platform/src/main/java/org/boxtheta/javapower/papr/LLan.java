@@ -34,6 +34,16 @@ import java.util.Set;
  * advertises no filter table entries ({@code ibm,mac-address-filters} is 0, as in QEMU), so
  * Linux disables filtering whenever it wants any multicast address.
  *
+ * <p>The receive queue entry's offset and length are big-endian, as PAPR says and as Linux reads
+ * them on either byte order. FreeBSD's little-endian {@code llan} reads them in host order, and
+ * under QEMU (which writes them big-endian) receives no frame intact. The same driver builds the
+ * MAC address argument of H_REGISTER_LOGICAL_LAN with {@code memcpy} from the address bytes into
+ * a doubleword, so on a little-endian kernel the address arrives byte-reversed: its low 16 bits
+ * zero, its high 16 bits not (Linux passes the address in the low 48 bits, and big-endian FreeBSD
+ * produces the same value). A device registered with such an argument writes the two fields
+ * little-endian, and takes H_MULTICAST_CTRL addresses byte-reversed too, until the driver frees
+ * it. A little-endian FreeBSD guest whose address ends in {@code :00:00} is not recognised.
+ *
  * <p>Threading: the receive state (registration, buffer pools, receive queue position, MAC,
  * filters, frames waiting for buffers) is guarded by the device lock. The backend's thread
  * delivers frames into guest memory itself, holding only that lock and the leaf locks below it,
@@ -82,6 +92,8 @@ public final class LLan extends VioDevice {
     static final int MC_CLEAR = 3;
     static final int MC_TABLE_MAX = 256;
     static final long MAC_MASK = 0xffffffffffffL;
+    /** In the saved MAC address: the receive queue is little-endian. */
+    private static final long LE_QUEUE_BIT = 1L << 63;
     private static final long BROADCAST = MAC_MASK;
 
     /** How long queued frames wait for a fitting buffer after the guest last posted one. */
@@ -98,6 +110,8 @@ public final class LLan extends VioDevice {
     private long rxqPtr;
     private int rxBufs;
     private long mac;
+    /** The driver reads receive queue offsets and lengths little-endian (see the class comment). */
+    private boolean leQueue;
     private boolean mcastRecv = true;
     private boolean mcastFilter;
     private boolean mcastOverflow;
@@ -419,8 +433,13 @@ public final class LLan extends VioDevice {
         long handle = readBe64(addr);
         long entry = (rxqBd & BD_ADDR_MASK) + rxqPtr;
         writeBe(entry + 8, handle, 8);
-        writeBe(entry + 4, f.length, 4);
-        writeBe(entry + 2, 8, 2);
+        if (leQueue) {
+            writeBe(entry + 4, Integer.reverseBytes(f.length), 4);
+            writeBe(entry + 2, Short.reverseBytes((short) 8), 2);
+        } else {
+            writeBe(entry + 4, f.length, 4);
+            writeBe(entry + 2, 8, 2);
+        }
         // The control byte makes the entry valid: everything before it must be visible first to
         // a CPU thread polling the queue.
         VarHandle.releaseFence();
@@ -443,8 +462,11 @@ public final class LLan extends VioDevice {
 
     // ---- hypercalls ---------------------------------------------------------------------------
 
-    /** H_REGISTER_LOGICAL_LAN. The MAC address argument is ignored, as in QEMU. */
-    long register(long bufListArg, long recQueue, long filterList) {
+    /**
+     * H_REGISTER_LOGICAL_LAN. As in QEMU the MAC address argument does not set the address; its
+     * byte order tells whether the driver is FreeBSD's little-endian one (see the class comment).
+     */
+    long register(long bufListArg, long recQueue, long filterList, long macArg) {
         synchronized (lock()) {
             if (open) {
                 log().once("llan-register-twice", nodeName() + ": H_REGISTER_LOGICAL_LAN without H_FREE_LOGICAL_LAN");
@@ -470,10 +492,21 @@ public final class LLan extends VioDevice {
             rxqPtr = 0;
             dmaFill(recQueue & BD_ADDR_MASK, 0, (int) bdLen(recQueue));
             resetFilters();
+            leQueue = reversedMac(macArg);
             lastAdd = System.nanoTime();
             open = true;
             return H.SUCCESS;
         }
+    }
+
+    /**
+     * Whether a MAC address argument is an address stored byte-reversed in a doubleword: two
+     * leading zero bytes and six address bytes loaded little-endian, which puts the zeros at the
+     * low end. An address in the low 48 bits, as Linux and big-endian drivers pass it, has its
+     * high 16 bits zero.
+     */
+    static boolean reversedMac(long arg) {
+        return (arg & 0xffff) == 0 && (arg >>> 48) != 0;
     }
 
     /** H_FREE_LOGICAL_LAN. */
@@ -600,7 +633,7 @@ public final class LLan extends VioDevice {
             if ((flags & MC_FILTER_MODIFY) != 0) {
                 mcastFilter = (flags & MC_FILTER_ENABLE) != 0;
             }
-            long a = address & MAC_MASK;
+            long a = (leQueue ? Long.reverseBytes(address) : address) & MAC_MASK;
             int at = -1;
             for (int i = 0; i < mcastCount; i++) {
                 if (mcastTable[i] == a) {
@@ -651,6 +684,7 @@ public final class LLan extends VioDevice {
         rxqPtr = 0;
         pools = newPools();
         mac = permMac;
+        leQueue = false;
         resetFilters();
         clearQueue();
     }
@@ -682,7 +716,9 @@ public final class LLan extends VioDevice {
         d.writeLong(bufList);
         d.writeLong(rxqPtr);
         d.writeInt(rxBufs);
-        d.writeLong(mac);
+        // The receive queue byte order rides in the address's unused top bit, so that the record
+        // keeps its layout: states without it (or from before it) read as big-endian.
+        d.writeLong(mac | (leQueue ? LE_QUEUE_BIT : 0));
         d.writeBoolean(mcastRecv);
         d.writeBoolean(mcastFilter);
         d.writeBoolean(mcastOverflow);
@@ -735,6 +771,7 @@ public final class LLan extends VioDevice {
         rxqPtr = ptr;
         rxBufs = bufs;
         mac = m & MAC_MASK;
+        leQueue = (m & LE_QUEUE_BIT) != 0;
         mcastRecv = recv;
         mcastFilter = filter;
         mcastOverflow = overflow;

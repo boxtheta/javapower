@@ -331,6 +331,77 @@ class LLanTest {
         assertEquals(q, r.mem.read64be(BUF_LIST));
     }
 
+    /** Register as FreeBSD's little-endian driver does: the address byte-reversed in the doubleword. */
+    static void openLe(Rig r, int entries) {
+        assertEquals(H.SUCCESS, r.hcall(H.REGISTER_LOGICAL_LAN, LAN0, BUF_LIST, bd(RXQ, 16L * entries), FILTER_LIST,
+                Long.reverseBytes(0x525400123456L)));
+    }
+
+    /** A receive queue entry with its offset and length read little-endian. */
+    static Entry entryLe(Rig r, int i) {
+        long a = RXQ + 16L * i;
+        return new Entry(r.mem.read8(a), Short.toUnsignedInt(Short.reverseBytes((short) r.mem.read16be(a + 2))),
+                Integer.reverseBytes(r.mem.read32be(a + 4)), r.mem.read64be(a + 8));
+    }
+
+    @Test
+    void theMacArgumentsByteOrderTellsALittleEndianFreeBsdDriver() {
+        assertFalse(LLan.reversedMac(0x525400123456L), "Linux, big-endian FreeBSD");
+        assertTrue(LLan.reversedMac(Long.reverseBytes(0x525400123456L)), "FreeBSD ppc64le");
+        assertTrue(LLan.reversedMac(Long.reverseBytes(0x020000000001L)));
+        assertFalse(LLan.reversedMac(0), "SLOF passes no address");
+        assertFalse(LLan.reversedMac(Long.reverseBytes(0x525400120000L)), "ends in :00:00: ambiguous, big-endian");
+    }
+
+    @Test
+    void aLittleEndianFreeBsdDriverGetsLittleEndianOffsetsAndLengths() {
+        Peer p = new Peer();
+        Rig r = bypass(p);
+        openLe(r, 2);
+        for (int i = 0; i < 4; i++) {
+            post(r, i, 2048);
+        }
+        byte[] f = frame(0x02, 1514, 0xab);
+        assertTrue(p.give(f));
+        Entry e = entryLe(r, 0);
+        assertEquals(new Entry(0xc0, 8, 1514, 0x1003), e, "control byte and handle as before");
+        assertArrayEquals(f, payload(r, e));
+        p.give(frame(0x02, 60, 1));
+        p.give(frame(0x02, 61, 2));
+        assertEquals(new Entry(0x40, 8, 61, 0x1001), entryLe(r, 0), "second pass of the queue");
+
+        // Its multicast addresses arrive byte-reversed as well.
+        byte[] group = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x01, 8, 0};
+        assertEquals(H.SUCCESS, r.hcall(H.MULTICAST_CTRL, LAN0, LLan.MC_FILTER_MODIFY | LLan.MC_FILTER_ENABLE
+                | LLan.MC_ADD, Long.reverseBytes(0x01005e000001L)));
+        post(r, 4, 2048);
+        assertTrue(p.give(group));
+        assertEquals(new Entry(0x40, 8, 8, 0x1004), entryLe(r, 1), "the filter matches the reversed address");
+
+        // Freed and registered as Linux does: big-endian again.
+        assertEquals(H.SUCCESS, r.hcall(H.FREE_LOGICAL_LAN, LAN0));
+        open(r, 2);
+        post(r, 5, 2048);
+        p.give(frame(0x02, 100, 3));
+        assertEquals(new Entry(0xc0, 8, 100, 0x1005), entry(r, 0));
+    }
+
+    @Test
+    void theLittleEndianQueueIsSaved() throws IOException {
+        Peer pa = new Peer();
+        Rig a = bypass(pa);
+        openLe(a, 4);
+        byte[] state = save(a);
+        Rig b = bypass(new Peer());
+        load(b, state);
+        assertArrayEquals(state, save(b));
+        assertEquals("52:54:00:12:34:56", mac(b.m.networks().get(0).macAddress()));
+        b.m.cpuExecEnter(b.cpu);
+        post(b, 0, 2048);
+        b.m.networks().get(0).receive(frame(0x02, 300, 1), 0, 300);
+        assertEquals(new Entry(0xc0, 8, 300, 0x1000), entryLe(b, 0));
+    }
+
     @Test
     void theInterruptFollowsVioSignal() {
         Peer p = new Peer();

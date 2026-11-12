@@ -194,6 +194,12 @@ given with `.mac("02:00:00:00:00:01")` (or six bytes), or else the first of 52:5
 52:54:00:12:34:57, ... that no other device of the machine uses, QEMU's default scheme. Set one
 when machines share a network.
 
+FreeBSD's ppc64le `llan` driver reads the offset and length of each receive queue entry in host
+order, where PAPR has them big-endian, so under QEMU it receives nothing. The device recognises
+that driver by the byte-reversed MAC address it passes to H_REGISTER_LOGICAL_LAN and writes those
+two fields little-endian for it. Linux on either byte order and big-endian FreeBSD are not
+affected. A ppc64le FreeBSD guest whose MAC address ends in `:00:00` is not recognised.
+
 The `NetBackend` is the other end of the cable. The device hands it each frame the guest sends,
 and the backend delivers frames to the guest through the `FrameSink` it is given at start:
 

@@ -4,6 +4,9 @@ name: Publish to GitHub Packages
 # GitHub Packages (https://maven.pkg.github.com/<owner>/<repository>). Runs when a GitHub release
 # is published, and by hand for a release tag that already exists. A version can be published
 # once: GitHub Packages refuses to replace it.
+#
+# The tests are not run here. A release is checked when it is made (scripts/release.sh), and the
+# multi-CPU tests depend on timing that a shared runner does not give reliably.
 on:
   release:
     types: [published]
@@ -46,8 +49,8 @@ jobs:
         with:
           ref: refs/tags/${{ steps.version.outputs.tag }}
 
-      # JDK 21 compiles and runs the tests; JDK 27 compiles the Java 22 classes of the
-      # multi-release jars and runs the tests a second time. The last one listed runs Gradle.
+      # JDK 21 compiles the modules; JDK 27 compiles the Java 22 classes of the multi-release
+      # jars. The last one listed runs Gradle.
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -78,7 +81,7 @@ jobs:
           }
           EOF
 
-      - name: Check and publish
+      - name: Build and publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -86,4 +89,4 @@ jobs:
           gradle --init-script "$RUNNER_TEMP/github-packages.init.gradle" \
             -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_27_X64 \
             -PreleaseVersion="$VERSION" \
-            check publishAllPublicationsToGitHubPackagesRepository
+            publishAllPublicationsToGitHubPackagesRepository

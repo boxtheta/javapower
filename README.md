@@ -285,10 +285,11 @@ as a deployment that is then released by hand in the portal. Run it from a termi
 checkout of the commit to release.
 
 Publishing the GitHub release for the tag (`v<version>`) starts the
-`Publish to GitHub Packages` workflow, which builds and checks that tag and publishes every module
-to GitHub Packages with the workflow's own token. The workflow can also be run by hand for a tag
-that already exists. Those artifacts are built by the workflow, so they are not the signed files
-on Maven Central, and GitHub Packages does not let a published version be replaced.
+`Publish to GitHub Packages` workflow, which builds that tag and publishes every module to GitHub
+Packages with the workflow's own token. It does not run the tests again: the release was checked
+by `scripts/release.sh`. The workflow can also be run by hand for a tag that already exists.
+Those artifacts are built by the workflow, so they are not the signed files on Maven Central, and
+GitHub Packages does not let a published version be replaced.
 
 ## Third-party code
 

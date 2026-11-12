@@ -253,8 +253,11 @@ class SmpConcurrencyTest {
                 records[me] = seq;
                 finished.incrementAndGet();
                 long end = System.nanoTime() + TIMEOUT_NS;
-                // Keep taking interrupts until every IPI anyone sent has been received.
-                while (finished.get() < n || ipis.received.get() < ipis.sent.get()) {
+                // Keep taking interrupts until every IPI anyone sent has been received. One may
+                // still be pending then: a receiver that empties its mailbox between a sender's
+                // count and its H_IPI has counted that IPI before it arrives. Every H_IPI has
+                // returned once all CPUs have finished, so extIrq shows it.
+                while (finished.get() < n || ipis.received.get() < ipis.sent.get() || c.extIrq) {
                     ipis.service(r, c);
                     if (me == 3 && got.length() < typed.length()) {
                         hc(r, c, H.GET_TERM_CHAR, VTY);

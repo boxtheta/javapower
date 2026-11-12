@@ -232,6 +232,10 @@ public final class Main {
             for (Map.Entry<String, Long> e : emu.log().unimplementedCounts().entrySet()) {
                 System.err.printf("[javapower] unimplemented %s x%d%n", e.getKey(), e.getValue());
             }
+            // Workarounds for known guest bugs that took effect (docs/guest-quirks.md).
+            for (String q : emu.appliedQuirks()) {
+                System.err.printf("[javapower] guest quirk %s%n", q);
+            }
         } finally {
             saved.countDown(); // also when the run or the save failed
         }

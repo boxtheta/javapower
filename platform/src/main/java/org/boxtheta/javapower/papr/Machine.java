@@ -8,6 +8,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.Hypervisor;
@@ -189,6 +193,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private byte[] fdtBlob;
     private int fdtInitialSize;
     private volatile long fdtAddr;
+    /** Guest quirks applied since the machine was built; see {@link #appliedQuirks}. */
+    private final Set<String> appliedQuirks = ConcurrentHashMap.newKeySet();
     private final Watchdog[] watchdogs = {new Watchdog(), new Watchdog(), new Watchdog(), new Watchdog()};
     private boolean closed;
 
@@ -465,6 +471,29 @@ public final class Machine implements Hypervisor, AutoCloseable {
     /** This machine's diagnostics: messages go to the configured sink, once-per-key counts stay here. */
     public PaprLog log() {
         return log;
+    }
+
+    /**
+     * The guest quirks this machine has applied, by id. A quirk is emulator behaviour that exists
+     * only to work around a known guest bug, and each id is documented in
+     * {@code docs/guest-quirks.md}. A quirk is listed from the moment the emulator recognises the
+     * guest and changes its behaviour for it. It stays listed after the guest stops needing it
+     * (a reset, a device the guest freed), so the set says what this machine's guests have
+     * needed since it was built. Loading a state adds the quirks in effect in that state. The
+     * set is sorted, a snapshot, and may be read from any thread.
+     */
+    public SortedSet<String> appliedQuirks() {
+        return Collections.unmodifiableSortedSet(new TreeSet<>(appliedQuirks));
+    }
+
+    /**
+     * Record that the quirk {@code id} (a {@link GuestQuirks} id) took effect. The first time,
+     * also log it at INFO level with {@code detail}. Any thread, with any locks held.
+     */
+    void applyQuirk(String id, String detail) {
+        if (appliedQuirks.add(id)) {
+            log.info("guest quirk " + id + ": " + detail);
+        }
     }
 
     public PhysicalMemory memory() {

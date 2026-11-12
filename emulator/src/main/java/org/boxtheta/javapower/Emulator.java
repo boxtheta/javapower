@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -204,6 +205,15 @@ public final class Emulator implements AutoCloseable {
     /** Every CPU's execution engine, by CPU number. */
     public List<Interpreter> interpreters() {
         return interpreters;
+    }
+
+    /**
+     * The guest quirks the machine has applied, by id ({@link Machine#appliedQuirks}): emulator
+     * behaviour that only works around a known guest bug, each id documented in
+     * {@code docs/guest-quirks.md}.
+     */
+    public SortedSet<String> appliedQuirks() {
+        return machine.appliedQuirks();
     }
 
     /** Instructions that raised a program interrupt because they are not implemented, with counts (all CPUs). */

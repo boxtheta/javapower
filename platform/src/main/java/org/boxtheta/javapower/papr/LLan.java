@@ -42,7 +42,8 @@ import java.util.Set;
  * zero, its high 16 bits not (Linux passes the address in the low 48 bits, and big-endian FreeBSD
  * produces the same value). A device registered with such an argument writes the two fields
  * little-endian, and takes H_MULTICAST_CTRL addresses byte-reversed too, until the driver frees
- * it. A little-endian FreeBSD guest whose address ends in {@code :00:00} is not recognised.
+ * it. A little-endian FreeBSD guest whose address ends in {@code :00:00} is not recognised. This
+ * is guest quirk {@value GuestQuirks#FREEBSD_LLAN_LE_RXQ} (docs/guest-quirks.md).
  *
  * <p>Threading: the receive state (registration, buffer pools, receive queue position, MAC,
  * filters, frames waiting for buffers) is guarded by the device lock. The backend's thread
@@ -493,6 +494,9 @@ public final class LLan extends VioDevice {
             dmaFill(recQueue & BD_ADDR_MASK, 0, (int) bdLen(recQueue));
             resetFilters();
             leQueue = reversedMac(macArg);
+            if (leQueue) {
+                applyLeQueueQuirk();
+            }
             lastAdd = System.nanoTime();
             open = true;
             return H.SUCCESS;
@@ -507,6 +511,12 @@ public final class LLan extends VioDevice {
      */
     static boolean reversedMac(long arg) {
         return (arg & 0xffff) == 0 && (arg >>> 48) != 0;
+    }
+
+    private void applyLeQueueQuirk() {
+        machine().applyQuirk(GuestQuirks.FREEBSD_LLAN_LE_RXQ,
+                nodeName() + ": byte-reversed MAC address at registration (FreeBSD ppc64le llan);"
+                        + " writing receive queue offsets and lengths little-endian");
     }
 
     /** H_FREE_LOGICAL_LAN. */
@@ -772,6 +782,9 @@ public final class LLan extends VioDevice {
         rxBufs = bufs;
         mac = m & MAC_MASK;
         leQueue = (m & LE_QUEUE_BIT) != 0;
+        if (leQueue) {
+            applyLeQueueQuirk();
+        }
         mcastRecv = recv;
         mcastFilter = filter;
         mcastOverflow = overflow;

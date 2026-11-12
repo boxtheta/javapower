@@ -11,6 +11,11 @@ needs differential tests whose expected values came from running the real instru
 QEMU is GPL and this project is Apache 2.0. Read QEMU to learn behaviour; do not copy or
 transliterate its code.
 
+Behaviour that exists only to work around a known guest bug is a quirk. List it in
+[docs/guest-quirks.md](docs/guest-quirks.md): how the guest is recognised, what changes, what is
+left out, and when the quirk can be removed. Do this in the same change that adds, alters or
+removes the quirk.
+
 ## Code conventions
 
 - Java 21 language level; `-Werror` is on. JUnit 5 for tests, which run on JDK 21 (`test`) and

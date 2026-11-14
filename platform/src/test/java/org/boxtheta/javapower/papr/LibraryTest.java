@@ -152,6 +152,48 @@ class LibraryTest {
     }
 
     @Test
+    void removableMediaBelongToWhoeverHoldsThem() throws Exception {
+        Tracking first = new Tracking();
+        Tracking second = new Tracking();
+        Tracking third = new Tracking();
+        MachineConfig cfg = new MachineConfig().ram(256L << 20).firmware(new byte[] {0x48, 0, 0, 0})
+                .logSink(e -> { });
+        MachineConfig.Disk fixed = cfg.addDisk(ScsiDisk.Type.DISK, new Tracking());
+        MachineConfig.Disk floppy = cfg.addRemovableDisk(first);
+        MachineConfig.Disk empty = cfg.addRemovableDisk();
+        MachineConfig.Disk cd = cfg.addDisk(ScsiDisk.Type.CDROM, null);
+        assertThrows(IllegalArgumentException.class, () -> cfg.addDisk(ScsiDisk.Type.DISK, null));
+        assertThrows(NullPointerException.class, () -> cfg.addRemovableDisk((BlockBackend) null));
+
+        Machine m = new Machine(cfg);
+        ScsiDisk drive = m.disk(floppy);
+        assertEquals(ScsiDisk.Type.REMOVABLE, drive.type());
+        assertEquals(512, drive.blockSize());
+        assertEquals(first, drive.backend());
+        assertEquals(ScsiDisk.Type.DISK, m.disk(fixed).type());
+        assertFalse(m.disk(empty).hasMedium());
+        assertEquals(ScsiDisk.Type.CDROM, m.disk(cd).type());
+        assertFalse(m.disk(cd).hasMedium());
+        // The drives are targets 0 to 3 in the order they were added.
+        assertEquals(java.util.List.of(m.disk(fixed), drive, m.disk(empty), m.disk(cd)), m.vscsi().targets());
+        assertEquals(1, drive.id());
+        assertThrows(IllegalArgumentException.class,
+                () -> m.disk(new MachineConfig().addRemovableDisk()), "another configuration's disk");
+
+        // A medium taken out is the caller's: the machine does not close it, then or later.
+        assertEquals(first, drive.changeMedium(second));
+        assertFalse(first.closed);
+        m.close();
+        assertFalse(first.closed);
+        assertTrue(second.closed, "the medium in the drive at close() was left open");
+        // A closed machine's drives are empty and take no medium.
+        assertFalse(drive.hasMedium());
+        assertEquals(null, drive.changeMedium(null));
+        assertThrows(IllegalStateException.class, () -> drive.changeMedium(third));
+        assertFalse(third.closed);
+    }
+
+    @Test
     void missingFirmwareNamesTheArtifact() {
         MachineConfig cfg = new MachineConfig().ram(256L << 20).logSink(e -> { });
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> new Machine(cfg));

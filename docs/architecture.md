@@ -52,6 +52,34 @@ first console. A machine has at most eight vtys, the number of `hvc` devices Lin
 needs a `CharBackend` of its own; a vty starts its backend in `startDevice` and closes it in
 `closeDevice` only if it was started, as the machine does for the first console.
 
+## SCSI devices and removable media
+
+The v-scsi adapter (`VScsi`) carries SRP over the CRQ and hands each command to a `ScsiTarget`;
+the targets are `ScsiDisk`s of three types: a fixed disk, an MMC CD-ROM, and a disk with a
+removable medium (QEMU's `scsi-hd`, `scsi-cd` and `scsi-hd,removable=on`). A command completes
+inside the H_SEND_CRQ that carries it, under the adapter's device lock.
+
+- The medium of a CD-ROM or removable disk drive is a `BlockBackend` the embedder changes with
+  `ScsiDisk.changeMedium` from any thread; the drive may be empty. Each `ScsiDisk` has a lock of
+  its own, taken after the adapter's device lock and held for a whole command, the backend calls
+  included, and by `changeMedium`. So a change waits for the command in progress and afterwards
+  no command touches the old backend: its owner may unmap it at once.
+- The guest learns of a change from sense data, as on hardware: NOT READY, MEDIUM NOT PRESENT
+  (3Ah) from an empty drive; one UNIT ATTENTION 28h/00h after a medium went in (QEMU reports a
+  unit attention with 3Ah first, we do not); for a CD-ROM also a NewMedia or MediaRemoval event
+  in GET EVENT STATUS NOTIFICATION. A target holds one unit attention: a pending reset one stays
+  and stands for the medium change too.
+- The guest's eject (START STOP UNIT) only cuts the guest off from the medium; the embedder,
+  told through `ScsiDisk.onGuestEject`, takes it out. The guest's removal lock (PREVENT ALLOW
+  MEDIUM REMOVAL) stops the guest's own eject, not `changeMedium`.
+- Saved state: the drive is hardware, the medium is not. The hardware description lists each
+  device's medium size (-1: none) and write protection as it always did; for drives with
+  removable media these are not compared, and a difference from the medium in the drive at the
+  load is reported to the guest as a medium change. The per-target state in the `"PAPR"` record
+  keeps the layout of the first release. State that has no place there goes into optional
+  tagged sections at the end of that record, written only when there is something in them:
+  `"MEDI"` holds media events a CD-ROM has still to report.
+
 ## Modules
 
 | Module | Package | Contents |

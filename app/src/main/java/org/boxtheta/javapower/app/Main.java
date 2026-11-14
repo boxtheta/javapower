@@ -28,6 +28,7 @@ import org.boxtheta.javapower.papr.Machine;
 import org.boxtheta.javapower.papr.MachineConfig;
 import org.boxtheta.javapower.papr.NetBackend;
 import org.boxtheta.javapower.papr.PaprLog;
+import org.boxtheta.javapower.papr.ScsiDisk;
 import org.boxtheta.javapower.papr.StdioCharBackend;
 import org.boxtheta.javapower.papr.VirtioPciDevice;
 import org.boxtheta.javapower.papr.VirtioRng;
@@ -41,7 +42,8 @@ public final class Main {
     private static final Instant DETERMINISTIC_TIME = Instant.parse("2026-01-01T00:00:00Z");
 
     private static final String USAGE = "usage: javapower [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]"
-            + " [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]"
+            + " [--disk4k img] [--cdrom iso|empty] [--removable img|empty]... [--media tcp:[host:]port]"
+            + " [--clock-scale f] [--deterministic] [--icount-shift n]"
             + " [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions] [--no-code-sharing]"
             + " [--persistent] [--load-state file] [--save-state file]"
             + " [--console tcp:[host:]port[,name=NAME]]..."
@@ -53,16 +55,22 @@ public final class Main {
                 .logSink(PaprLog.printTo(System.err));
         // Consoles after the first; closed at exit (the machine closes those it started).
         java.util.List<SocketConsole> sockets = new java.util.ArrayList<>();
+        // The media control port of --media, if any; closed at exit.
+        java.util.List<MediaControl> media = new java.util.ArrayList<>();
         try {
-            run(args, cfg, sockets);
+            run(args, cfg, sockets, media);
         } finally {
             for (SocketConsole c : sockets) {
+                c.close();
+            }
+            for (MediaControl c : media) {
                 c.close();
             }
         }
     }
 
-    private static void run(String[] args, MachineConfig cfg, java.util.List<SocketConsole> sockets) throws Exception {
+    private static void run(String[] args, MachineConfig cfg, java.util.List<SocketConsole> sockets,
+            java.util.List<MediaControl> media) throws Exception {
         Interpreter.Clock clock = Interpreter.Clock.WALL;
         long maxInsns = Long.MAX_VALUE;
         int icountShift = 0;
@@ -77,6 +85,8 @@ public final class Main {
         Path loadState = null;
         Path saveState = null;
         java.util.List<MachineConfig.Disk> disks = new java.util.ArrayList<>();
+        // The drives with removable media, CD-ROMs included, for --media and the guest's eject.
+        java.util.List<MachineConfig.Disk> drives = new java.util.ArrayList<>();
         int virtioRngs = 0;
         try {
             for (int i = 0; i < args.length; i++) {
@@ -89,7 +99,32 @@ public final class Main {
                     case "--persistent" -> persistent = true;
                     case "--load-state" -> loadState = Path.of(args[++i]);
                     case "--save-state" -> saveState = Path.of(args[++i]);
-                    case "--cdrom" -> cfg.addCdrom(Path.of(args[++i]));
+                    case "--cdrom" -> {
+                        String iso = args[++i];
+                        drives.add(iso.equals("empty") ? cfg.addDisk(ScsiDisk.Type.CDROM, null)
+                                : cfg.addCdrom(Path.of(iso)));
+                    }
+                    case "--removable" -> {
+                        String image = args[++i];
+                        if (image.equals("empty")) {
+                            drives.add(cfg.addRemovableDisk());
+                        } else {
+                            MachineConfig.Disk d = cfg.addRemovableDisk(Path.of(image));
+                            disks.add(d); // --persistent applies
+                            drives.add(d);
+                        }
+                    }
+                    case "--media" -> {
+                        String spec = args[++i];
+                        if (!spec.startsWith("tcp:") || !media.isEmpty()) {
+                            throw new IllegalArgumentException("--media takes tcp:[host:]port, once");
+                        }
+                        try {
+                            media.add(new MediaControl(spec.substring(4)));
+                        } catch (IOException | RuntimeException e) {
+                            throw new IllegalArgumentException("--media " + spec + ": cannot listen: " + e.getMessage(), e);
+                        }
+                    }
                     case "--clock-scale" -> clockScale = Double.parseDouble(args[++i]);
                     case "--deterministic" -> clock = Interpreter.Clock.DETERMINISTIC;
                     case "--icount-shift" -> icountShift = Integer.parseInt(args[++i]);
@@ -158,6 +193,20 @@ public final class Main {
         }
         CountDownLatch saved = new CountDownLatch(1);
         try (Emulator emu = emulator) {
+            // A medium the guest ejects leaves a removable disk drive (a CD stays in its open
+            // tray, as before); --media changes media from outside.
+            java.util.List<ScsiDisk> scsiDrives = new java.util.ArrayList<>();
+            for (MachineConfig.Disk d : drives) {
+                ScsiDisk drive = emu.machine().disk(d);
+                if (drive.type() == ScsiDisk.Type.REMOVABLE) {
+                    MediaControl.ejectForGuest(drive);
+                }
+                scsiDrives.add(drive);
+            }
+            for (MediaControl c : media) {
+                c.start(scsiDrives);
+                System.err.printf("[javapower] media control on %s%n", c.address());
+            }
             if (loadState != null) {
                 long t0 = System.nanoTime();
                 try (InputStream in = open(loadState)) {

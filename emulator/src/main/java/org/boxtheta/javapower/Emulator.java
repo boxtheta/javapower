@@ -72,7 +72,8 @@ import org.boxtheta.javapower.papr.PaprLog;
  * new one in another process; the next {@code run} continues the guest where it was saved. The
  * state covers every CPU, guest RAM, the hypervisor, the interrupt controller and the devices.
  * Host resources stay outside it and are the embedder's to keep: disk contents (reattach the
- * same images, with the guest's writes, as {@code BlockBackend}s), the console backend, the
+ * same images, with the guest's writes, as {@code BlockBackend}s), removable media (the drives
+ * may hold others, or none, when the state is loaded), the console backend, the
  * NVRAM file (it is rewritten from the state), {@link MachineConfig#random} and
  * {@link MachineConfig#clock}. Guest time does not advance while a machine is saved.
  */
@@ -272,8 +273,11 @@ public final class Emulator implements AutoCloseable {
      * {@link #run} continues the saved guest. The emulator must have been built from a
      * configuration with the same hardware: CPU count, RAM size, the PCI host bridge and
      * spapr-rng settings, NVRAM size, and the same SCSI devices (type, target id, LUN, block
-     * size, size in bytes, read-only). The disk contents should be the ones the guest had
-     * written when the state was saved; nothing checks that. Firmware, boot device, kernel
+     * size, and for fixed disks size in bytes and read-only). The disk contents should be the
+     * ones the guest had written when the state was saved; nothing checks that. The medium of a
+     * drive with removable media is not hardware: with another medium in the drive, or none, the
+     * state loads and the guest is told of a medium change (see
+     * {@link org.boxtheta.javapower.papr.Machine#loadState}). Firmware, boot device, kernel
      * command line, UUID and name need not match: what the guest saw of them is in its RAM and
      * the saved device tree. The clock ({@link Interpreter.Clock}) and time scale may differ
      * too: each CPU's timebase continues from its saved value either way.

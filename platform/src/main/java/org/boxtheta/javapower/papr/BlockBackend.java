@@ -7,6 +7,11 @@ import java.nio.file.Path;
  * Byte-addressed storage behind a SCSI target. All calls are synchronous for now and are made on
  * the CPU thread; the SCSI layer only talks to this interface and completes requests through a
  * callback, so an asynchronous implementation can later be dropped in behind the same boundary.
+ *
+ * <p>A backend is also the medium of a drive with removable media. The drive calls it only
+ * while it is in the drive, one call at a time, and never again once
+ * {@link ScsiDisk#changeMedium} has returned it; {@link #size} and {@link #readOnly} must stay
+ * the same while it is in a drive.
  */
 public interface BlockBackend extends AutoCloseable {
     /** Size in bytes. */

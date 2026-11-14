@@ -173,6 +173,179 @@ class MachineStateTest {
         assertFalse(b.cpu.extIrq);
     }
 
+    // ---- removable media -----------------------------------------------------------------------
+
+    /** A machine with a fixed disk, a removable disk drive and a CD-ROM drive, the last two as given. */
+    record Drives(Rig rig, ScsiDisk floppy, ScsiDisk cd) {
+        static Drives of(BlockBackend floppyMedium, BlockBackend cdMedium) {
+            MachineConfig c = new MachineConfig().ram(256L << 20);
+            c.addDisk(ScsiDisk.Type.DISK, new MemoryBackend(1 << 20));
+            MachineConfig.Disk f = floppyMedium == null ? c.addRemovableDisk() : c.addRemovableDisk(floppyMedium);
+            MachineConfig.Disk d = c.addDisk(ScsiDisk.Type.CDROM, cdMedium);
+            Rig r = new Rig(c);
+            Drives v = new Drives(r, r.m.disk(f), r.m.disk(d));
+            // The guest has seen the power-on unit attentions.
+            assertEquals(0x29, ScsiDiskTest.run(v.floppy, ScsiDiskTest.TUR).asc());
+            assertEquals(0x29, ScsiDiskTest.run(v.cd, ScsiDiskTest.TUR).asc());
+            return v;
+        }
+    }
+
+    static MemoryBackend floppy(int blocks) {
+        return ScsiDiskTest.medium(blocks, blocks, false);
+    }
+
+    static MemoryBackend iso(int blocks) {
+        return new MemoryBackend(new byte[2048 * blocks], true);
+    }
+
+    static final int[] GESN = {0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8, 0};
+
+    @Test
+    void theSameMediaLoadWithoutAWordToTheGuest() throws IOException {
+        Drives a = Drives.of(floppy(8), iso(100));
+        byte[] state = save(a.rig.m);
+        Drives b = Drives.of(floppy(8), iso(100));
+        load(b.rig.m, state);
+        assertArrayEquals(state, save(b.rig.m));
+        assertEquals(0, ScsiDiskTest.run(b.floppy, ScsiDiskTest.TUR).status());
+        assertEquals(0, ScsiDiskTest.run(b.cd, ScsiDiskTest.TUR).status());
+        assertEquals(0, ScsiDiskTest.run(b.cd, GESN).data()[4]);
+    }
+
+    @Test
+    void whatTheGuestHasNotSeenOfAMediumChangeIsSaved() throws IOException {
+        Drives a = Drives.of(null, iso(100));
+        assertEquals(0, ScsiDiskTest.run(a.floppy, 0x1e, 0, 0, 0, 1, 0).status()); // PREVENT
+        a.floppy.changeMedium(floppy(8));
+        a.cd.changeMedium(iso(200));
+        byte[] state = save(a.rig.m);
+
+        Drives b = Drives.of(floppy(8), iso(200));
+        load(b.rig.m, state);
+        assertArrayEquals(state, save(b.rig.m), "saved again, the state is unchanged");
+        assertTrue(b.floppy.removalPrevented());
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(b.floppy, ScsiDiskTest.TUR));
+        assertEquals(0, ScsiDiskTest.run(b.floppy, ScsiDiskTest.TUR).status());
+        // The CD-ROM's media event and unit attention, each once.
+        assertEquals(2, ScsiDiskTest.run(b.cd, GESN).data()[4]);
+        assertEquals(0, ScsiDiskTest.run(b.cd, GESN).data()[4]);
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(b.cd, ScsiDiskTest.TUR));
+        assertEquals(0, ScsiDiskTest.run(b.cd, ScsiDiskTest.TUR).status());
+
+        // A guest eject is state as well.
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(a.floppy, ScsiDiskTest.TUR));
+        assertEquals(0, ScsiDiskTest.run(a.floppy, 0x1e, 0, 0, 0, 0, 0).status()); // ALLOW
+        assertEquals(0, ScsiDiskTest.run(a.floppy, ScsiDiskTest.EJECT).status());
+        Drives c = Drives.of(floppy(8), iso(200));
+        load(c.rig.m, save(a.rig.m));
+        assertTrue(c.floppy.ejected());
+        ScsiDiskTest.assertNoMedium(ScsiDiskTest.run(c.floppy, ScsiDiskTest.TUR));
+    }
+
+    @Test
+    void aStateLoadsWithOtherMediaOrNone() throws IOException {
+        Drives a = Drives.of(floppy(8), iso(100));
+        byte[] state = save(a.rig.m);
+
+        // Other media: a change the guest is told of, with the new sizes from then on.
+        Drives b = Drives.of(floppy(16), iso(300));
+        load(b.rig.m, state);
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(b.floppy, ScsiDiskTest.READ_CAPACITY));
+        assertArrayEquals(new byte[] {0, 0, 0, 15, 0, 0, 2, 0},
+                ScsiDiskTest.run(b.floppy, ScsiDiskTest.READ_CAPACITY).data());
+        assertEquals(2, ScsiDiskTest.run(b.cd, GESN).data()[4]);
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(b.cd, ScsiDiskTest.TUR));
+
+        // The same size with other write protection is another medium too.
+        Drives w = Drives.of(ScsiDiskTest.medium(8, 8, true), iso(100));
+        load(w.rig.m, state);
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(w.floppy, ScsiDiskTest.TUR));
+        assertEquals(0, ScsiDiskTest.run(w.cd, ScsiDiskTest.TUR).status());
+
+        // Empty drives: the media are gone, which needs no unit attention.
+        Drives e = Drives.of(null, null);
+        load(e.rig.m, state);
+        ScsiDiskTest.assertNoMedium(ScsiDiskTest.run(e.floppy, ScsiDiskTest.TUR));
+        ScsiDiskTest.assertNoMedium(ScsiDiskTest.run(e.cd, ScsiDiskTest.TUR));
+        assertEquals(3, ScsiDiskTest.run(e.cd, GESN).data()[4]);
+
+        // Saved empty, loaded with media in the drives.
+        byte[] empty = save(Drives.of(null, null).rig.m);
+        Drives f = Drives.of(floppy(8), iso(100));
+        load(f.rig.m, empty);
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(f.floppy, ScsiDiskTest.TUR));
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(f.cd, ScsiDiskTest.TUR));
+        // And empty again: nothing changed.
+        Drives g = Drives.of(null, null);
+        load(g.rig.m, empty);
+        assertArrayEquals(empty, save(g.rig.m));
+        assertEquals(0, ScsiDiskTest.run(g.cd, GESN).data()[4]);
+
+        // A medium put in while the guest had the drive ejected ends the eject.
+        assertEquals(0, ScsiDiskTest.run(a.floppy, ScsiDiskTest.EJECT).status());
+        Drives h = Drives.of(floppy(32), iso(100));
+        load(h.rig.m, save(a.rig.m));
+        assertFalse(h.floppy.ejected());
+        ScsiDiskTest.assertMediumChanged(ScsiDiskTest.run(h.floppy, ScsiDiskTest.TUR));
+    }
+
+    @Test
+    void theDriveIsHardwareAndTheFixedDisksMediumToo() throws IOException {
+        Drives a = Drives.of(floppy(8), iso(100));
+        byte[] state = save(a.rig.m);
+
+        // A fixed disk where the removable drive was, of the medium's very size.
+        MachineConfig other = new MachineConfig().ram(256L << 20);
+        other.addDisk(ScsiDisk.Type.DISK, new MemoryBackend(2 << 20));
+        other.addDisk(ScsiDisk.Type.DISK, floppy(8));
+        other.addDisk(ScsiDisk.Type.CDROM, iso(100));
+        Rig b = new Rig(other);
+        byte[] before = save(b.m);
+        StateMismatchException e = assertThrows(StateMismatchException.class, () -> load(b.m, state));
+        String m = e.getMessage();
+        for (String want : new String[] {"SCSI device 0: bytes: saved 1048576, this machine 2097152",
+                "SCSI device 1: type: saved REMOVABLE, this machine DISK"}) {
+            assertTrue(m.contains(want), want + " in: " + m);
+        }
+        assertFalse(m.contains("SCSI device 2"), m);
+        assertArrayEquals(before, save(b.m));
+
+        // The drive's block size is the drive's.
+        MachineConfig big = new MachineConfig().ram(256L << 20);
+        big.addDisk(ScsiDisk.Type.DISK, new MemoryBackend(1 << 20));
+        big.addRemovableDisk().blockSize(4096);
+        big.addDisk(ScsiDisk.Type.CDROM, iso(100));
+        e = assertThrows(StateMismatchException.class, () -> load(new Rig(big).m, state));
+        assertTrue(e.getMessage().contains("SCSI device 1: block size: saved 512, this machine 4096"), e.getMessage());
+    }
+
+    @Test
+    void corruptMediaEventsAreRefused() throws IOException {
+        Drives a = Drives.of(floppy(8), iso(100));
+        a.cd.changeMedium(iso(200));
+        byte[] state = save(a.rig.m);
+        // The event byte of the CD-ROM is the last byte of the PAPR record's payload: an event
+        // code that does not exist, with the record's checksum made right again.
+        StateInput in = new StateInput(new ByteArrayInputStream(state));
+        in.record("PHW ");
+        int phw = 12 + 12 + recordLength(state, 12);
+        int len = recordLength(state, phw);
+        assertEquals(2, state[phw + 8 + len - 1]);
+        state[phw + 8 + len - 1] = 9;
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update(state, phw, 8 + len);
+        java.nio.ByteBuffer.wrap(state).putInt(phw + 8 + len, (int) crc.getValue());
+        Drives b = Drives.of(floppy(8), iso(200));
+        StateFormatException e = assertThrows(StateFormatException.class, () -> load(b.rig.m, state));
+        assertTrue(e.getMessage().contains("media events"), e.getMessage());
+    }
+
+    /** The payload length of the record that starts at {@code at}. */
+    static int recordLength(byte[] state, int at) {
+        return java.nio.ByteBuffer.wrap(state).getInt(at + 4);
+    }
+
     @Test
     void corruptPlatformRecordsAreRefused() throws IOException {
         Rig a = new Rig(cfg());

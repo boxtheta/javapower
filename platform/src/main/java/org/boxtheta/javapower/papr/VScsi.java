@@ -154,6 +154,8 @@ public final class VScsi extends VioDevice {
     /**
      * The state of every target. Commands complete inside H_SEND_CRQ, so between run slices no
      * request is in flight and there is no queue to save beyond the CRQ itself (guest memory).
+     * The layout is that of the first release, which later ones must still read; pending media
+     * events travel separately ({@link #saveMediaEvents}).
      */
     @Override
     protected void saveDevice(java.io.DataOutput out) throws java.io.IOException {
@@ -176,6 +178,41 @@ public final class VScsi extends VioDevice {
                 d.loadState(in);
             }
         }
+    }
+
+    /**
+     * Whether a target has a media event the guest has not read yet (GET EVENT STATUS
+     * NOTIFICATION, after a medium change): state that {@link #saveDevice} has no place for.
+     */
+    boolean mediaEventsPending() {
+        for (ScsiTarget t : targets) {
+            if (t instanceof ScsiDisk d && d.mediaEvent() != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The pending media event of every target, in target order; 0 for none. */
+    void saveMediaEvents(java.io.DataOutput out) throws java.io.IOException {
+        out.writeInt(targets.size());
+        for (ScsiTarget t : targets) {
+            out.writeByte(t instanceof ScsiDisk d ? d.mediaEvent() : 0);
+        }
+    }
+
+    /** Read what {@link #saveMediaEvents} wrote; false if it does not fit the targets. */
+    boolean loadMediaEvents(java.io.DataInput in) throws java.io.IOException {
+        if (in.readInt() != targets.size()) {
+            return false;
+        }
+        for (ScsiTarget t : targets) {
+            int event = in.readUnsignedByte();
+            if (t instanceof ScsiDisk d ? !d.setMediaEvent(event) : event != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ---- CRQ entry point ---------------------------------------------------------------------

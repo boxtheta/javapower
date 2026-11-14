@@ -18,7 +18,8 @@ import org.boxtheta.javapower.core.MmioHandler;
  * with fluent setters; read once when the machine is constructed.
  *
  * <p>What an embedder usually sets: {@link #ram}, {@link #cpus}, the {@link #console} backend
- * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk})
+ * (default: an in-memory {@link BufferCharBackend}), disks ({@link #addCdrom}, {@link #addDisk},
+ * and {@link #addRemovableDisk} for drives whose medium changes while the machine runs)
  * and the {@link #logSink} for diagnostics (default: the {@link System.Logger}
  * {@value PaprLog#LOGGER_NAME}).
  *
@@ -118,7 +119,10 @@ public final class MachineConfig {
         }
     }
 
-    /** One SCSI device on the v-scsi bus. */
+    /**
+     * One SCSI device on the v-scsi bus. A built machine's device is {@link Machine#disk}, which
+     * is where the medium of a drive with removable media is changed.
+     */
     public static final class Disk {
         final ScsiDisk.Type type;
         final Path file;
@@ -140,7 +144,10 @@ public final class MachineConfig {
             this.readOnly = type == ScsiDisk.Type.CDROM;
         }
 
-        /** Logical (and, unless set separately, physical) block size: 512, 2048 or 4096. */
+        /**
+         * Logical (and, unless set separately, physical) block size: 512, 2048 or 4096. It
+         * belongs to the device: every medium of a drive with removable media has this block size.
+         */
         public Disk blockSize(int bs) {
             this.blockSize = bs;
             return this;
@@ -506,12 +513,77 @@ public final class MachineConfig {
         return d;
     }
 
-    /** Add a device on an already open backend (tests). The backend is used as is. */
+    /**
+     * Add a device on an already open backend, which is used as is. For a type with removable
+     * media ({@link ScsiDisk.Type#CDROM}, {@link ScsiDisk.Type#REMOVABLE}) {@code backend} may be
+     * null: the drive is empty until {@link ScsiDisk#changeMedium} puts a medium in.
+     *
+     * @throws IllegalArgumentException if {@code backend} is null and {@code type} is a fixed disk
+     */
     public Disk addDisk(ScsiDisk.Type type, BlockBackend backend) {
+        Objects.requireNonNull(type, "type");
+        if (backend == null && !type.removable()) {
+            throw new IllegalArgumentException("a fixed disk needs a backend; only CDROM and REMOVABLE drives may"
+                    + " be empty");
+        }
         Disk d = new Disk(type, null, backend);
         d.persistent = true;
         disks.add(d);
         return d;
+    }
+
+    /**
+     * Add an empty disk drive with removable media ({@link ScsiDisk.Type#REMOVABLE}; QEMU's
+     * {@code scsi-hd,removable=on}): a floppy or flash drive like device on the v-scsi bus, next
+     * to the fixed disks, that Linux's {@code sd} and FreeBSD's {@code da} drive as a removable
+     * disk. Media are {@link BlockBackend}s put in and taken out while the machine runs:
+     * <pre>{@code
+     * MachineConfig.Disk floppy = cfg.addRemovableDisk();
+     * Machine m = ...;                                       // or emulator.machine()
+     * ScsiDisk drive = m.disk(floppy);
+     * drive.changeMedium(medium);                            // any thread; the guest is told
+     * BlockBackend out = drive.changeMedium(null);           // empty the drive; out is yours again
+     * }</pre>
+     * See {@link ScsiDisk} for what the guest sees, the threads, and how the guest's own eject
+     * and removal lock are handled. Media may differ in size and write protection
+     * ({@link BlockBackend#readOnly}); all are read in blocks of the drive's
+     * {@link Disk#blockSize block size}, 512 bytes by default.
+     *
+     * <p>SLOF treats the drive as a disk. Its default boot order tries the disks, fixed and
+     * removable alike, in the order they were added, before CD-ROMs and the network: it boots
+     * from the first one with a bootable medium and passes over an empty drive. So a drive added
+     * before the fixed disk boots its medium first when it holds a bootable one, as a floppy
+     * drive does on a PC; add the drive after the fixed disks if it should not.
+     *
+     * <p>In a saved state the drive is hardware and its medium is not: a state loads into a
+     * machine whose drive holds another medium, or none (see {@link Machine#loadState}).
+     */
+    public Disk addRemovableDisk() {
+        return addDisk(ScsiDisk.Type.REMOVABLE, null);
+    }
+
+    /**
+     * Add a disk drive with removable media that starts with the image file {@code image} in it;
+     * see {@link #addRemovableDisk()}. The machine opens the image as it does a fixed disk's: as
+     * a copy-on-write snapshot unless {@link Disk#persistent persistent}, write-protected if
+     * {@link Disk#readOnly readOnly}. Media put in later are opened by the embedder, e.g. with
+     * {@link BlockBackend#open}.
+     */
+    public Disk addRemovableDisk(Path image) {
+        Disk d = new Disk(ScsiDisk.Type.REMOVABLE, Objects.requireNonNull(image, "image"), null);
+        disks.add(d);
+        return d;
+    }
+
+    /**
+     * Add a disk drive with removable media that starts with {@code medium} in it; see
+     * {@link #addRemovableDisk()}.
+     *
+     * @param medium the first medium; the machine closes whichever medium is in the drive when
+     *     the machine itself is closed
+     */
+    public Disk addRemovableDisk(BlockBackend medium) {
+        return addDisk(ScsiDisk.Type.REMOVABLE, Objects.requireNonNull(medium, "medium"));
     }
 
     /**

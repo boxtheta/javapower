@@ -29,6 +29,12 @@ Scenarios:
                  jp.two); find their devices by name (QEMU: by node), write to and read from each,
                  run a shell on one and a getty on the other; with --save (ours), save with unread
                  input on one, resume in a new process, read it and use both consoles again
+  media          --guest le, be or suse (ours): an empty removable disk drive and an empty CD-ROM
+                 drive on the v-scsi bus; through the CLI's --media port, load a medium, write to
+                 it, swap it for a larger one, load one write-protected, empty the drive, and let
+                 the guest eject; the guest must see each change (size, contents, write
+                 protection, no medium) and its writes must be in the image files. Then the same
+                 swaps with discs in the CD-ROM drive
   regress        prompt-le, prompt-be + a short kyua subset, suse; non-zero exit on failure
   compare        compare kyua results: --baseline (QEMU) against --out (ours), per directory
 
@@ -226,6 +232,8 @@ def scenario(a):
         net(a)
     elif a.scenario == "consoles":
         consoles(a)
+    elif a.scenario == "media":
+        media(a)
     elif a.scenario == "regress":
         return regress(a)
     elif a.scenario == "compare":
@@ -866,6 +874,236 @@ def consoles(a):
         interactive(a, c, port, dev, names, linux)
 
 
+def media_ctl(port, cmd):
+    """Send one command to the CLI's --media port; return its answer lines (the last starts with ok)."""
+    lines = []
+    with socket.create_connection(("127.0.0.1", port), timeout=30) as s:
+        s.sendall((cmd + "\n").encode())
+        for line in s.makefile("r"):
+            lines.append(line.rstrip("\n"))
+            if line.startswith(("ok", "error")):
+                break
+    if not lines or not lines[-1].startswith("ok"):
+        raise Exited("media control: %s -> %s" % (cmd, lines))
+    return lines
+
+
+def file_sha(path, nbytes=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        left = os.path.getsize(path) if nbytes is None else nbytes
+        while left > 0:
+            b = f.read(min(1 << 20, left))
+            if not b:
+                break
+            h.update(b)
+            left -= len(b)
+    return h.hexdigest()
+
+
+class Drive:
+    """A drive with removable media as a guest sees it: its device, and commands for its size in
+    512-byte sectors without opening it (`seen`: what the driver's polling found), with opening
+    it (`size`), the checksum of its first n bytes, and ejecting the medium. `seen_gone` says
+    whether `seen` also shows that a medium is gone."""
+
+    def __init__(self, guest, scsi_id, cd):
+        self.id = scsi_id
+        self.cd = cd
+        if guest == "suse":
+            # The boot disk is sda; the removable disk is sdb and the CD-ROM sr0.
+            name = "sr0" if cd else "sdb"
+            self.dev = "/dev/" + name
+            self.sys = "/sys/block/" + name
+            self.seen = "cat %s/size" % self.sys
+            self.seen_gone = True
+            self.size = "blockdev --getsz %s 2>/dev/null || echo 0" % self.dev
+            self.sha = "head -c %%d %s | sha256sum | cut -c1-64" % self.dev
+            self.eject = "eject %s" % self.dev
+        else:
+            # The install disc is cd0; the removable disk is da0 and the second CD-ROM cd1.
+            name = "cd1" if cd else "da0"
+            self.dev = "/dev/" + name
+            self.sys = None
+            # GEOM's view, which the driver updates from its periodic TEST UNIT READY when a
+            # medium arrives; it keeps the size of a medium that is gone.
+            self.seen = ("geom disk list %s 2>/dev/null | awk '/Mediasize:/ { print $2 / 512; f = 1; exit } "
+                         "END { if (!f) print 0 }'" % name)
+            self.seen_gone = False
+            # cd(4) can be opened without a medium and then has its last one's size: read a block.
+            self.size = ("dd if=%s of=/dev/null bs=2048 count=1 2>/dev/null && diskinfo %s 2>/dev/null "
+                         "| awk '{ print $3 / 512; f = 1 } END { if (!f) print 0 }' || echo 0" % (self.dev, name))
+            self.sha = "dd if=%s bs=64k 2>/dev/null | head -c %%d | sha256 -q" % self.dev
+            self.eject = "camcontrol eject %s" % name
+
+
+def media_wait(a, c, d, sectors, what, polled=45, timeout=120):
+    """Wait until the guest sees a medium of `sectors` 512-byte sectors in `d` (0: none): first
+    for its driver's polling to find it, then, if it has not, by opening the device."""
+    if sectors == 0 and not d.seen_gone:
+        polled = 0
+    t0 = time.time()
+    while True:
+        waited = time.time() - t0
+        how = "the driver's polling" if waited < polled else "opening the device"
+        st, o = c.sh(d.seen if waited < polled else d.size, timeout=120)
+        try:
+            if int(float(o.strip().splitlines()[-1])) == sectors:
+                break
+        except (ValueError, IndexError):
+            pass
+        if waited > timeout:
+            raise Exited("%s: the guest does not see %d sectors in %s; last answer %r" % (what, sectors, d.dev, o))
+        time.sleep(1)
+    # The device node agrees.
+    st, o = c.sh(d.size, timeout=120)
+    if int(float(o.strip().splitlines()[-1])) != sectors:
+        raise Exited("%s: %s has %s sectors when opened, not %d" % (what, d.dev, o.strip(), sectors))
+    say(a, "%s: the guest sees %s in %s after %.0fs (%s)" % (
+        what, "%d sectors" % sectors if sectors else "no medium", d.dev, time.time() - t0, how))
+
+
+def media_sha(a, c, d, nbytes, want, what):
+    st, o = c.sh(d.sha % nbytes, timeout=1200)
+    got = o.strip().splitlines()[-1] if o.strip() else ""
+    if got != want:
+        raise Exited("%s: the guest reads %s from %s, the image has %s" % (what, got, d.dev, want))
+    say(a, "%s: the guest reads the image's %d bytes (sha256 %s...)" % (what, nbytes, want[:16]))
+
+
+def media_status(port, d):
+    for line in media_ctl(port, "status"):
+        if line.split()[:1] == [str(d.id)]:
+            return line
+    raise Exited("media control: no status for drive %d" % d.id)
+
+
+def media(a):
+    """Change the media of a removable disk drive and a CD-ROM drive under a running guest."""
+    if a.vm != "ours":
+        raise SystemExit("media: --vm ours only")
+    linux = a.guest == "suse"
+    os.makedirs(a.logdir, exist_ok=True)
+    port = free_port()
+    img = {}
+    for name, kib in (("a", 1440), ("b", 2880)):
+        img[name] = os.path.join(a.logdir, "media-%s-%s.img" % (a.guest, name))
+        with open(img[name], "wb") as f:
+            f.write(os.urandom(kib << 10))
+    size = {k: os.path.getsize(v) for k, v in img.items()}
+    if linux:
+        disk = os.path.join(a.logdir, "media-suse.raw")
+        subprocess.check_call(["cp", "--sparse=always", SUSE, disk])
+        boot, cdroms = dict(disk4k=disk), []
+    else:
+        boot, cdroms = {}, [ISO_BE if a.guest == "be" else ISO_LE]
+    b = argparse.Namespace(**vars(a))
+    # SCSI ids follow the order of the options: the boot device is 0.
+    b.extra = list(a.extra) + ["--removable", "empty", "--cdrom", "empty", "--media", "tcp:127.0.0.1:%d" % port]
+    b.name = "media-%s" % a.guest
+    fd = Drive(a.guest, 1, False)
+    cd = Drive(a.guest, 2, True)
+    errlog = os.path.join(a.logdir, "%s-%s.stderr.log" % (b.name, a.vm))
+    with start(b, "media", cdroms, **boot) as c:
+        guest_shell(a, c)
+        if linux:
+            st, o = c.sh("cat %s/removable %s/events_poll_msecs /sys/module/block/parameters/events_dfl_poll_msecs"
+                         % (fd.sys, fd.sys))
+            removable, poll, dfl = o.split()
+            say(a, "%s: removable=%s events_poll_msecs=%s (module default %s)" % (fd.dev, removable, poll, dfl))
+        else:
+            st, o = c.sh("camcontrol devlist; camcontrol inquiry da0 | head -3; sysctl kern.cam.da.poll_period")
+            removable = "1" if re.search(r"Removable Direct Access", o) else "0"
+            say(a, "devices: %s" % " | ".join(l.strip() for l in o.strip().splitlines()))
+        if removable != "1":
+            raise Exited("%s is not a removable disk to the guest" % fd.dev)
+
+        # An empty drive.
+        media_wait(a, c, fd, 0, "empty drive", polled=0)
+        st, o = c.sh("dd if=%s of=/dev/null bs=512 count=1" % fd.dev)
+        if st == 0:
+            raise Exited("reading the empty drive succeeded: %s" % o)
+        say(a, "empty drive: a read fails: %s" % o.strip().splitlines()[-1])
+
+        # A medium goes in; the guest writes to it.
+        media_ctl(port, "load %d %s" % (fd.id, img["a"]))
+        media_wait(a, c, fd, size["a"] // 512, "medium A loaded")
+        media_sha(a, c, fd, size["a"], file_sha(img["a"]), "medium A")
+        st, o = c.sh("dd if=/dev/urandom of=%s bs=512 seek=100 count=128 %s 2>&1 && sync"
+                     % (fd.dev, "conv=fsync" if linux else ""))
+        if st:
+            raise Exited("writing to medium A failed: %s" % o)
+        st, o = c.sh(fd.sha % size["a"], timeout=1200)
+        written = o.strip().splitlines()[-1]
+        if not re.fullmatch(r"[0-9a-f]{64}", written):
+            raise Exited("no checksum from the guest: %r" % o)
+
+        # Swapped for a larger one without emptying the drive first.
+        media_ctl(port, "load %d %s" % (fd.id, img["b"]))
+        if file_sha(img["a"]) != written:
+            raise Exited("the guest's writes are not in image A after it left the drive")
+        say(a, "medium A taken out: its image has the guest's writes")
+        media_wait(a, c, fd, size["b"] // 512, "medium B swapped in")
+        media_sha(a, c, fd, size["b"], file_sha(img["b"]), "medium B")
+
+        # A write-protected medium.
+        media_ctl(port, "load %d %s ro" % (fd.id, img["a"]))
+        media_wait(a, c, fd, size["a"] // 512, "medium A loaded write-protected")
+        media_sha(a, c, fd, size["a"], written, "medium A again")
+        st, o = c.sh("dd if=/dev/zero of=%s bs=512 count=1 %s 2>&1" % (fd.dev, "conv=fsync" if linux else ""))
+        if st == 0:
+            raise Exited("a write to the write-protected medium succeeded: %s" % o)
+        say(a, "write-protected: a write fails: %s" % o.strip().splitlines()[-1])
+        if file_sha(img["a"]) != written:
+            raise Exited("the write-protected image changed")
+
+        # While the guest has the device open it prevents removal; the embedder can see that.
+        c.sh("sleep 8 <%s &" % fd.dev)
+        time.sleep(3)
+        locked = media_status(port, fd)
+        time.sleep(8)
+        c.sh("wait")
+        unlocked = media_status(port, fd)
+        say(a, "status with the device open: %r, closed: %r" % (locked, unlocked))
+        if "locked" not in locked or "locked" in unlocked:
+            raise Exited("the guest's removal lock did not follow its open and close")
+
+        # Emptied.
+        media_ctl(port, "eject %d" % fd.id)
+        media_wait(a, c, fd, 0, "drive emptied")
+
+        # The guest ejects: the CLI takes the medium out.
+        media_ctl(port, "load %d %s" % (fd.id, img["b"]))
+        media_wait(a, c, fd, size["b"] // 512, "medium B loaded")
+        st, o = c.sh(fd.eject + " 2>&1", timeout=120)
+        if st:
+            raise Exited("%s failed: %s" % (fd.eject, o))
+        time.sleep(1)
+        status = media_status(port, fd)
+        ejected = "guest ejected the medium of SCSI device %d" % fd.id in open(errlog, errors="replace").read()
+        say(a, "after the guest's %r: status %r, eject reported: %s" % (fd.eject, status, ejected))
+        if "empty" not in status or not ejected:
+            raise Exited("the guest's eject did not reach the drive")
+        media_wait(a, c, fd, 0, "ejected by the guest")
+
+        # The CD-ROM drive: two discs of different sizes, one after the other.
+        discs = [ISO_LE, ISO_BE]
+        media_wait(a, c, cd, 0, "empty CD-ROM drive", polled=0)
+        for k, iso in enumerate(discs):
+            nbytes = os.path.getsize(iso)
+            media_ctl(port, "load %d %s ro" % (cd.id, iso))
+            media_wait(a, c, cd, nbytes // 512, "disc %d loaded" % (k + 1))
+            media_sha(a, c, cd, 8 << 20, file_sha(iso, 8 << 20), "disc %d" % (k + 1))
+            mnt = "mount -o ro %s /mnt" if linux else "mount -t cd9660 %s /mnt"
+            st, o = c.sh((mnt + " && ls /mnt | head -5 && umount /mnt") % cd.dev, timeout=300)
+            if st:
+                raise Exited("mounting disc %d failed: %s" % (k + 1, o))
+            say(a, "disc %d mounts: %s" % (k + 1, " ".join(o.split())))
+        media_ctl(port, "eject %d" % cd.id)
+        media_wait(a, c, cd, 0, "CD-ROM drive emptied")
+        say(a, "media: all changes seen by the guest")
+
+
 def regress(a):
     failed = []
     for name in ["prompt-le", "prompt-be", "kyua", "suse"]:
@@ -956,7 +1194,7 @@ def main():
     p.add_argument("--out", help="results file")
     p.add_argument("--name", help="log file prefix (default: the scenario)")
     p.add_argument("--baseline", help="regress: kyua results from QEMU to compare against")
-    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="shell, resume, net, consoles: which guest")
+    p.add_argument("--guest", choices=["le", "be", "suse"], default="be", help="shell, resume, net, consoles, media: which guest")
     p.add_argument("--nics", type=int, default=1, choices=[1, 2], help="net: network devices")
     p.add_argument("--net-mib", type=int, default=4, help="net: MiB to download and upload")
     p.add_argument("--net-burst", type=int, default=500, help="net: pings in the burst")

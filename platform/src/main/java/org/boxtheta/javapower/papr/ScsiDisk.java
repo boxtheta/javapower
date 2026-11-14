@@ -4,18 +4,75 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 /**
- * SCSI direct-access disk ({@code scsi-hd}) or MMC CD/DVD-ROM ({@code scsi-cd}) on top of a
- * {@link BlockBackend}, modelled on QEMU's hw/scsi/scsi-disk.c plus the target-level behaviour of
- * scsi-bus.c (unit attention after reset, sense persistence for REQUEST SENSE, wrong-LUN
- * handling).
+ * SCSI direct-access disk ({@code scsi-hd}), MMC CD/DVD-ROM ({@code scsi-cd}) or direct-access
+ * disk with a removable medium ({@code scsi-hd,removable=on}) on top of a {@link BlockBackend},
+ * modelled on QEMU's hw/scsi/scsi-disk.c plus the target-level behaviour of scsi-bus.c (unit
+ * attention after reset, sense persistence for REQUEST SENSE, wrong-LUN handling).
  *
  * <p>Emulated (non-READ/WRITE) commands transfer exactly the allocation length the CDB asks for,
  * zero padded, as QEMU does. Logical block provisioning is advertised as QEMU does for a raw image
  * (discard granularity 4 KiB): UNMAP is accepted and leaves the data in place, which LBPRZ = 0
  * allows; WRITE SAME writes its block repeatedly.
+ *
+ * <h2>Removable media</h2>
+ * A {@link Type#CDROM} or {@link Type#REMOVABLE} drive reports a removable medium (the RMB bit of
+ * INQUIRY), and the embedder changes that medium while the machine runs with
+ * {@link #changeMedium}; the drive may be empty, also when it is created. A built machine's
+ * drives are found with {@link Machine#disk}.
+ * <ul>
+ * <li>Empty drive: TEST UNIT READY, READ CAPACITY, reads, writes and the other commands that need
+ *     a medium fail with NOT READY, MEDIUM NOT PRESENT (sense key 2h, 3Ah/00h). INQUIRY, MODE
+ *     SENSE, REPORT LUNS, START STOP UNIT and PREVENT ALLOW MEDIUM REMOVAL work as ever.</li>
+ * <li>After a medium is loaded, the next command that reports unit attentions fails once with
+ *     UNIT ATTENTION, NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED (6h, 28h/00h). From then
+ *     on READ CAPACITY and MODE SENSE give the new medium's size and write protection. Linux's
+ *     {@code sd} and {@code sr} find this with their media change polling, FreeBSD's {@code da}
+ *     and {@code cd} with their periodic TEST UNIT READY. QEMU reports an extra unit attention
+ *     with 3Ah/00h first; we do not, since the medium is there. A reset unit attention that is
+ *     still pending is reported instead of the medium change, never in addition: after it the
+ *     initiator has to look at the medium again anyway.</li>
+ * <li>A CD-ROM also reports the change to GET EVENT STATUS NOTIFICATION, once: NewMedia after a
+ *     load, MediaRemoval after the drive was emptied.</li>
+ * <li>The block size belongs to the drive and stays what it was created with; a medium is so
+ *     many whole blocks, and bytes after the last whole block are out of the guest's reach.</li>
+ * <li>The guest can eject (START STOP UNIT with LoEj and without Start): the medium, if any,
+ *     stays in the drive but the guest reaches it no more (3Ah/00h) until it loads it again
+ *     (LoEj with Start) or the embedder changes it. {@link #onGuestEject} tells the embedder,
+ *     which may then take the medium out. While the guest prevents removal (PREVENT ALLOW MEDIUM
+ *     REMOVAL) its own eject fails with ILLEGAL REQUEST, MEDIUM REMOVAL PREVENTED (5h, 53h/02h),
+ *     as in QEMU. {@link #changeMedium} works all the same, like the emergency eject of a real
+ *     drive: an embedder that wants to honour the guest's wish asks {@link #removalPrevented}
+ *     first.</li>
+ * </ul>
+ *
+ * <h2>Threading</h2>
+ * A drive has a lock of its own. {@link #submit} holds it for the whole command, the data
+ * transfer and the backend calls included; {@link #changeMedium}, {@link #reset} and the queries
+ * take it too, and may be called from any thread, also while guest CPUs run. So a medium change
+ * waits for a command in progress on this drive, and when it returns no command uses the old
+ * backend and none ever will again: the caller may close it or unmap its memory at once. The
+ * lock comes after the HBA's device lock in the machine's lock order and is held while the
+ * backend is called, so a backend must not wait for a thread that is changing this drive's medium.
  */
 public final class ScsiDisk implements ScsiTarget {
-    public enum Type { DISK, CDROM }
+    /** The kind of device a guest sees. */
+    public enum Type {
+        /** A fixed disk (QEMU's {@code scsi-hd}): direct access, the medium never changes. */
+        DISK,
+        /** An MMC CD/DVD-ROM drive (QEMU's {@code scsi-cd}): read-only, removable medium. */
+        CDROM,
+        /**
+         * A disk drive with a removable, writable medium (QEMU's {@code scsi-hd,removable=on}):
+         * direct access like {@link #DISK} with the RMB bit set in INQUIRY, for floppy and flash
+         * drive like devices.
+         */
+        REMOVABLE;
+
+        /** Whether the medium of such a device can be changed ({@link ScsiDisk#changeMedium}). */
+        public boolean removable() {
+            return this != DISK;
+        }
+    }
 
     public static final int TYPE_DISK = 0x00;
     public static final int TYPE_ROM = 0x05;
@@ -77,8 +134,16 @@ public final class ScsiDisk implements ScsiTarget {
     /** CDs above this many 512-byte sectors are reported as DVDs (80 min CD). */
     private static final long CD_MAX_SECTORS = 80L * 60 * 75 * 2048 / 512;
 
+    /** GET EVENT STATUS NOTIFICATION media event codes (MMC). */
+    private static final int MEDIA_EVENT_NONE = 0;
+    private static final int MEDIA_EVENT_NEW_MEDIA = 2;
+    private static final int MEDIA_EVENT_REMOVAL = 3;
+
     private final Type type;
-    private final BlockBackend backend;
+    /** The drive's lock (see the class comment); guards everything below that is not final. */
+    private final Object lock = new Object();
+    /** The medium in the drive; null when a drive with removable media is empty. */
+    private BlockBackend backend;
     private final int blockSize;
     private final int physBlockExp;
     private final int channel;
@@ -93,14 +158,30 @@ public final class ScsiDisk implements ScsiTarget {
     private byte[] unitAttention;
     private byte[] lastSense;
     private boolean senseIsUa;
+    /** The guest ejected the medium (START STOP UNIT) and has not loaded it again. */
     private boolean trayOpen;
+    /** The guest prevents medium removal (PREVENT ALLOW MEDIUM REMOVAL). */
     private boolean trayLocked;
+    /**
+     * The media event GET EVENT STATUS NOTIFICATION has still to report, or none. Only a CD-ROM
+     * has that command, so only a CD-ROM ever has an event.
+     */
+    private int mediaEvent;
+    /** The machine was closed: the drive takes no medium any more. */
+    private boolean closed;
+    /** A guest eject happened in the command being processed; the listener is told after it. */
+    private boolean ejectNotify;
+    private volatile Runnable ejectListener;
     private volatile PaprLog log = new PaprLog();
 
     /**
+     * @param backend   the medium; null for an empty drive, which only a type with removable
+     *                  media may be
      * @param blockSize logical block size (512 or 4096 for disks; CDs normally 2048)
      * @param deviceId  identifier reported in VPD page 0x83 (QEMU uses the drive id, e.g. "d0")
      * @param serial    unit serial number for VPD page 0x80, or null (QEMU default: none)
+     * @throws IllegalArgumentException if the block size is not a power of two from 512, or a
+     *     fixed disk has no backend
      */
     public ScsiDisk(Type type, BlockBackend backend, int blockSize, int physicalBlockSize, String deviceId,
                     String serial) {
@@ -115,6 +196,10 @@ public final class ScsiDisk implements ScsiTarget {
         if (physicalBlockSize < blockSize) {
             physicalBlockSize = blockSize;
         }
+        if (backend == null && !type.removable()) {
+            throw new IllegalArgumentException("a fixed disk needs a backend; only drives with removable media"
+                    + " may be empty");
+        }
         this.type = type;
         this.backend = backend;
         this.blockSize = blockSize;
@@ -125,7 +210,7 @@ public final class ScsiDisk implements ScsiTarget {
         this.id = id;
         this.lun = lun;
         this.vendor = "QEMU";
-        this.product = type == Type.DISK ? "QEMU HARDDISK" : "QEMU CD-ROM";
+        this.product = type == Type.CDROM ? "QEMU CD-ROM" : "QEMU HARDDISK";
         this.version = "2.5+";
         reset();
     }
@@ -141,6 +226,11 @@ public final class ScsiDisk implements ScsiTarget {
 
     public static ScsiDisk cdrom(BlockBackend b, String deviceId) {
         return new ScsiDisk(Type.CDROM, b, 2048, 2048, deviceId, null);
+    }
+
+    /** A drive with a removable, writable medium; {@code b} is null for an empty drive. */
+    public static ScsiDisk removable(BlockBackend b, int blockSize, String deviceId) {
+        return new ScsiDisk(Type.REMOVABLE, b, blockSize, blockSize, deviceId, null);
     }
 
     @Override
@@ -166,21 +256,161 @@ public final class ScsiDisk implements ScsiTarget {
         return blockSize;
     }
 
+    /**
+     * The medium in the drive, or null when the drive is empty. The drive's commands use it
+     * under the drive's lock; anything else done with it while it is in the drive is the
+     * caller's to keep apart from them.
+     */
     public BlockBackend backend() {
-        return backend;
+        synchronized (lock) {
+            return backend;
+        }
+    }
+
+    /** Whether there is a medium in the drive (a fixed disk always has one). */
+    public boolean hasMedium() {
+        return backend() != null;
+    }
+
+    /**
+     * Whether the guest has ejected the medium (START STOP UNIT) and not loaded it again. The
+     * medium, if there is one, is still in the drive; see {@link #onGuestEject}.
+     */
+    public boolean ejected() {
+        synchronized (lock) {
+            return trayOpen;
+        }
+    }
+
+    /**
+     * Whether the guest currently prevents medium removal (PREVENT ALLOW MEDIUM REMOVAL), as an
+     * operating system does while it has the medium mounted. {@link #changeMedium} does not
+     * look at this; an embedder that wants to keep the medium in the drive for the guest does.
+     */
+    public boolean removalPrevented() {
+        synchronized (lock) {
+            return trayLocked;
+        }
+    }
+
+    /**
+     * Change the medium of a drive with removable media: put {@code medium} into the drive, or
+     * empty the drive with null, and take out what was in it. May be called from any thread, also
+     * while the guest runs. It waits for a command in progress on this drive; when it returns,
+     * no command uses the medium that was taken out and none will, and every later command sees
+     * the new one (see the class comment for what the guest is told).
+     *
+     * <p>The medium taken out is returned and is the caller's again: the drive neither flushes
+     * nor closes it. The medium put in is the drive's until it is taken out the same way; the
+     * machine closes the one that is in the drive when the machine itself is closed. Putting in
+     * the backend that is already there tells the guest of a change too (use it when the
+     * backend's contents or size were replaced behind the drive's back) and returns null,
+     * since nothing was taken out.
+     *
+     * @param medium the new medium, or null to leave the drive empty
+     * @return the medium that was in the drive and no longer is, or null if there was none
+     * @throws IllegalStateException if this is a fixed disk, or the machine was closed and
+     *     {@code medium} is not null (a closed machine's drives are empty and stay so)
+     */
+    public BlockBackend changeMedium(BlockBackend medium) {
+        if (!type.removable()) {
+            throw new IllegalStateException("SCSI device " + id + ":" + lun + " is a fixed disk; only a CDROM or"
+                    + " REMOVABLE drive can have its medium changed");
+        }
+        synchronized (lock) {
+            if (closed) {
+                if (medium != null) {
+                    throw new IllegalStateException("the machine of SCSI device " + id + ":" + lun + " is closed");
+                }
+                return null;
+            }
+            BlockBackend old = backend;
+            if (old == null && medium == null) {
+                return null;
+            }
+            backend = medium;
+            mediumChanged();
+            return old == medium ? null : old;
+        }
+    }
+
+    /**
+     * Set what tells the embedder that the guest ejected the medium (START STOP UNIT with LoEj
+     * and without Start, e.g. {@code eject /dev/sdb} on Linux or {@code camcontrol eject da1} on
+     * FreeBSD) and the drive let it, i.e. removal was not prevented. The medium, if there is one,
+     * is still in the drive then, out of the guest's reach; a listener usually takes it out with
+     * {@code changeMedium(null)}, at once or later from a thread of its own.
+     *
+     * <p>{@code listener} runs on the thread of the guest CPU that sent the command, after the
+     * command has completed, inside that CPU's hypercall: the HBA's device lock is held, the
+     * drive's lock is not. It must return quickly, since the guest's other commands wait for it.
+     * An exception it throws is logged and otherwise ignored.
+     *
+     * @param listener the listener, or null for none
+     */
+    public void onGuestEject(Runnable listener) {
+        this.ejectListener = listener;
+    }
+
+    /**
+     * The medium in the drive is another one than a moment ago, or gone. Call with the lock
+     * held, after {@code backend} was set.
+     */
+    private void mediumChanged() {
+        if (backend != null) {
+            // A medium put in is loaded: the guest's earlier eject is over.
+            trayOpen = false;
+            // A pending reset unit attention stays and stands for this change too.
+            if (unitAttention == null || (unitAttention[12] & 0xff) != 0x29) {
+                unitAttention = ScsiRequest.sense(ScsiRequest.KEY_UNIT_ATTENTION, 0x28, 0x00);
+            }
+        } else {
+            // Without a medium there is no change to announce: commands fail with 3Ah.
+            if (unitAttention != null && (unitAttention[12] & 0xff) == 0x28) {
+                unitAttention = null;
+            }
+        }
+        if (type == Type.CDROM) {
+            mediaEvent = backend != null ? MEDIA_EVENT_NEW_MEDIA : MEDIA_EVENT_REMOVAL;
+        }
+    }
+
+    /**
+     * The machine is being closed: take the medium out for it to close, and take no other from
+     * now on.
+     */
+    BlockBackend detach() {
+        synchronized (lock) {
+            BlockBackend b = backend;
+            backend = null;
+            closed = true;
+            return b;
+        }
     }
 
     private int peripheralType() {
-        return type == Type.DISK ? TYPE_DISK : TYPE_ROM;
+        return type == Type.CDROM ? TYPE_ROM : TYPE_DISK;
     }
 
     private boolean removable() {
-        return type == Type.CDROM;
+        return type.removable();
     }
 
-    /** Number of logical blocks. */
+    /** Size of the medium in bytes; 0 for an empty drive. Call with the lock held. */
+    private long mediumSize() {
+        return backend == null ? 0 : backend.size();
+    }
+
+    /** Whether writes are refused: a CD-ROM, or a write-protected medium. Call with the lock held. */
+    private boolean writeProtected() {
+        return type == Type.CDROM || (backend != null && backend.readOnly());
+    }
+
+    /** Number of logical blocks of the medium in the drive; 0 for an empty drive. */
     public long blocks() {
-        return backend.size() / blockSize;
+        synchronized (lock) {
+            return mediumSize() / blockSize;
+        }
     }
 
     private long maxLba() {
@@ -188,51 +418,136 @@ public final class ScsiDisk implements ScsiTarget {
         return n == 0 ? 0 : n - 1;
     }
 
+    /** Whether commands reach a medium: there is one and the guest has not ejected it. */
     private boolean available() {
-        return !trayOpen;
+        return backend != null && !trayOpen;
     }
 
     @Override
     public void reset() {
-        // scsi_disk_reset: purge requests and raise POWER ON, RESET OR BUS DEVICE RESET OCCURRED.
-        unitAttention = ScsiRequest.sense(ScsiRequest.KEY_UNIT_ATTENTION, 0x29, 0x00);
-        trayLocked = false;
-        trayOpen = false;
+        synchronized (lock) {
+            // scsi_disk_reset: purge requests and raise POWER ON, RESET OR BUS DEVICE RESET OCCURRED.
+            unitAttention = ScsiRequest.sense(ScsiRequest.KEY_UNIT_ATTENTION, 0x29, 0x00);
+            trayLocked = false;
+            trayOpen = false;
+            mediaEvent = MEDIA_EVENT_NONE;
+        }
     }
 
-    /** Sense and unit-attention state and the tray; the medium is the embedder's (not saved). */
+    /**
+     * Sense and unit-attention state and the tray. The medium is the embedder's and not saved;
+     * {@link #mediumBytes} and {@link #mediumReadOnly} describe it for {@link #mediumAfterLoad}.
+     */
     void saveState(java.io.DataOutput out) throws java.io.IOException {
-        out.writeInt(id);
-        out.writeInt(lun);
-        org.boxtheta.javapower.core.StateOutput.writeBytes(out, unitAttention);
-        org.boxtheta.javapower.core.StateOutput.writeBytes(out, lastSense);
-        out.writeBoolean(senseIsUa);
-        out.writeBoolean(trayOpen);
-        out.writeBoolean(trayLocked);
+        synchronized (lock) {
+            out.writeInt(id);
+            out.writeInt(lun);
+            org.boxtheta.javapower.core.StateOutput.writeBytes(out, unitAttention);
+            org.boxtheta.javapower.core.StateOutput.writeBytes(out, lastSense);
+            out.writeBoolean(senseIsUa);
+            out.writeBoolean(trayOpen);
+            out.writeBoolean(trayLocked);
+        }
     }
 
     void loadState(org.boxtheta.javapower.core.StateInput.Record in) throws java.io.IOException {
-        int i = in.readInt();
-        int l = in.readInt();
-        if (i != id || l != lun) {
-            throw in.corrupt("SCSI target " + i + ":" + l + " where " + id + ":" + lun + " was expected");
+        synchronized (lock) {
+            int i = in.readInt();
+            int l = in.readInt();
+            if (i != id || l != lun) {
+                throw in.corrupt("SCSI target " + i + ":" + l + " where " + id + ":" + lun + " was expected");
+            }
+            unitAttention = in.readBytes(252);
+            lastSense = in.readBytes(252);
+            senseIsUa = in.readBoolean();
+            trayOpen = in.readBoolean();
+            trayLocked = in.readBoolean();
+            if ((unitAttention != null && unitAttention.length < 14) || (lastSense != null && lastSense.length < 14)) {
+                throw in.corrupt("SCSI target " + id + ":" + lun + ": sense data too short");
+            }
+            mediaEvent = MEDIA_EVENT_NONE;
         }
-        unitAttention = in.readBytes(252);
-        lastSense = in.readBytes(252);
-        senseIsUa = in.readBoolean();
-        trayOpen = in.readBoolean();
-        trayLocked = in.readBoolean();
+    }
+
+    /** Size in bytes of the medium in the drive, or -1 for an empty drive (saved states). */
+    long mediumBytes() {
+        synchronized (lock) {
+            return backend == null ? -1 : backend.size();
+        }
+    }
+
+    /** Whether the medium in the drive is write-protected; false for an empty drive (saved states). */
+    boolean mediumReadOnly() {
+        synchronized (lock) {
+            return backend != null && backend.readOnly();
+        }
+    }
+
+    /** The media event still to be reported, for the saved state. */
+    int mediaEvent() {
+        synchronized (lock) {
+            return mediaEvent;
+        }
+    }
+
+    /** Restore {@link #mediaEvent} from a saved state; false if it holds no such event. */
+    boolean setMediaEvent(int event) {
+        if (event != MEDIA_EVENT_NONE
+                && (type != Type.CDROM || (event != MEDIA_EVENT_NEW_MEDIA && event != MEDIA_EVENT_REMOVAL))) {
+            return false;
+        }
+        synchronized (lock) {
+            mediaEvent = event;
+        }
+        return true;
+    }
+
+    /**
+     * A state was loaded into this drive that was saved with a medium of {@code savedBytes}
+     * bytes (-1: none) and that write protection. If the drive holds a medium of another size
+     * or protection now, or the one has a medium and the other none, the medium was changed
+     * while the machine was saved, and the guest is told as for {@link #changeMedium}.
+     */
+    void mediumAfterLoad(long savedBytes, boolean savedReadOnly) {
+        synchronized (lock) {
+            long now = backend == null ? -1 : backend.size();
+            if (now != savedBytes || (backend != null && backend.readOnly() != savedReadOnly)) {
+                mediumChanged();
+            }
+        }
     }
 
     /** Whether a unit attention condition is pending (tests). */
     public boolean unitAttentionPending() {
-        return unitAttention != null;
+        synchronized (lock) {
+            return unitAttention != null;
+        }
     }
 
     // ---- dispatch ----------------------------------------------------------------------------
 
     @Override
     public void submit(ScsiRequest req) {
+        Runnable listener = null;
+        synchronized (lock) {
+            dispatch(req);
+            if (ejectNotify) {
+                ejectNotify = false;
+                listener = ejectListener;
+            }
+        }
+        if (listener != null) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                log.once("scsi-eject-listener", "the guest eject listener of SCSI device " + id + ":" + lun
+                        + " failed: " + e);
+            }
+        }
+    }
+
+    /** Run one command to its completion. Called with the lock held. */
+    private void dispatch(ScsiRequest req) {
         byte[] cdb = req.cdb();
         int op = cdb[0] & 0xff;
         if (unitAttention != null && op != INQUIRY && op != REPORT_LUNS && op != GET_CONFIGURATION
@@ -422,7 +737,7 @@ public final class ScsiDisk implements ScsiTarget {
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_NOT_READY, 0x3a, 0), false);
             return;
         }
-        if (backend.readOnly() || type == Type.CDROM) {
+        if (writeProtected()) {
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_DATA_PROTECT, 0x27, 0), false);
             return;
         }
@@ -491,7 +806,8 @@ public final class ScsiDisk implements ScsiTarget {
         switch (op) {
             case INQUIRY, MODE_SENSE, MODE_SENSE_10, RESERVE, RESERVE_10, RELEASE, RELEASE_10, START_STOP,
                  ALLOW_MEDIUM_REMOVAL, GET_CONFIGURATION, GET_EVENT_STATUS_NOTIFICATION, MECHANISM_STATUS,
-                 REQUEST_SENSE -> {
+                 REQUEST_SENSE, REPORT_LUNS -> {
+                // These need no medium. (QEMU answers REPORT LUNS in scsi-bus.c, before the disk.)
             }
             default -> {
                 if (!available()) {
@@ -725,7 +1041,7 @@ public final class ScsiDisk implements ScsiTarget {
             req.complete(ScsiRequest.TRANSFER_ERROR, null, -len);
             return;
         }
-        if (backend.readOnly() || type == Type.CDROM) {
+        if (writeProtected()) {
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_DATA_PROTECT, 0x27, 0), false);
             return;
         }
@@ -776,7 +1092,7 @@ public final class ScsiDisk implements ScsiTarget {
             req.complete(ScsiRequest.TRANSFER_ERROR, null, -blockSize);
             return;
         }
-        if (backend.readOnly() || type == Type.CDROM) {
+        if (writeProtected()) {
             checkCondition(req, ScsiRequest.sense(ScsiRequest.KEY_DATA_PROTECT, 0x27, 0), false);
             return;
         }
@@ -834,7 +1150,7 @@ public final class ScsiDisk implements ScsiTarget {
                     out[len++] = (byte) 0x80;
                 }
                 out[len++] = (byte) 0x83;
-                if (type == Type.DISK) {
+                if (type != Type.CDROM) {
                     out[len++] = (byte) 0xb0;
                     out[len++] = (byte) 0xb1;
                     out[len++] = (byte) 0xb2;
@@ -866,7 +1182,7 @@ public final class ScsiDisk implements ScsiTarget {
                 }
             }
             case 0xb0 -> {
-                if (type != Type.DISK) {
+                if (type == Type.CDROM) {
                     return false;
                 }
                 // Block limits (scsi_emulate_block_limits).
@@ -880,13 +1196,13 @@ public final class ScsiDisk implements ScsiTarget {
                 len += 0x3c;
             }
             case 0xb1 -> {
-                if (type != Type.DISK) {
+                if (type == Type.CDROM) {
                     return false;
                 }
                 len = 0x40; // rotation rate etc. all zero
             }
             case 0xb2 -> {
-                if (type != Type.DISK) {
+                if (type == Type.CDROM) {
                     return false;
                 }
                 len = 8; // logical block provisioning
@@ -907,8 +1223,8 @@ public final class ScsiDisk implements ScsiTarget {
         int page = cdb[2] & 0x3f;
         int pc = (cdb[2] & 0xc0) >>> 6;
         int devSpecific = 0;
-        if (type == Type.DISK) {
-            if (backend.readOnly()) {
+        if (type != Type.CDROM) {
+            if (writeProtected()) {
                 devSpecific |= 0x80;
             }
         } else {
@@ -922,8 +1238,8 @@ public final class ScsiDisk implements ScsiTarget {
             out[3] = (byte) devSpecific;
             p = 8;
         }
-        long nb = backend.size() / blockSize;
-        if (!dbd && backend.size() >= 512) {
+        long nb = mediumSize() / blockSize;
+        if (!dbd && mediumSize() >= 512) {
             if (six) {
                 out[3] = 8;
             } else {
@@ -968,7 +1284,7 @@ public final class ScsiDisk implements ScsiTarget {
     private int modePage(int page, byte[] out, int at, int pc) {
         int q = at + 2;
         int length;
-        boolean disk = type == Type.DISK;
+        boolean disk = type != Type.CDROM;
         switch (page) {
             case 0x04 -> { // rigid disk geometry
                 if (!disk) {
@@ -1079,7 +1395,7 @@ public final class ScsiDisk implements ScsiTarget {
 
     /** Default CHS guess (QEMU's guess_chs_for_size): 16 heads, 63 sectors. Returns {cyls, heads, secs}. */
     private int[] geometry() {
-        long sectors = backend.size() / 512;
+        long sectors = mediumSize() / 512;
         long cyls = sectors / (16 * 63);
         cyls = Math.max(2, Math.min(cyls, 16383));
         return new int[] {(int) cyls, 16, 63};
@@ -1097,6 +1413,9 @@ public final class ScsiDisk implements ScsiTarget {
                 checkCondition(req, ScsiRequest.sense(
                         available() ? ScsiRequest.KEY_ILLEGAL_REQUEST : ScsiRequest.KEY_NOT_READY, 0x53, 0x02), false);
                 return false;
+            }
+            if (!start && !trayOpen) {
+                ejectNotify = true; // the embedder is told once the command has completed
             }
             trayOpen = !start;
         }
@@ -1207,11 +1526,11 @@ public final class ScsiDisk implements ScsiTarget {
     }
 
     private boolean mediaIsDvd() {
-        return type == Type.CDROM && available() && backend.size() / 512 > CD_MAX_SECTORS;
+        return type == Type.CDROM && available() && mediumSize() / 512 > CD_MAX_SECTORS;
     }
 
     private boolean mediaIsCd() {
-        return type == Type.CDROM && available() && backend.size() / 512 <= CD_MAX_SECTORS;
+        return type == Type.CDROM && available() && mediumSize() / 512 <= CD_MAX_SECTORS;
     }
 
     private boolean getConfiguration(byte[] out) {
@@ -1247,7 +1566,11 @@ public final class ScsiDisk implements ScsiTarget {
         out[3] = 1 << 4; // supported: media class
         if ((cdb[4] & (1 << 4)) != 0) {
             out[2] = 4; // GESN_MEDIA
-            out[4] = 0; // no change
+            // An event is reported once, and not while the guest has the medium ejected.
+            if (!trayOpen) {
+                out[4] = (byte) mediaEvent;
+                mediaEvent = MEDIA_EVENT_NONE;
+            }
             out[5] = (byte) (trayOpen ? 1 : available() ? 2 : 0);
             size += 4;
         } else {
@@ -1284,7 +1607,7 @@ public final class ScsiDisk implements ScsiTarget {
                 if (layer != 0) {
                     return -1;
                 }
-                long nb512 = backend.size() / 512;
+                long nb512 = mediumSize() / 512;
                 out[4] = 1;
                 out[5] = 0xf;
                 out[6] = 1;

@@ -3,6 +3,7 @@ package org.boxtheta.javapower.papr;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -322,6 +323,466 @@ class ScsiDiskTest {
         r = run(c, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x04, 0);
         assertEquals(0, r.status);
         assertTrue(r.data.length > 4);
+    }
+
+    // ---- removable media -----------------------------------------------------------------------
+
+    static final int[] TUR = {0x00};
+    static final int[] READ_CAPACITY = {0x25};
+    static final int[] READ_BLOCK_0 = {0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    static final int[] WRITE_BLOCK_0 = {0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    static final int[] EJECT = {0x1b, 0, 0, 0, 2, 0};
+    static final int[] LOAD = {0x1b, 0, 0, 0, 3, 0};
+
+    /** A medium of {@code blocks} 512-byte blocks, every byte {@code fill}. */
+    static MemoryBackend medium(int blocks, int fill, boolean readOnly) {
+        byte[] b = new byte[512 * blocks];
+        Arrays.fill(b, (byte) fill);
+        return new MemoryBackend(b, readOnly);
+    }
+
+    /** An empty drive whose power-on unit attention has been reported. */
+    static ScsiDisk emptyDrive() {
+        ScsiDisk d = ScsiDisk.removable(null, 512, "d0");
+        assertEquals(0x29, run(d, TUR).asc());
+        return d;
+    }
+
+    static void assertNoMedium(Res r) {
+        assertEquals(2, r.status);
+        assertEquals(ScsiRequest.KEY_NOT_READY, r.key());
+        assertEquals(0x3a, r.asc());
+        assertEquals(0, r.sense[13]);
+    }
+
+    static void assertMediumChanged(Res r) {
+        assertEquals(2, r.status);
+        assertEquals(ScsiRequest.KEY_UNIT_ATTENTION, r.key());
+        assertEquals(0x28, r.asc());
+        assertEquals(0, r.sense[13]);
+    }
+
+    @Test
+    void removableDiskIsADiskWithTheRmbBit() {
+        ScsiDisk d = ScsiDisk.removable(medium(16, 0, false), 512, "d0");
+        run(d, TUR);
+        Res r = run(d, 0x12, 0, 0, 0, 36, 0);
+        assertEquals(0, r.data[0]); // direct access
+        assertEquals((byte) 0x80, r.data[1]); // RMB
+        assertEquals("QEMU    QEMU HARDDISK   2.5+", new String(r.data, 8, 28, StandardCharsets.US_ASCII));
+        // The disk's VPD pages and mode pages, not the CD's.
+        r = run(d, 0x12, 1, 0x00, 0, 255, 0);
+        assertArrayEquals(new byte[] {0, 0, 0, 5, 0, (byte) 0x83, (byte) 0xb0, (byte) 0xb1, (byte) 0xb2},
+                Arrays.copyOf(r.data, 9));
+        assertEquals(0, run(d, 0x1a, 0, 0x04, 0, 255, 0).status);
+        assertEquals(0x24, run(d, 0x1a, 0, 0x2a, 0, 255, 0).asc());
+        assertEquals(0x24, run(d, 0x46, 0, 0, 0, 0, 0, 0, 0, 64, 0).asc()); // GET CONFIGURATION is MMC
+        assertEquals(0x24, run(d, 0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8, 0).asc()); // and so is GESN
+        assertTrue(d.type().removable());
+        assertTrue(ScsiDisk.Type.CDROM.removable());
+        assertFalse(ScsiDisk.Type.DISK.removable());
+    }
+
+    @Test
+    void emptyDriveIsNotReady() {
+        ScsiDisk d = emptyDrive();
+        assertFalse(d.hasMedium());
+        assertEquals(0, d.blocks());
+        assertNoMedium(run(d, TUR));
+        assertNoMedium(run(d, READ_CAPACITY));
+        assertNoMedium(run(d, 0x9e, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0));
+        assertNoMedium(run(d, READ_BLOCK_0));
+        assertNoMedium(run(d, 0, new byte[512], WRITE_BLOCK_0));
+        assertNoMedium(run(d, 0, new byte[512], 0x41, 0, 0, 0, 0, 0, 0, 0, 1, 0)); // WRITE SAME
+        assertNoMedium(run(d, 0x35)); // SYNCHRONIZE CACHE
+        // What a guest needs to find the drive works without a medium.
+        Res r = run(d, 0x12, 0, 0, 0, 36, 0);
+        assertEquals(0, r.status);
+        assertEquals((byte) 0x80, r.data[1]);
+        r = run(d, 0xa0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0); // REPORT LUNS
+        assertEquals(0, r.status);
+        assertEquals(8, ByteBuffer.wrap(r.data).getInt(0));
+        r = run(d, 0x1a, 0, 0x3f, 0, 255, 0); // MODE SENSE: not write-protected, no block descriptor
+        assertEquals(0, r.status);
+        assertEquals(0, r.data[2]);
+        assertEquals(0, r.data[3]);
+        assertEquals(0, run(d, 0x1e, 0, 0, 0, 1, 0).status); // PREVENT
+        assertEquals(0, run(d, 0x1e, 0, 0, 0, 0, 0).status); // ALLOW
+        assertEquals(0, run(d, 0x1b, 0, 0, 0, 1, 0).status); // START
+        // The sense of the last failure is there for REQUEST SENSE.
+        assertNoMedium(run(d, TUR));
+        r = run(d, 0x03, 0, 0, 0, 18, 0);
+        assertEquals(2, r.data[2]);
+        assertEquals(0x3a, r.data[12]);
+    }
+
+    @Test
+    void loadedMediumIsAnnouncedOnceAndThenUsed() {
+        ScsiDisk d = emptyDrive();
+        MemoryBackend a = medium(8, 0xa1, false);
+        assertEquals(null, d.changeMedium(a));
+        assertTrue(d.hasMedium());
+        // INQUIRY does not report the unit attention; the next command that can does, once.
+        assertEquals(0, run(d, 0x12, 0, 0, 0, 36, 0).status);
+        assertTrue(d.unitAttentionPending());
+        assertMediumChanged(run(d, TUR));
+        assertFalse(d.unitAttentionPending());
+        assertEquals(0, run(d, TUR).status);
+        assertArrayEquals(new byte[] {0, 0, 0, 7, 0, 0, 2, 0}, run(d, READ_CAPACITY).data);
+        assertEquals(8, d.blocks());
+        Res r = run(d, READ_BLOCK_0);
+        assertEquals(512, r.data.length);
+        assertEquals((byte) 0xa1, r.data[511]);
+        byte[] w = new byte[512];
+        Arrays.fill(w, (byte) 0x5c);
+        assertEquals(0, run(d, 0, w, WRITE_BLOCK_0).status);
+        assertEquals(0x5c, a.data()[0]);
+        assertEquals((byte) 0xa1, a.data()[512]);
+        assertEquals(0, run(d, 0x1a, 0, 0x3f, 0, 255, 0).data[2]); // not write-protected
+    }
+
+    @Test
+    void changedMediumBringsItsOwnSizeAndProtection() {
+        MemoryBackend a = medium(8, 0xa1, false);
+        ScsiDisk d = ScsiDisk.removable(a, 512, "d0");
+        run(d, TUR);
+        assertArrayEquals(new byte[] {0, 0, 0, 7, 0, 0, 2, 0}, run(d, READ_CAPACITY).data);
+
+        // A larger, write-protected medium in its place.
+        MemoryBackend b = medium(2880, 0xb2, true);
+        assertEquals(a, d.changeMedium(b));
+        assertMediumChanged(run(d, READ_CAPACITY));
+        assertArrayEquals(new byte[] {0, 0, 0x0b, 0x3f, 0, 0, 2, 0}, run(d, READ_CAPACITY).data);
+        assertEquals((byte) 0xb2, run(d, READ_BLOCK_0).data[0]);
+        Res r = run(d, 0, new byte[512], WRITE_BLOCK_0);
+        assertEquals(ScsiRequest.KEY_DATA_PROTECT, r.key());
+        assertEquals(0x27, r.asc());
+        assertEquals((byte) 0x80, run(d, 0x1a, 0, 0x3f, 0, 255, 0).data[2]); // WP
+        // Block 8 exists now; on the first medium it did not.
+        assertEquals(0, run(d, 0x28, 0, 0, 0, 0, 8, 0, 0, 1, 0).status);
+
+        // Emptied: the medium comes back to the caller, untouched since.
+        assertEquals(b, d.changeMedium(null));
+        assertNoMedium(run(d, TUR));
+        assertEquals(null, d.changeMedium(null));
+        assertFalse(d.unitAttentionPending());
+
+        // The first medium again: block 8 is out of range again.
+        assertEquals(null, d.changeMedium(a));
+        assertMediumChanged(run(d, TUR));
+        assertEquals(0x21, run(d, 0x28, 0, 0, 0, 0, 8, 0, 0, 1, 0).asc());
+        // The same backend put in again counts as a change, and nothing comes out.
+        assertEquals(null, d.changeMedium(a));
+        assertMediumChanged(run(d, TUR));
+        assertEquals(a, d.backend());
+
+        // A medium that is not a whole number of blocks: the rest is out of reach.
+        d.changeMedium(new MemoryBackend(new byte[512 * 3 + 100], false));
+        assertMediumChanged(run(d, TUR));
+        assertEquals(3, d.blocks());
+        assertEquals(0x21, run(d, 0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0).asc());
+    }
+
+    @Test
+    void aMediumLoadedAndTakenOutUnseenLeavesNoUnitAttention() {
+        ScsiDisk d = emptyDrive();
+        MemoryBackend a = medium(8, 0, false);
+        d.changeMedium(a);
+        assertEquals(a, d.changeMedium(null));
+        assertNoMedium(run(d, TUR));
+    }
+
+    @Test
+    void aPendingResetUnitAttentionStandsForTheMediumChangeToo() {
+        ScsiDisk d = ScsiDisk.removable(null, 512, "d0");
+        d.changeMedium(medium(8, 0, false));
+        assertEquals(0x29, run(d, TUR).asc());
+        assertEquals(0, run(d, TUR).status);
+        // And a reset after the change replaces its unit attention.
+        d.changeMedium(medium(16, 0, false));
+        d.reset();
+        assertEquals(0x29, run(d, TUR).asc());
+        assertEquals(0, run(d, TUR).status);
+        assertEquals(16, d.blocks());
+    }
+
+    @Test
+    void fixedDisksKeepTheirMedium() {
+        ScsiDisk d = disk(512, 8);
+        assertThrows(IllegalStateException.class, () -> d.changeMedium(medium(8, 0, false)));
+        assertThrows(IllegalStateException.class, () -> d.changeMedium(null));
+        assertTrue(d.hasMedium());
+        assertThrows(IllegalArgumentException.class, () -> ScsiDisk.disk(null, 512, "d0"));
+        // A guest's eject of a fixed disk does nothing, as before.
+        assertEquals(0, run(d, EJECT).status);
+        assertFalse(d.ejected());
+        assertEquals(0, run(d, TUR).status);
+    }
+
+    @Test
+    void guestEjectAndRemovalLock() {
+        MemoryBackend a = medium(8, 0xa1, false);
+        ScsiDisk d = ScsiDisk.removable(a, 512, "d0");
+        run(d, TUR);
+        int[] ejects = {0};
+        d.onGuestEject(() -> ejects[0]++);
+
+        // While the guest prevents removal its own eject fails; the embedder can see the lock.
+        assertEquals(0, run(d, 0x1e, 0, 0, 0, 1, 0).status);
+        assertTrue(d.removalPrevented());
+        Res r = run(d, EJECT);
+        assertEquals(ScsiRequest.KEY_ILLEGAL_REQUEST, r.key());
+        assertEquals(0x53, r.asc());
+        assertEquals(2, r.sense[13]);
+        assertEquals(0, ejects[0]);
+        assertFalse(d.ejected());
+        assertEquals(0, run(d, 0x1e, 0, 0, 0, 0, 0).status);
+        assertFalse(d.removalPrevented());
+
+        // Ejected: the medium stays in the drive, out of the guest's reach, and the embedder is told.
+        assertEquals(0, run(d, EJECT).status);
+        assertEquals(1, ejects[0]);
+        assertTrue(d.ejected());
+        assertEquals(a, d.backend());
+        assertNoMedium(run(d, TUR));
+        assertNoMedium(run(d, READ_BLOCK_0));
+        assertEquals(0, run(d, EJECT).status); // already out: no second notification
+        assertEquals(1, ejects[0]);
+        // Loaded again by the guest: there it is, with no unit attention.
+        assertEquals(0, run(d, LOAD).status);
+        assertFalse(d.ejected());
+        assertEquals(0, run(d, TUR).status);
+        assertEquals((byte) 0xa1, run(d, READ_BLOCK_0).data[0]);
+
+        // A medium put in by the embedder ends the guest's eject.
+        assertEquals(0, run(d, EJECT).status);
+        assertEquals(2, ejects[0]);
+        MemoryBackend b = medium(16, 0xb2, false);
+        assertEquals(a, d.changeMedium(b));
+        assertFalse(d.ejected());
+        assertMediumChanged(run(d, TUR));
+        assertEquals((byte) 0xb2, run(d, READ_BLOCK_0).data[0]);
+
+        // The embedder's change does not ask the guest's lock.
+        assertEquals(0, run(d, 0x1e, 0, 0, 0, 1, 0).status);
+        assertEquals(b, d.changeMedium(null));
+        assertNoMedium(run(d, TUR));
+        assertTrue(d.removalPrevented());
+
+        // A listener may take the medium out itself, and one that fails harms nothing.
+        d.reset();
+        run(d, TUR);
+        d.changeMedium(a);
+        run(d, TUR);
+        d.onGuestEject(() -> assertEquals(a, d.changeMedium(null)));
+        assertEquals(0, run(d, EJECT).status);
+        assertFalse(d.hasMedium());
+        assertEquals(0, run(d, LOAD).status);
+        assertNoMedium(run(d, TUR));
+        d.onGuestEject(() -> {
+            throw new IllegalStateException("listener");
+        });
+        assertEquals(0, run(d, EJECT).status);
+        assertTrue(d.ejected());
+    }
+
+    @Test
+    void cdromMediumChangeAndMediaEvents() {
+        ScsiDisk c = cd(1000);
+        int[] gesn = {0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8, 0};
+        Res r = run(c, gesn);
+        assertEquals(0, r.data[4]); // no event
+        assertEquals(2, r.data[5]); // media present
+
+        BlockBackend first = c.changeMedium(null);
+        assertTrue(first != null);
+        assertNoMedium(run(c, TUR));
+        r = run(c, gesn);
+        assertEquals(3, r.data[4]); // MediaRemoval, once
+        assertEquals(0, r.data[5]); // no media, tray closed
+        assertEquals(0, run(c, gesn).data[4]);
+
+        c.changeMedium(new MemoryBackend(new byte[2048 * 500], true));
+        // GESN neither reports nor clears the unit attention, and gives the event once.
+        r = run(c, gesn);
+        assertEquals(2, r.data[4]); // NewMedia
+        assertEquals(2, r.data[5]);
+        assertEquals(0, run(c, gesn).data[4]);
+        assertMediumChanged(run(c, TUR));
+        assertArrayEquals(new byte[] {0, 0, 0x01, (byte) 0xf3, 0, 0, 0x08, 0}, run(c, READ_CAPACITY).data);
+        // READ TOC: the lead-out follows the new medium.
+        r = run(c, 0x43, 0, 0, 0, 0, 0, 0, 0, 0xff, 0);
+        assertEquals(500, ByteBuffer.wrap(r.data).getInt(16));
+        // A writable backend does not make a CD-ROM writable.
+        c.changeMedium(new MemoryBackend(2048 * 4));
+        assertMediumChanged(run(c, TUR));
+        assertEquals(7, run(c, 0, new byte[2048], 0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0).key());
+
+        // While the guest has the tray open an event waits.
+        run(c, gesn);
+        assertEquals(0, run(c, EJECT).status);
+        c.changeMedium(null);
+        r = run(c, gesn);
+        assertEquals(0, r.data[4]);
+        assertEquals(1, r.data[5]); // tray open
+        assertEquals(0, run(c, LOAD).status);
+        r = run(c, gesn);
+        assertEquals(3, r.data[4]);
+        assertEquals(0, r.data[5]);
+
+        // An empty CD-ROM drive from the start.
+        ScsiDisk e = ScsiDisk.cdrom(null, "d1");
+        run(e, TUR);
+        assertNoMedium(run(e, TUR));
+        assertEquals(0, ByteBuffer.wrap(run(e, 0x46, 0, 0, 0, 0, 0, 0, 0, 64, 0).data).getShort(6)); // no profile
+        assertEquals(0, run(e, gesn).data[5]);
+    }
+
+    /** A medium whose reads wait until the test lets them go, and that counts its calls. */
+    static final class SlowMedium implements BlockBackend {
+        final java.util.concurrent.CountDownLatch reading = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        volatile boolean closed;
+        volatile boolean usedAfterClose;
+
+        private void call() {
+            calls.incrementAndGet();
+            if (closed) {
+                usedAfterClose = true;
+            }
+        }
+
+        @Override
+        public long size() {
+            call();
+            return 512 * 8;
+        }
+
+        @Override
+        public boolean readOnly() {
+            call();
+            return false;
+        }
+
+        @Override
+        public void read(long offset, byte[] buf, int off, int len) throws java.io.IOException {
+            call();
+            reading.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                throw new java.io.IOException(e);
+            }
+            call(); // the command is still inside the backend when the wait ends
+            Arrays.fill(buf, off, off + len, (byte) 0x11);
+        }
+
+        @Override
+        public void write(long offset, byte[] buf, int off, int len) {
+            call();
+        }
+
+        @Override
+        public void flush() {
+            call();
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+    }
+
+    /**
+     * A medium change from another thread waits for the command that is using the old medium,
+     * and nothing touches the old medium once the change has returned.
+     */
+    @Test
+    void mediumChangeWaitsForTheCommandInProgress() throws Exception {
+        SlowMedium slow = new SlowMedium();
+        ScsiDisk d = ScsiDisk.removable(slow, 512, "d0");
+        run(d, TUR);
+        Res[] read = new Res[1];
+        Thread cpu = new Thread(() -> read[0] = run(d, READ_BLOCK_0), "guest-cpu");
+        cpu.start();
+        assertTrue(slow.reading.await(10, java.util.concurrent.TimeUnit.SECONDS), "the read never reached the backend");
+
+        MemoryBackend next = medium(4, 0x22, false);
+        BlockBackend[] out = new BlockBackend[1];
+        Thread server = new Thread(() -> {
+            out[0] = d.changeMedium(next);
+            slow.close(); // what an embedder does with a medium it got back
+        }, "server");
+        server.start();
+        // The change must not return while the read is inside the old medium.
+        server.join(300);
+        assertTrue(server.isAlive(), "the medium changed under a command in progress");
+        assertFalse(slow.closed);
+
+        slow.release.countDown();
+        cpu.join(10_000);
+        server.join(10_000);
+        assertFalse(cpu.isAlive());
+        assertFalse(server.isAlive());
+        assertEquals(slow, out[0]);
+        // The read finished on the old medium, with its data.
+        assertEquals(0, read[0].status);
+        assertEquals(0x11, read[0].data[0]);
+
+        // From here on only the new medium is used.
+        int calls = slow.calls.get();
+        assertMediumChanged(run(d, TUR));
+        assertEquals(0x22, run(d, READ_BLOCK_0).data[0]);
+        assertArrayEquals(new byte[] {0, 0, 0, 3, 0, 0, 2, 0}, run(d, READ_CAPACITY).data);
+        assertEquals(calls, slow.calls.get());
+        assertFalse(slow.usedAfterClose);
+    }
+
+    /** Commands on one thread and medium changes on another: every command sees one whole medium. */
+    @Test
+    void commandsAndMediumChangesFromTwoThreads() throws Exception {
+        ScsiDisk d = emptyDrive();
+        MemoryBackend[] media = {medium(8, 1, false), medium(16, 2, false), medium(32, 3, false)};
+        java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread server = new Thread(() -> {
+            try {
+                java.util.Random rnd = new java.util.Random(7);
+                while (!stop.get()) {
+                    int k = rnd.nextInt(media.length + 1);
+                    d.changeMedium(k == media.length ? null : media[k]);
+                }
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "server");
+        server.start();
+        try {
+            int reads = 0;
+            for (int i = 0; i < 20_000 || reads < 100; i++) {
+                assertTrue(i < 2_000_000, "the drive never had a medium for a command");
+                // The last block of the smallest medium: within every medium.
+                Res r = run(d, 0x28, 0, 0, 0, 0, 7, 0, 0, 1, 0);
+                if (r.status == 0) {
+                    reads++;
+                    assertEquals(512, r.data.length);
+                    byte fill = r.data[0];
+                    assertTrue(fill >= 1 && fill <= 3, "fill " + fill);
+                    for (byte b : r.data) {
+                        assertEquals(fill, b);
+                    }
+                } else {
+                    assertTrue(r.key() == ScsiRequest.KEY_NOT_READY && r.asc() == 0x3a
+                            || r.key() == ScsiRequest.KEY_UNIT_ATTENTION && r.asc() == 0x28,
+                            "sense key " + r.key() + " asc " + Integer.toHexString(r.asc()));
+                }
+            }
+        } finally {
+            stop.set(true);
+            server.join(10_000);
+        }
+        assertEquals(null, failure.get());
     }
 
     /** A read-only backend of a given size that reads zeros. */

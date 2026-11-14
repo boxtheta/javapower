@@ -71,7 +71,9 @@ class Boot {
 
 - `MachineConfig` configures the machine: RAM, CPU count, firmware, consoles (`console`,
   `addConsole`; see [More consoles](#more-consoles)), disks (`addCdrom`,
-  `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`), network devices
+  `addDisk`, or `addDisk(type, backend)` with your own `BlockBackend`; `addRemovableDisk` for a
+  drive whose medium changes while the machine runs, see [Removable media](#removable-media)),
+  network devices
   (`addNetwork(backend)`, see [Networking](#networking)), NVRAM file, kernel command line, log
   sink, devices of your own in the guest's address space (`addMmio`; see
   [Memory-mapped devices](#memory-mapped-devices)) and PCI devices, virtio ones among them
@@ -184,6 +186,66 @@ them differently:
 
   FreeBSD takes input from a console as soon as it arrives and drops it while the device is not
   open, so a program opens the device before the host sends anything.
+
+### Removable media
+
+`addRemovableDisk` adds a disk drive with a removable, writable medium to the v-scsi bus, next to
+the fixed disks: a floppy or flash drive like device (QEMU's `scsi-hd,removable=on`) that Linux's
+`sd` and FreeBSD's `da` drive as a removable disk. The embedder changes its medium while the
+guest runs, and a CD-ROM's the same way:
+
+```java
+MachineConfig.Disk floppy = cfg.addRemovableDisk();           // an empty drive, 512-byte blocks
+MachineConfig.Disk cd = cfg.addCdrom(Path.of("disc1.iso"));
+try (Emulator emu = new Emulator(cfg)) {
+    ScsiDisk drive = emu.machine().disk(floppy);
+    drive.onGuestEject(() -> server.execute(() -> popFloppy(drive)));   // the guest ran `eject`
+    // ... emu.run() on another thread ...
+    drive.changeMedium(mediumA);                              // load: any thread, the guest is told
+    BlockBackend out = drive.changeMedium(mediumB);           // swap: out is mediumA, yours again
+    out = drive.changeMedium(null);                           // empty the drive
+    emu.machine().disk(cd).changeMedium(BlockBackend.open(Path.of("disc2.iso"), true, false));
+}
+```
+
+- A medium is a `BlockBackend`: your own, a `MemoryBackend`, or an image file opened with
+  `BlockBackend.open`. Media may differ in size and in write protection (`readOnly()`); the block
+  size is the drive's (`blockSize`, 512 by default) and bytes after the last whole block are out
+  of the guest's reach. `addRemovableDisk(medium)` and `addRemovableDisk(Path)` start with a
+  medium in the drive; `addDisk(ScsiDisk.Type.CDROM, null)` is an empty CD-ROM drive.
+- What the guest sees: an empty drive answers TEST UNIT READY, READ CAPACITY and I/O with NOT
+  READY, MEDIUM NOT PRESENT (3Ah). After a medium went in, the next command fails once with
+  UNIT ATTENTION, NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED (28h/00h), and from then on
+  the drive has the new medium's capacity and write protection. A CD-ROM also reports NewMedia
+  and MediaRemoval to GET EVENT STATUS NOTIFICATION.
+- Guests find a change when they next look at the drive. FreeBSD's `da` and `cd` do so every
+  three seconds (`kern.cam.da.poll_period`) and whenever the device is opened. Linux's `sd` and
+  `sr` do when the device is opened, and every two seconds where media polling is on: udev turns
+  it on, and a guest without udev can with `block.events_dfl_poll_msecs=2000` on the kernel
+  command line or by writing to `/sys/block/sdX/events_poll_msecs`. I/O on a file system that
+  was mounted from a medium that is gone fails, as it does on real hardware: unmount before
+  taking a medium out, or eject from the guest.
+- Threads: `changeMedium` may be called from any thread while the guest runs. It waits for a
+  command in progress on that drive, and when it returns nothing uses the medium that came out
+  and nothing ever will again, so you can close it or unmap its memory at once. The drive neither
+  flushes nor closes a medium it gives back. A medium in a drive is called from guest CPU
+  threads, one call at a time; the machine closes the one that is in the drive when the machine
+  is closed.
+- The guest's side: `eject /dev/sdb` on Linux and `camcontrol eject da1` on FreeBSD (START STOP
+  UNIT) cut the guest off from the medium, which stays in the drive until you take it out;
+  `onGuestEject` tells you, on the guest CPU's thread, so hand longer work to another thread. An
+  operating system prevents removal while it has the device open or mounted (PREVENT ALLOW
+  MEDIUM REMOVAL): its own eject then fails, but `changeMedium` works regardless, like pulling a
+  floppy out. `removalPrevented()` tells an embedder that would rather wait.
+- SLOF takes the drive for a disk and can boot from its medium. Its default boot order tries
+  the disks in the order they were added, fixed and removable alike, and passes over an empty
+  drive, so a drive added before the fixed disk boots its medium first if that is bootable.
+- Saved states: the drive is hardware, its medium is not. What the guest has not seen yet of a
+  change is saved; the medium is yours to put back. A state loads into a machine whose drive
+  holds another medium, or none: if its size or write protection differs from the saved
+  medium's, or one of the two is missing, the guest is told of a medium change when it resumes.
+  A different medium of the very same size and protection cannot be told apart, so load that one
+  with `changeMedium` after `loadState`.
 
 ### Networking
 
@@ -460,7 +522,8 @@ try (Emulator emu = new Emulator(cfg);
 - The state holds every CPU (registers, timebase and decrementer, reservations, idle and
   RTAS-stopped state), guest RAM, the hypervisor (CAS results, the guest's device tree, VPAs,
   process table, watchdogs), XICS, RTAS, and the devices: CRQs, TCE tables, NVRAM contents,
-  input the guest has not read yet on each console, SCSI sense state, each network device's
+  input the guest has not read yet on each console, SCSI sense state (with medium changes and
+  ejects the guest has not seen yet), each network device's
   registration, receive buffers, receive queue position, MAC address and multicast filters, PCI
   devices (configuration space, virtio queues and what each device saves), and what each MMIO
   region's handler saves. Frames waiting for the guest's receive buffers are dropped on save, as
@@ -471,11 +534,13 @@ try (Emulator emu = new Emulator(cfg);
   decode caches and TLBs are rebuilt as the guest runs.
 - Outside the state, and the embedder's to keep: disk contents (reattach the images as the guest
   left them; use `persistent(true)` disks or your own `BlockBackend`, since the default
-  copy-on-write snapshots are discarded at `close()`), the console and network backends, the NVRAM file (it
+  copy-on-write snapshots are discarded at `close()`), removable media (see
+  [Removable media](#removable-media)), the console and network backends, the NVRAM file (it
   is rewritten from the state on load), `MachineConfig.random` and `MachineConfig.clock`.
 - The configuration used to load must describe the same hardware: CPU count, RAM size, the PCI
   host bridge and `rng` settings, NVRAM size, the same SCSI devices (type, target id, LUN,
-  block size, size, read-only), the same added VIO devices in the same order (consoles with
+  block size, and for fixed disks size and read-only; the medium of a CD-ROM or removable disk
+  drive need not be the same), the same added VIO devices in the same order (consoles with
   the same names; network devices with the same MAC addresses, so give explicit addresses or
   add them in the same order; for devices of your own see
   [Adding VIO devices of your own](#adding-vio-devices-of-your-own)), the same PCI devices
@@ -523,7 +588,8 @@ classes, which refuse to load on a JVM without atomic access to byte arrays (JDK
 
 ```
 app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--disk img]
-    [--disk4k img] [--cdrom iso] [--clock-scale f] [--deterministic] [--icount-shift n]
+    [--disk4k img] [--cdrom iso|empty] [--removable img|empty]... [--media tcp:[host:]port]
+    [--clock-scale f] [--deterministic] [--icount-shift n]
     [--max-insns n] [--log-interrupts] [--status-secs n] [--jit off|blocks|regions]
     [--no-code-sharing] [--persistent] [--load-state file] [--save-state file]
     [--console tcp:[host:]port[,name=NAME]]... [--net spec]... [--virtio-rng] [--test-mmio addr]
@@ -535,7 +601,9 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--smp n` | Guest CPUs (default 1) |
 | `--firmware file` | Firmware image (default: the bundled SLOF image) |
 | `--disk img` / `--disk4k img` | Raw disk image, 512- or 4096-byte sectors (snapshot mode) |
-| `--cdrom iso` | ISO image as a SCSI CD-ROM |
+| `--cdrom iso` | ISO image as a SCSI CD-ROM; `--cdrom empty` is an empty CD-ROM drive |
+| `--removable img` | Raw image as the medium of a removable disk drive (`addRemovableDisk`; snapshot mode unless `--persistent`); `--removable empty` is an empty drive. Repeat for more drives. A medium the guest ejects is taken out of the drive, which is reported on stderr |
+| `--media tcp:[host:]port` | Change media while the guest runs, with commands sent to a TCP port of the loopback address or of `host`, one per line, each answered with a line starting with `ok` or `error`: `load ID FILE [ro\|snapshot]` puts an image into the CD-ROM or removable disk drive with SCSI target id `ID` (ids count the `--disk`, `--cdrom` and `--removable` options from 0 in the order given), `eject ID` empties it, `status` lists the drives |
 | `--clock-scale f` | Run guest time `f` times slower than the host clock |
 | `--deterministic` | Guest time from the instruction count, fixed seeds and time of day (one CPU) |
 | `--icount-shift n` | With `--deterministic`: 2^n virtual nanoseconds per instruction |
@@ -544,7 +612,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--status-secs n` | Print per-CPU progress to stderr every `n` seconds |
 | `--jit off\|blocks\|regions` | Compile hot guest code to JVM bytecode: not at all, basic blocks only, or blocks plus whole-page regions (default `regions`) |
 | `--no-code-sharing` | Compile code separately for each CPU and address space instead of sharing it |
-| `--persistent` | Write guest changes to the `--disk` images instead of a discarded snapshot |
+| `--persistent` | Write guest changes to the `--disk` and `--removable` images instead of a discarded snapshot |
 | `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |
 | `--save-state file` | When the guest is stopped by `--max-insns`, SIGTERM or SIGINT, save the machine to `file` |
 | `--console tcp:[host:]port[,name=NAME]` | Another console (`addConsole`), on a TCP port of the loopback address or of `host`; repeat for more. One client at a time; the guest's output is dropped while none is connected. Give the same ones to `--load-state` |

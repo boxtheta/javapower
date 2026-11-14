@@ -66,7 +66,10 @@ import org.boxtheta.javapower.core.Spr;
  *     vty has separate input and output locks instead, so console output never waits for input.
  *     A network device's lock guards its receive side (H_REGISTER_LOGICAL_LAN,
  *     H_ADD_LOGICAL_LAN_BUFFER, frames its backend delivers from its own threads); sending
- *     (H_SEND_LOGICAL_LAN, which calls the backend) holds a transmit lock of its own instead.</li>
+ *     (H_SEND_LOGICAL_LAN, which calls the backend) holds a transmit lock of its own instead.
+ *     Each SCSI device has a lock of its own inside the v-scsi device lock, held for a whole
+ *     command and its backend calls; {@link ScsiDisk#changeMedium} takes it alone, from any
+ *     thread, so a medium never changes under a command.</li>
  * <li>Leaf locks: the {@link Xics} monitor (all ICS and ICP state; H_CPPR, H_IPI, H_XIRR,
  *     H_XIRR_X, H_EOI, H_IPOLL and every interrupt source change) and each {@link TceTable}.
  *     Holders of a leaf lock only call {@link CpuState#setExternalIrq}, which takes no lock.</li>
@@ -154,6 +157,8 @@ public final class Machine implements Hypervisor, AutoCloseable {
     private final Nvram nvram;
     private final Vty vty;
     private final VScsi vscsi;
+    /** The SCSI device this machine built for each disk of its configuration. */
+    private final java.util.Map<MachineConfig.Disk, ScsiDisk> disks = new java.util.IdentityHashMap<>();
     private final List<LLan> networks = new ArrayList<>();
     /** Set while a save or load has stopped the network devices' deliveries; see {@link #freezeNetworks}. */
     private volatile boolean networksFrozen;
@@ -401,8 +406,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 }
                 used[id] = true;
             }
+            // Neither a backend nor a file: a drive with removable media that starts empty.
             BlockBackend b = d.backend;
-            if (b == null) {
+            if (b == null && d.file != null) {
                 b = BlockBackend.open(d.file, d.readOnly, !d.persistent);
             }
             String devId = d.deviceId != null ? d.deviceId : "d" + n;
@@ -411,11 +417,14 @@ public final class Machine implements Hypervisor, AutoCloseable {
             try {
                 disk = new ScsiDisk(d.type, b, d.blockSize, pbs, devId, d.serial, 0, id, d.lun);
             } catch (RuntimeException e) {
-                closeQuietly(b, e);
+                if (b != null) {
+                    closeQuietly(b, e);
+                }
                 throw e;
             }
             disk.setLog(log);
             vscsi.addTarget(disk);
+            disks.put(d, disk);
             n++;
         }
 
@@ -525,6 +534,22 @@ public final class Machine implements Hypervisor, AutoCloseable {
 
     public VScsi vscsi() {
         return vscsi;
+    }
+
+    /**
+     * The SCSI device this machine built for {@code disk}, one of the disks of its configuration
+     * ({@link MachineConfig#addDisk}, {@link MachineConfig#addCdrom},
+     * {@link MachineConfig#addRemovableDisk}). For a drive with removable media this is where the
+     * medium is changed while the machine runs: {@link ScsiDisk#changeMedium}.
+     *
+     * @throws IllegalArgumentException if {@code disk} is not a disk of this machine's configuration
+     */
+    public ScsiDisk disk(MachineConfig.Disk disk) {
+        ScsiDisk d = disks.get(disk);
+        if (d == null) {
+            throw new IllegalArgumentException("not a disk of this machine's configuration");
+        }
+        return d;
     }
 
     public Nvram nvram() {
@@ -1094,7 +1119,9 @@ public final class Machine implements Hypervisor, AutoCloseable {
     /**
      * Release the host resources: close the disk backends (deleting snapshot overlays), the NVRAM
      * file, the console backends, the network backends and the added VIO devices
-     * ({@link VioDevice#closeDevice}). Idempotent. The CPUs must not be running. Guest RAM is
+     * ({@link VioDevice#closeDevice}). Of removable media, the one in each drive now is closed;
+     * media taken out earlier are their owner's ({@link ScsiDisk#changeMedium}), and the drives
+     * take no medium afterwards. Idempotent. The CPUs must not be running. Guest RAM is
      * off-heap memory the JVM reclaims once the machine is unreachable.
      *
      * @throws IOException the first failure to close a backend (the others are still closed and
@@ -1128,7 +1155,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
         List<AutoCloseable> all = new ArrayList<>();
         for (ScsiTarget t : vscsi.targets()) {
             if (t instanceof ScsiDisk d) {
-                all.add(d.backend());
+                // The medium in the drive now; from here on the drive is empty and stays so.
+                BlockBackend b = d.detach();
+                if (b != null) {
+                    all.add(b);
+                }
             }
         }
         all.add(nvram::close);
@@ -1165,13 +1196,15 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * loaded), then a {@code "PAPR"} record with the hypervisor state (shutdown state, CAS
      * results, the device tree the guest holds, process table, VPA/SLB shadow/DTL registrations,
      * watchdogs), XICS, RTAS, the DR connectors and every VIO device (CRQ, TCE tables, NVRAM
-     * contents, console input not yet read by the guest, SCSI sense state, network device
+     * contents, console input not yet read by the guest, SCSI sense state with the unit
+     * attentions, ejects and media events the guest has not seen yet, network device
      * registration, receive buffers and filters), then, if the machine has PCI devices, a
      * {@code "PCI "} record with each one's configuration space and own state, and, if it has
      * MMIO regions, an {@code "MMIO"} record with each region handler's own state. Guest RAM
      * and the CPUs are not written here: they belong to {@code PhysicalMemory} and the CPU
      * module, and {@code org.boxtheta.javapower.Emulator#saveState} writes all of it. Disk contents, the
-     * console and the other host resources stay outside the state.
+     * console and the other host resources stay outside the state, and so do removable media:
+     * of the medium in a drive the description only notes the size and write protection.
      *
      * <p>Received frames waiting for the guest's receive buffers are dropped, and the network
      * devices take no frames from their backends from here until a CPU next runs (or the machine
@@ -1224,6 +1257,12 @@ public final class Machine implements Hypervisor, AutoCloseable {
                 if (phbTce != null) {
                     phbTce.saveState(d);
                 }
+                // Optional sections, in the form of the hardware description's: each written
+                // only when there is something in it, so that a machine without writes the
+                // record it always did.
+                if (vscsi.mediaEventsPending()) {
+                    hardwareSection(d, "MEDI", vscsi::saveMediaEvents);
+                }
             });
             if (phb != null && !phb.devices().isEmpty()) {
                 out.record("PCI ", phb::saveState);
@@ -1257,8 +1296,11 @@ public final class Machine implements Hypervisor, AutoCloseable {
             d.writeInt(disk.id());
             d.writeInt(disk.lun());
             d.writeInt(disk.blockSize());
-            d.writeLong(disk.backend().size());
-            d.writeBoolean(disk.backend().readOnly());
+            // The medium: its size, or -1 for an empty drive, and its write protection. Hardware
+            // for a fixed disk; for a drive with removable media only what the guest last saw,
+            // which checkHardware does not compare (see SavedMedium).
+            d.writeLong(disk.mediumBytes());
+            d.writeBoolean(disk.mediumReadOnly());
         }
         // Optional sections: absent without the devices they describe, so that a machine
         // without any writes the description it always did.
@@ -1367,6 +1409,15 @@ public final class Machine implements Hypervisor, AutoCloseable {
      * guest negotiated come from the state, not from this machine's configuration. Watchdogs
      * resume with the time they had left.
      *
+     * <p>Fixed disks must have the size and write protection they were saved with. Drives with
+     * removable media ({@link ScsiDisk.Type#removable}) need not hold the medium they were saved
+     * with: this machine's drives keep what they hold now. Where that is a medium of another size
+     * or write protection, a medium in a drive saved empty, or none in a drive saved with one,
+     * the medium was changed while the machine was saved, and the guest is told as for
+     * {@link ScsiDisk#changeMedium} when it runs again. A different medium of the same size and
+     * protection cannot be told apart from the saved one: put it in with
+     * {@link ScsiDisk#changeMedium} after the load.
+     *
      * <p>No CPU may be running. If loading fails after the check, the machine is left partly
      * loaded and must be reset or loaded again before it runs.
      *
@@ -1375,7 +1426,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
      */
     public void loadState(org.boxtheta.javapower.core.StateInput in) throws IOException {
         synchronized (lock) {
-            checkHardware(in.record("PHW "));
+            List<SavedMedium> media = checkHardware(in.record("PHW "));
             freezeNetworks();
             org.boxtheta.javapower.core.StateInput.Record r = in.record("PAPR");
             int sd = r.readUnsignedByte();
@@ -1448,6 +1499,26 @@ public final class Machine implements Hypervisor, AutoCloseable {
             if (phbTce != null) {
                 phbTce.loadState(r);
             }
+            byte[] rest = new byte[r.remaining()];
+            r.readFully(rest);
+            try {
+                java.util.Map<String, java.io.DataInputStream> more = hardwareSections(rest);
+                java.io.DataInputStream events = more.remove("MEDI");
+                if (events != null && (!vscsi.loadMediaEvents(events) || events.available() != 0)) {
+                    throw r.corrupt("media events");
+                }
+                if (!more.isEmpty()) {
+                    throw r.corrupt("state this version of javapower does not know: section "
+                            + more.keySet().iterator().next().trim());
+                }
+            } catch (java.io.EOFException e) {
+                throw r.corrupt("a state section ends early");
+            }
+            // The drives have the state they were saved with; now tell them of media that are
+            // not the ones they were saved with.
+            for (SavedMedium sm : media) {
+                sm.disk().mediumAfterLoad(sm.bytes(), sm.readOnly());
+            }
             if (phb != null && !phb.devices().isEmpty()) {
                 phb.loadState(in.record("PCI "));
             }
@@ -1480,10 +1551,25 @@ public final class Machine implements Hypervisor, AutoCloseable {
         }
     }
 
-    private void checkHardware(org.boxtheta.javapower.core.StateInput.Record r) throws IOException {
+    /**
+     * The medium a drive with removable media held when a state was saved: its size in bytes
+     * (-1: the drive was empty) and write protection. Media are not hardware, so this need not
+     * match the drive's medium now; the drive compares the two after the load and tells the
+     * guest of a change ({@link ScsiDisk#mediumAfterLoad}).
+     */
+    private record SavedMedium(ScsiDisk disk, long bytes, boolean readOnly) {}
+
+    /**
+     * Compare the saved hardware description with this machine's.
+     *
+     * @return the media the drives with removable media were saved with
+     * @throws org.boxtheta.javapower.core.StateMismatchException if the hardware differs
+     */
+    private List<SavedMedium> checkHardware(org.boxtheta.javapower.core.StateInput.Record r) throws IOException {
         java.io.ByteArrayOutputStream mine = new java.io.ByteArrayOutputStream();
         saveHardware(new java.io.DataOutputStream(mine));
         List<String> diff = new ArrayList<>();
+        List<SavedMedium> media = new ArrayList<>();
         java.io.DataInputStream cur = new java.io.DataInputStream(new java.io.ByteArrayInputStream(mine.toByteArray()));
         compare(diff, "CPUs", r.readInt(), cur.readInt());
         compare(diff, "bytes of RAM", r.readLong(), cur.readLong());
@@ -1495,12 +1581,23 @@ public final class Machine implements Hypervisor, AutoCloseable {
         compare(diff, "SCSI devices", n, m);
         for (int i = 0; i < Math.min(n, m); i++) {
             String what = "SCSI device " + i + ": ";
-            compare(diff, what + "type", r.readUTF(), cur.readUTF());
+            String savedType = r.readUTF();
+            compare(diff, what + "type", savedType, cur.readUTF());
             compare(diff, what + "target id", r.readInt(), cur.readInt());
             compare(diff, what + "LUN", r.readInt(), cur.readInt());
             compare(diff, what + "block size", r.readInt(), cur.readInt());
-            compare(diff, what + "bytes", r.readLong(), cur.readLong());
-            compare(diff, what + "read-only", r.readBoolean(), cur.readBoolean());
+            long savedBytes = r.readLong();
+            long bytes = cur.readLong();
+            boolean savedReadOnly = r.readBoolean();
+            boolean readOnly = cur.readBoolean();
+            ScsiDisk disk = (ScsiDisk) vscsi.targets().get(i);
+            if (disk.type().removable() && disk.type().name().equals(savedType)) {
+                // A removable medium is not hardware: another one, or none, is a medium change.
+                media.add(new SavedMedium(disk, savedBytes, savedReadOnly));
+            } else {
+                compare(diff, what + "bytes", savedBytes, bytes);
+                compare(diff, what + "read-only", savedReadOnly, readOnly);
+            }
         }
         // The optional sections follow the disks; with another disk count they cannot be found.
         if (n == m) {
@@ -1523,6 +1620,7 @@ public final class Machine implements Hypervisor, AutoCloseable {
             throw new org.boxtheta.javapower.core.StateMismatchException(
                     "the machine state was saved from different hardware: " + String.join("; ", diff));
         }
+        return media;
     }
 
     /** Compare the added VIO device sections of two hardware descriptions; null stands for none. */

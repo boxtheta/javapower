@@ -49,7 +49,17 @@ public final class PhysicalMemory extends MemoryBase {
     private static final VarHandle I_NATIVE = ValueLayout.JAVA_INT.varHandle();
     private static final VarHandle L_NATIVE = ValueLayout.JAVA_LONG.varHandle();
 
+    /**
+     * Bytes allocated after the RAM, so that the JIT's accesses through {@link #jitBacking},
+     * which it masks to the RAM size when that is a power of two, are in bounds whatever is
+     * masked: such an access then needs no bounds check.
+     */
+    private static final long JIT_PAD = 16;
+
+    /** The RAM: the bounds of the accessors below. A slice of {@link #padded}. */
     private final MemorySegment ram;
+    /** The RAM and {@link #JIT_PAD} bytes after it. */
+    private final MemorySegment padded;
 
     /**
      * Allocate {@code size} bytes of zeroed guest RAM.
@@ -60,22 +70,24 @@ public final class PhysicalMemory extends MemoryBase {
     public PhysicalMemory(long size) {
         super(size);
         try {
-            this.ram = Arena.ofAuto().allocate(size, 4096);
+            this.padded = Arena.ofAuto().allocate(size + JIT_PAD, 4096);
         } catch (OutOfMemoryError e) {
             OutOfMemoryError err = new OutOfMemoryError(noMemory(size, e));
             err.initCause(e);
             throw err;
         }
+        this.ram = padded.asSlice(0, size);
     }
 
     /**
      * For javapower's own execution engines only, not part of the supported API: the object
-     * holding the RAM, whose type depends on the Java version (here the {@code MemorySegment}).
-     * Writes made through it bypass code-write tracking.
+     * holding the RAM, whose type depends on the Java version (here a {@code MemorySegment},
+     * which is a few bytes longer than the RAM). Writes made through it bypass code-write
+     * tracking.
      */
     @Override
     public Object jitBacking() {
-        return ram;
+        return padded;
     }
 
     public int read8(long a) { return ram.get(ValueLayout.JAVA_BYTE, a) & 0xff; }

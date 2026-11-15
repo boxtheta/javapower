@@ -42,10 +42,12 @@ import org.boxtheta.javapower.core.Spr;
  * <p>This module's own handlers are executed inline from a switch in the run loop (see
  * {@link Reg}), so the JIT can inline them; other handlers are called through {@link Op#exec}.
  *
- * <p>Hot guest code is translated to JVM bytecode in two tiers (on by default, see
- * {@link #compileBlocks}): straight-line blocks that call the instruction handlers
- * ({@link BlockCompiler}), and, for entries that stay hot, regions of a page with guest registers in
- * JVM locals and inline memory access ({@link RegionCompiler}). Compiled code runs only where it
+ * <p>Hot guest code is translated to JVM bytecode (on by default, see {@link #compileBlocks}) by
+ * one of two compilers: regions of a page with guest registers in JVM locals and inline memory
+ * access ({@link RegionCompiler}), which is what hot entries become by default, and
+ * straight-line blocks that call the instruction handlers ({@link BlockCompiler}), for entries
+ * no region can be built for, with regions off, or as a first tier before regions (see
+ * {@link #regionThreshold}). Compiled code runs only where it
  * is exactly equivalent to interpreting: its page's code generation (see
  * {@link PhysicalMemory#watchCode}) must not have changed since its words were last checked
  * (otherwise they are compared again), its first block must fit before the end of the current
@@ -942,10 +944,18 @@ public final class Interpreter {
     int blockThreshold = 20_000;
     /**
      * Executions of a block's entry before it is compiled as a second-tier region. At or below
-     * {@link #blockThreshold}, hot entries become regions directly; above it, they first run as
-     * first-tier blocks (cheap to compile) and are promoted when they reach this count.
+     * {@link #blockThreshold}, the default, hot entries become regions directly, and first-tier
+     * blocks are only what is left when no region can be built; above it, entries first run as
+     * first-tier blocks and are promoted when they reach this count.
+     *
+     * <p>Regions directly is the faster arrangement since a region's rare paths stopped being
+     * branches of its code (see {@link RegionCompiler}): the host JIT then compiles a region
+     * about as fast as the first-tier block it replaces and seldom twice, and the block was
+     * several times slower to run. A FreeBSD kernel boot spends a quarter less time than with
+     * blocks first and regions at 200 000; from 2 000 to 20 000 the count makes little
+     * difference, and lower ones compile more than the host JIT keeps up with.
      */
-    int regionThreshold = 200_000;
+    int regionThreshold = 20_000;
     /** Largest region, in instructions (smaller regions compile faster; see {@link RegionCompiler#MAX_INSNS}). */
     int regionMaxInsns = 64;
     /**
@@ -969,6 +979,18 @@ public final class Interpreter {
     /** Block key bits for the current chunk: the MSR bits compiled code depends on (RegionCompiler.mode). */
     private int blockMode;
     private final Block[] blocks = new Block[1 << BLOCK_TABLE_BITS];
+    /**
+     * Compiled code {@link #runBlock} may run without a second look, by a hash of its entry's
+     * real address: code that {@link #runBlockSlow} ran and that no longer counts runs towards
+     * a promotion. What must hold for a run (same real address and mode, room in the chunk, code
+     * unchanged) is checked against fields of the code itself, which the call has to read
+     * anyway; an entry never says anything about the effective address, on which compiled code
+     * does not depend, nor about {@link #blocks}, which may have dropped the entry's block.
+     * The table is small and dense so that it stays in the host's cache when the guest's
+     * profile is flat, which {@link #blocks} and the objects behind it do not.
+     */
+    private final CompiledBlock[] fastRun = new CompiledBlock[1 << FAST_BITS];
+    private static final int FAST_BITS = 14;
     /** Execution counts of block entries without a table entry, by table index (collisions add up). */
     private final int[] heat = new int[1 << BLOCK_TABLE_BITS];
 
@@ -984,8 +1006,6 @@ public final class Interpreter {
         final long pa;
         /** First tier: the number of instructions; region: the length of its entry block. */
         final int n;
-        /** First tier: the real address just past the block (the store guard's end). */
-        final long paEnd;
         /** The words the code covers, as raw memory (little-endian ints) from rawPa. */
         final long rawPa;
         final int[] rawWords;
@@ -997,12 +1017,13 @@ public final class Interpreter {
          */
         volatile int checkedAt = -1;
 
-        Code(CompiledBlock run, boolean region, long pa, int n, long paEnd, long rawPa, int[] rawWords, int gen) {
+        Code(CompiledBlock run, boolean region, long pa, int n, long rawPa, int[] rawWords, int gen) {
             this.run = run;
             this.region = region;
             this.pa = pa;
             this.n = n;
-            this.paEnd = paEnd;
+            run.region = region;
+            run.n = n;
             this.rawPa = rawPa;
             this.rawWords = rawWords;
             this.gen = gen;
@@ -1036,12 +1057,51 @@ public final class Interpreter {
 
     /**
      * At an instruction that may start a block (effective address {@code pc}, real address
-     * {@code pa}, page already translated by the run loop): count it, compile it once hot, and run
-     * its compiled code if that is exactly equivalent to interpreting from here, i.e. the code
-     * words in memory are still the ones it was built from and the code's first block fits before
-     * the end of the chunk. Returns {@link #NO_BLOCK} or the code's {@link CompiledBlock#run} result.
+     * {@code pa}, page already translated by the run loop): run its compiled code if that is
+     * exactly equivalent to interpreting from here, i.e. the code words in memory are still the
+     * ones it was built from and the code's first block fits before the end of the chunk.
+     * Returns {@link #NO_BLOCK} or the code's {@link CompiledBlock#run} result.
+     *
+     * <p>This is the path of code that ran before and has not been written since (see
+     * {@link #fastRun}); everything else is {@link #runBlockSlow}.
      */
     private int runBlock(long pc, long pa) {
+        CompiledBlock run = fastRun[fastIndex(pa)];
+        if (run != null && run.key == CompiledBlock.key(pa, blockMode) && s.icount + run.n <= chunkEnd
+                && run.checkedAt == pm.codeWriteCount()) {
+            return enter(run, pa);
+        }
+        return runBlockSlow(pc, pa);
+    }
+
+    private static int fastIndex(long pa) {
+        return ((int) (pa >>> 2) * 0x9E3779B1) >>> (32 - FAST_BITS);
+    }
+
+    /**
+     * Run compiled code entered at real address {@code pa}, with the MMU's store guard on it. The
+     * guard stays set afterwards (also when a RuntimeException escapes): it means nothing until
+     * the next compiled code sets it.
+     */
+    private int enter(CompiledBlock run, long pa) {
+        RadixMmu m = mmu;
+        if (run.region) {
+            m.guardLo = pa & ~0xfffL; // a region stops after any store into its page
+            m.guardHi = (pa & ~0xfffL) + 0x1000;
+        } else {
+            m.guardLo = pa;
+            m.guardHi = pa + 4L * run.n;
+        }
+        m.guardHit = false;
+        blocksRun++;
+        return run.run(s, this);
+    }
+
+    /**
+     * {@link #runBlock} for an entry that is not in {@link #fastRun} or needs a second look:
+     * count it, compile it once hot, check that its code is current, promote it, and run it.
+     */
+    private int runBlockSlow(long pc, long pa) {
         int h = ((int) (pa >>> 2) ^ (int) (pc >>> 14)) & ((1 << BLOCK_TABLE_BITS) - 1);
         Block b = blocks[h];
         if (b == null || b.pa != pa || b.ea != pc || b.mode != blockMode) {
@@ -1094,22 +1154,13 @@ public final class Interpreter {
                 return NO_BLOCK;
             }
         }
-        // A RuntimeException escaping run() leaves the guard set; that can only make later
-        // blocks stop early, which is always safe.
-        RadixMmu m = mmu;
-        if (c.region) {
-            m.guardLo = pa & ~0xfffL; // a region stops after any store into its page
-            m.guardHi = (pa & ~0xfffL) + 0x1000;
-        } else {
-            m.guardLo = pa;
-            m.guardHi = c.paEnd;
+        // The code is current (isCurrent). First-tier code that may still be promoted keeps
+        // coming here, which counts its runs.
+        if (c.region || b.noRegion || !compileRegions) {
+            c.run.key = CompiledBlock.key(pa, b.mode);
+            fastRun[fastIndex(pa)] = c.run;
         }
-        blocksRun++;
-        int r = c.run.run(s, this);
-        m.guardLo = 0;
-        m.guardHi = 0;
-        m.guardHit = false;
-        return r;
+        return enter(c.run, pa);
     }
 
     /** Install a table entry for code the domain already holds for this entry, if any is current. */
@@ -1156,10 +1207,12 @@ public final class Interpreter {
     private boolean isCurrent(Code c) {
         int w = pm.codeWriteCount();
         if (c.checkedAt == w) {
+            c.run.checkedAt = w;
             return true;
         }
         if (pm.codeGeneration(c.pa) == c.gen || revalidate(c)) {
             c.checkedAt = w;
+            c.run.checkedAt = w;
             return true;
         }
         return false;
@@ -1277,7 +1330,7 @@ public final class Interpreter {
         long mask = (b.mode & RegionCompiler.MODE_SF) != 0 ? -1L : 0xffffffffL;
         CompiledBlock run = BlockCompiler.compile(b.ea, mask, words, slots, n, ops);
         blocksCompiled++;
-        return new Code(run, false, pa, n, pa + 4L * n, pa, java.util.Arrays.copyOf(raw, n), gen);
+        return new Code(run, false, pa, n, pa, java.util.Arrays.copyOf(raw, n), gen);
     }
 
     /**
@@ -1323,7 +1376,7 @@ public final class Interpreter {
         }
         regionsCompiled++;
         regionInsns += r.insns();
-        return new Code(r.code(), true, b.pa, r.entryLen(), 0, page + r.spanLo(),
+        return new Code(r.code(), true, b.pa, r.entryLen(), page + r.spanLo(),
                 java.util.Arrays.copyOfRange(raw, r.spanLo() >>> 2, r.spanHi() >>> 2), gen);
     }
 

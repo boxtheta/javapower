@@ -19,7 +19,10 @@ abstract class MemoryBase {
     private static final VarHandle CODE_GEN = MethodHandles.arrayElementVarHandle(int[].class);
 
     final long size;
-    /** Per 4 KiB page: nonzero while some engine holds code translated from it. */
+    /**
+     * Per 4 KiB page: nonzero while some engine holds code translated from it. The length is a
+     * power of two (see {@link #jitCodePages}); the entries past the last page stay zero.
+     */
     private final byte[] codePages;
     /** Per 4 KiB page: the code generation. */
     private final int[] codeGens;
@@ -32,7 +35,7 @@ abstract class MemoryBase {
         }
         this.size = size;
         int pages = (int) ((size + 4095) >>> CODE_PAGE_SHIFT);
-        this.codePages = new byte[pages];
+        this.codePages = new byte[pages <= 1 ? 1 : Integer.highestOneBit(pages - 1) << 1];
         this.codeGens = new int[pages];
     }
 
@@ -65,6 +68,16 @@ abstract class MemoryBase {
      * passes it to generated code as a constant.
      */
     public abstract Object jitBacking();
+
+    /**
+     * For javapower's own execution engines only, not part of the supported API: the flags
+     * behind {@link #isCodePage}, one byte per 4 KiB page, nonzero while the page is flagged. The
+     * JIT reads them from compiled code, which holds the array as a constant; its length is a
+     * power of two, so an index masked with it needs no range check. Engines never write it.
+     */
+    public byte[] jitCodePages() {
+        return codePages;
+    }
 
     /** Copy {@code len} bytes of RAM at {@code addr} into {@code dst}; documented in {@code PhysicalMemory}. */
     public abstract void read(long addr, byte[] dst, int off, int len);

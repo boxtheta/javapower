@@ -9,15 +9,15 @@ import java.nio.ByteOrder;
 import org.boxtheta.javapower.core.PhysicalMemory;
 
 /**
- * Guest RAM accesses for code {@link RegionCompiler} generates, which the JIT inlines into the
- * region's method. This class is multi-release, like {@link PhysicalMemory}: the generated code
- * passes {@link #backing} (held as a constant in the region's class data) to these helpers, and
- * {@link #TYPE} is its type, so the code is built for whichever version is loaded.
+ * Guest RAM accesses for code {@link RegionCompiler} generates (through {@link JitRt}'s loads and
+ * stores), which the JIT inlines into the region's method. This class is multi-release, like
+ * {@link PhysicalMemory}: the generated code holds {@link #backing} as a constant in the region's
+ * class data and passes it to these helpers as an {@code Object}, so one {@link JitRt} serves
+ * whichever version is loaded; {@link #TYPE} is its actual type.
  *
  * <p>Loads return the value zero-extended (8, 16 bits) or sign-extended (32 bits); callers
- * zero-extend where the instruction does. Stores return whether the region must stop after the
- * instruction: the store hit translated code (any CPU's, which is then invalidated) or the
- * region's own page {@code page}.
+ * zero-extend where the instruction does. Stores write the low bytes of the value and nothing
+ * else: there is no code-write tracking here, callers keep away from pages that need it.
  *
  * <p>This version (Java 21) accesses {@link PhysicalMemory}'s heap chunks ({@code byte[][]},
  * see {@link PhysicalMemory#jitBacking}) through byte-array views. An access that crosses from
@@ -26,7 +26,7 @@ import org.boxtheta.javapower.core.PhysicalMemory;
 final class RamAccess {
     private RamAccess() {}
 
-    /** Type of {@link #backing}, as generated code declares it. */
+    /** Type of {@link #backing}. */
     static final ClassDesc TYPE = ConstantDescs.CD_byte.arrayType(2);
 
     private static final int SHIFT = 30;
@@ -62,7 +62,8 @@ final class RamAccess {
         return pm.jitBacking();
     }
 
-    private static byte[] chunk(byte[][] c, long pa) {
+    private static byte[] chunk(Object ram, long pa) {
+        byte[][] c = (byte[][]) ram;
         return c[(int) Math.min(pa >>> SHIFT, Integer.MAX_VALUE)];
     }
 
@@ -70,7 +71,7 @@ final class RamAccess {
         return BIAS + ((int) pa & MASK);
     }
 
-    private static long slowBe(byte[][] c, long pa, int n) {
+    private static long slowBe(Object c, long pa, int n) {
         long v = 0;
         for (int k = 0; k < n; k++) {
             v = (v << 8) | (chunk(c, pa + k)[index(pa + k)] & 0xff);
@@ -78,17 +79,17 @@ final class RamAccess {
         return v;
     }
 
-    private static void slowStoreBe(byte[][] c, long pa, int n, long v) {
+    private static void slowStoreBe(Object c, long pa, int n, long v) {
         for (int k = n - 1; k >= 0; k--, v >>>= 8) {
             chunk(c, pa + k)[index(pa + k)] = (byte) v;
         }
     }
 
-    static long ld8(byte[][] c, long pa) {
+    static long ld8(Object c, long pa) {
         return chunk(c, pa)[index(pa)] & 0xffL;
     }
 
-    static long ld16le(byte[][] c, long pa) {
+    static long ld16le(Object c, long pa) {
         try {
             return (short) S_LE.get(chunk(c, pa), index(pa)) & 0xffffL;
         } catch (IndexOutOfBoundsException e) {
@@ -96,7 +97,7 @@ final class RamAccess {
         }
     }
 
-    static long ld16be(byte[][] c, long pa) {
+    static long ld16be(Object c, long pa) {
         try {
             return (short) S_BE.get(chunk(c, pa), index(pa)) & 0xffffL;
         } catch (IndexOutOfBoundsException e) {
@@ -104,7 +105,7 @@ final class RamAccess {
         }
     }
 
-    static long ld32le(byte[][] c, long pa) {
+    static long ld32le(Object c, long pa) {
         try {
             return (int) I_LE.get(chunk(c, pa), index(pa));
         } catch (IndexOutOfBoundsException e) {
@@ -112,7 +113,7 @@ final class RamAccess {
         }
     }
 
-    static long ld32be(byte[][] c, long pa) {
+    static long ld32be(Object c, long pa) {
         try {
             return (int) I_BE.get(chunk(c, pa), index(pa));
         } catch (IndexOutOfBoundsException e) {
@@ -120,7 +121,7 @@ final class RamAccess {
         }
     }
 
-    static long ld64le(byte[][] c, long pa) {
+    static long ld64le(Object c, long pa) {
         try {
             return (long) L_LE.get(chunk(c, pa), index(pa));
         } catch (IndexOutOfBoundsException e) {
@@ -128,7 +129,7 @@ final class RamAccess {
         }
     }
 
-    static long ld64be(byte[][] c, long pa) {
+    static long ld64be(Object c, long pa) {
         try {
             return (long) L_BE.get(chunk(c, pa), index(pa));
         } catch (IndexOutOfBoundsException e) {
@@ -136,71 +137,55 @@ final class RamAccess {
         }
     }
 
-    /** After a direct store of {@code size} bytes at {@code pa}: track it, and say whether the region must stop. */
-    private static boolean stored(PhysicalMemory pm, long pa, int size, long page) {
-        boolean code = pm.isCodePage(pa);
-        if (code) {
-            pm.invalidateCode(pa, size);
-        }
-        return code || ((pa ^ page) >>> 12) == 0;
-    }
-
-    static boolean st8(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st8(Object c, long pa, long v) {
         chunk(c, pa)[index(pa)] = (byte) v;
-        return stored(pm, pa, 1, page);
     }
 
-    static boolean st16le(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st16le(Object c, long pa, long v) {
         try {
             S_LE.set(chunk(c, pa), index(pa), (short) v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 2, Short.reverseBytes((short) v));
         }
-        return stored(pm, pa, 2, page);
     }
 
-    static boolean st16be(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st16be(Object c, long pa, long v) {
         try {
             S_BE.set(chunk(c, pa), index(pa), (short) v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 2, v);
         }
-        return stored(pm, pa, 2, page);
     }
 
-    static boolean st32le(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st32le(Object c, long pa, long v) {
         try {
             I_LE.set(chunk(c, pa), index(pa), (int) v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 4, Integer.reverseBytes((int) v));
         }
-        return stored(pm, pa, 4, page);
     }
 
-    static boolean st32be(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st32be(Object c, long pa, long v) {
         try {
             I_BE.set(chunk(c, pa), index(pa), (int) v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 4, v);
         }
-        return stored(pm, pa, 4, page);
     }
 
-    static boolean st64le(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st64le(Object c, long pa, long v) {
         try {
             L_LE.set(chunk(c, pa), index(pa), v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 8, Long.reverseBytes(v));
         }
-        return stored(pm, pa, 8, page);
     }
 
-    static boolean st64be(byte[][] c, PhysicalMemory pm, long pa, long v, long page) {
+    static void st64be(Object c, long pa, long v) {
         try {
             L_BE.set(chunk(c, pa), index(pa), v);
         } catch (IndexOutOfBoundsException e) {
             slowStoreBe(c, pa, 8, v);
         }
-        return stored(pm, pa, 8, page);
     }
 }

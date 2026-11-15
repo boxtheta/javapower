@@ -452,15 +452,22 @@ class BlockCompilerTest {
         for (int tier : new int[] {BLOCKS, REGIONS}) {
             Machine a = new Machine(INTERP, true, true);
             Machine b = new Machine(tier, true, true);
+            long compiled = 0;
+            long runs = 0;
             for (Machine m : List.of(a, b)) {
                 m.load(CODE, loop(300, MIX));
                 m.s.gpr[6] = DATA;
                 m.cpu.run(20_000);
+                compiled = m.cpu.blocksCompiled + m.cpu.regionsCompiled;
+                runs = m.cpu.blocksRun;
                 m.s.stopRequested = false;
                 m.s.pc = 0xc000000000000000L | CODE;
                 m.cpu.run(20_000);
             }
-            assertTrue(b.cpu.sharedHits > 0, "tier " + tier + ": code not reused at the second address");
+            // The code is found again under its real address: through the run loop's table when
+            // both addresses share an entry of it, as here, else in the domain's cache.
+            assertTrue(b.cpu.blocksRun > runs, "tier " + tier + ": code not reused at the second address");
+            assertEquals(compiled, b.cpu.blocksCompiled + b.cpu.regionsCompiled, "tier " + tier + ": recompiled");
             assertEquals(1, b.cpu.dupCompiles == 0 ? 1 : 0, "tier " + tier + ": recompiled");
             compare(a, b, "tier " + tier + ": ");
         }

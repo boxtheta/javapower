@@ -34,8 +34,9 @@ import org.boxtheta.javapower.cpu.internal.asm.Label;
  * on entry, written back on every exit. Common integer, branch, CR and load/store instructions
  * are generated directly; their semantics mirror the handlers in {@link Alu}, {@link LoadStore},
  * {@link BranchInsns} and {@link Interpreter} exactly. Loads and stores take the software TLB's
- * hit path inline ({@link JitRt#xlate}) and fall back to the MMU's full path for everything else
- * (misses, page-crossing accesses, faults), so TLB contents evolve exactly as when interpreting.
+ * hit path inline ({@link JitRt#xlate}, through {@link JitRt}'s loads and stores) and fall back
+ * to the MMU's full path for everything else (misses, page-crossing accesses, faults, stores to
+ * pages holding translated code), so TLB contents evolve exactly as when interpreting.
  * Every other instruction calls its handler, as the run loop would: locals the handler may read
  * are written back first, {@code pc}, {@code npc} and {@code icount} are set, and afterwards the
  * cached values are treated as stale and reloaded before their next use.
@@ -43,14 +44,15 @@ import org.boxtheta.javapower.cpu.internal.asm.Label;
  * <h2>Exactness</h2>
  * <ul>
  * <li>Instruction count and chunk budget: every basic block starts with a check that it fits
- * before {@link Interpreter#chunkEnd}; if not, the region exits and the run loop interprets the
- * rest of the chunk. Asynchronous interrupts and decrementer timing therefore happen at exactly
- * the instruction counts they would when interpreting.
+ * before {@link Interpreter#chunkEnd} ({@link JitRt#budget}); if not, the region exits and the
+ * run loop interprets the rest of the chunk. Asynchronous interrupts and decrementer timing
+ * therefore happen at exactly the instruction counts they would when interpreting.
  * <li>After a handler call the region exits if the handler changed {@code npc} (a branch,
  * {@code rfid}), set {@link Interpreter#recheck} (MSR, timer, TLB changes: the run loop ends its
  * chunk there too) or stored into the region's page (the MMU's store guard). Directly generated
- * stores check the page they hit: a store into translated code (any CPU's, see
- * {@link PhysicalMemory#watchCode}) or into the region's own page ends the region after it.
+ * stores check the page they hit: one into translated code (any CPU's, see
+ * {@link PhysicalMemory#watchCode}) goes through the MMU, which tracks it, and one into the
+ * region's own page also ends the region after it ({@link JitRt#leaveIf}).
  * <li>A fault (a {@link org.boxtheta.javapower.core.PpcException} from a slow path or handler)
  * is caught by one handler that writes back the locals, sets {@code pc} and {@code icount} of
  * the faulting instruction from tables indexed by a site number, and delivers it as the run loop
@@ -60,6 +62,17 @@ import org.boxtheta.javapower.cpu.internal.asm.Label;
  * their last instruction, so a CPU sees code changed by another CPU (which advances the page's
  * code generation) at the latest after its next context-synchronising instruction.
  * </ul>
+ *
+ * <h2>Rare paths</h2>
+ * The host JIT compiles a branch of the generated method that has not been taken while it
+ * profiled the method as a trap, and compiles the method again when the branch is first taken.
+ * A region's rare paths would each cost such a recompilation, so they are not branches of the
+ * generated code: the MMU's full path is behind a branch in {@link JitRt}'s loads and stores,
+ * which every region shares and whose profile has long seen both ways, and the block budget and
+ * stores into the region's page leave through an exception ({@link JitRt.Leave}) that
+ * {@link JitRt} throws and the region catches, in one handler that writes back every cached
+ * value, sets {@code pc} and {@code icount} from the site tables and returns. Inlined, the throw
+ * is a jump to that handler.
  *
  * <p>A region is compiled for one mode: MSR[LE], MSR[SF], MSR[DR] and MSR[PR] (see {@link #mode})
  * and one real page; the run loop uses it only when entering at the same effective address,
@@ -103,11 +116,10 @@ final class RegionCompiler {
     private static final ClassDesc CD_CPU = ClassDesc.of("org.boxtheta.javapower.core.CpuState");
     private static final ClassDesc CD_OP = ClassDesc.of("org.boxtheta.javapower.core.Op");
     private static final ClassDesc CD_PPCEX = ClassDesc.of("org.boxtheta.javapower.core.PpcException");
-    private static final ClassDesc CD_PM = ClassDesc.of("org.boxtheta.javapower.core.PhysicalMemory");
+    private static final ClassDesc CD_BARR = ConstantDescs.CD_byte.arrayType();
     private static final ClassDesc CD_INTERP = ClassDesc.of("org.boxtheta.javapower.cpu.Interpreter");
     private static final ClassDesc CD_MMU = ClassDesc.of("org.boxtheta.javapower.cpu.RadixMmu");
     private static final ClassDesc CD_RT = ClassDesc.of("org.boxtheta.javapower.cpu.JitRt");
-    private static final ClassDesc CD_RAM_ACCESS = ClassDesc.of("org.boxtheta.javapower.cpu.RamAccess");
     private static final ClassDesc CD_REGION = ClassDesc.of("org.boxtheta.javapower.cpu.Region");
     private static final ClassDesc CD_LONG = ClassDesc.of("java.lang.Long");
     private static final ClassDesc CD_INT = ClassDesc.of("java.lang.Integer");
@@ -125,13 +137,10 @@ final class RegionCompiler {
     private static final MethodTypeDesc MTD_I_J = MethodTypeDesc.of(CD_int, CD_long);
     private static final MethodTypeDesc MTD_CR0 = MethodTypeDesc.of(CD_int, CD_int, CD_long, CD_int);
     private static final MethodTypeDesc MTD_CMP = MethodTypeDesc.of(CD_int, CD_int, CD_int, CD_long, CD_long, CD_int);
-    private static final MethodTypeDesc MTD_XLATE =
-            MethodTypeDesc.of(CD_long, CD_LARR, CD_LARR, CD_IARR, CD_long, CD_int, CD_int, CD_int);
-    private static final MethodTypeDesc MTD_LD = MethodTypeDesc.of(CD_long, RamAccess.TYPE, CD_long);
-    private static final MethodTypeDesc MTD_ST =
-            MethodTypeDesc.of(CD_boolean, RamAccess.TYPE, CD_PM, CD_long, CD_long, CD_long);
-    private static final MethodTypeDesc MTD_RD = MethodTypeDesc.of(CD_long, CD_MMU, CD_long);
-    private static final MethodTypeDesc MTD_WR = MethodTypeDesc.of(CD_void, CD_MMU, CD_long, CD_long);
+    private static final ClassDesc CD_OBJECT = ConstantDescs.CD_Object;
+    private static final ClassDesc CD_LEAVE = ClassDesc.of("org.boxtheta.javapower.cpu.JitRt$Leave");
+    private static final MethodTypeDesc MTD_BUDGET = MethodTypeDesc.of(CD_void, CD_long, CD_long, CD_long);
+    private static final MethodTypeDesc MTD_LEAVE_IF = MethodTypeDesc.of(CD_void, CD_boolean);
     private static final MethodTypeDesc MTD_MFOCRF = MethodTypeDesc.of(CD_long, CD_int, CD_int, CD_long);
 
     // Basic block terminators.
@@ -664,6 +673,8 @@ final class RegionCompiler {
         boolean hasMem;
         final int[] slot = new int[NVAL];
         int gprs;
+        /** Local: {@code s.spr}, if CFAR is cached. */
+        int sprs;
         /** Local: the effective address of the page at run time (from s.pc at entry). */
         int pb;
         int ic;
@@ -672,8 +683,7 @@ final class RegionCompiler {
         int at;
         int wb;
         int mmu;
-        int tag;
-        int addend;
+        int tlb;
         int epoch;
         int tEa;
         int tPa;
@@ -683,10 +693,9 @@ final class RegionCompiler {
         long dirty;
         long stale;
         Label tail;
-        final List<Runnable> stubs = new ArrayList<>();
 
         static final int CD_RAM_IDX = 0;
-        static final int CD_PM_IDX = 1;
+        static final int CD_CODE_IDX = 1;
         static final int CD_PCS_IDX = 2;
         static final int CD_OFFS_IDX = 3;
 
@@ -702,7 +711,7 @@ final class RegionCompiler {
             this.entry = entry;
             this.pm = pm;
             classData.add(RamAccess.backing(pm));
-            classData.add(pm);
+            classData.add(pm.jitCodePages());
             classData.add(null); // site pcs, filled in after generation
             classData.add(null); // site offsets
         }
@@ -786,6 +795,7 @@ final class RegionCompiler {
 
         void allocLocals() {
             gprs = cb.allocateLocal(CodeEmitter.REFERENCE);
+            sprs = cb.allocateLocal(CodeEmitter.REFERENCE);
             pb = cb.allocateLocal(CodeEmitter.LONG);
             for (int v = 0; v < NVAL; v++) {
                 slot[v] = (used & g(v)) != 0 ? cb.allocateLocal(isInt(v) ? CodeEmitter.INT : CodeEmitter.LONG) : -1;
@@ -801,8 +811,7 @@ final class RegionCompiler {
             tHit = cb.allocateLocal(CodeEmitter.INT);
             if (hasMem) {
                 mmu = cb.allocateLocal(CodeEmitter.REFERENCE);
-                tag = cb.allocateLocal(CodeEmitter.REFERENCE);
-                addend = cb.allocateLocal(CodeEmitter.REFERENCE);
+                tlb = cb.allocateLocal(CodeEmitter.REFERENCE);
                 epoch = cb.allocateLocal(CodeEmitter.REFERENCE);
             }
         }
@@ -818,7 +827,7 @@ final class RegionCompiler {
                 case OV32 -> cb.aload(1).getfield(CD_CPU, "ov32", CD_int);
                 case CA -> cb.aload(1).getfield(CD_CPU, "ca", CD_int);
                 case CA32 -> cb.aload(1).getfield(CD_CPU, "ca32", CD_int);
-                case CFAR -> cb.aload(1).getfield(CD_CPU, "spr", CD_LARR).loadConstant(Spr.CFAR).laload();
+                case CFAR -> cb.aload(sprs).loadConstant(Spr.CFAR).laload();
                 default -> cb.aload(gprs).loadConstant(v).laload();
             }
         }
@@ -842,8 +851,7 @@ final class RegionCompiler {
                 case OV32 -> cb.aload(1).iload(slot[v]).putfield(CD_CPU, "ov32", CD_int);
                 case CA -> cb.aload(1).iload(slot[v]).putfield(CD_CPU, "ca", CD_int);
                 case CA32 -> cb.aload(1).iload(slot[v]).putfield(CD_CPU, "ca32", CD_int);
-                case CFAR -> cb.aload(1).getfield(CD_CPU, "spr", CD_LARR).loadConstant(Spr.CFAR).lload(slot[v])
-                        .lastore();
+                case CFAR -> cb.aload(sprs).loadConstant(Spr.CFAR).lload(slot[v]).lastore();
                 default -> cb.aload(gprs).loadConstant(v).lload(slot[v]).lastore();
             }
         }
@@ -935,11 +943,20 @@ final class RegionCompiler {
             return classData.size() - 1;
         }
 
-        /** Register a fault site for instruction {@code k} of block {@code b}; returns its number. */
-        int site(Insn in, int k) {
-            sitePc.add(in.pc - pageEa);
+        /**
+         * Register a site, the place a fault or a {@link JitRt.Leave} comes from: instruction
+         * {@code k} of the current block, at {@code pc}. A fault is delivered with that
+         * {@code pc} and {@code k} instructions counted; a leave continues after the instruction,
+         * at {@code pc + 4} with {@code k + 1} counted. Returns the site's number.
+         */
+        int site(long pc, int k) {
+            sitePc.add(pc - pageEa);
             siteOff.add(k);
             return sitePc.size() - 1;
+        }
+
+        int site(Insn in, int k) {
+            return site(in.pc, k);
         }
 
         /**
@@ -962,14 +979,22 @@ final class RegionCompiler {
             allocLocals();
             tail = cb.newLabel();
             Label fault = cb.newLabel();
+            Label leave = cb.newLabel();
             Label tryStart = cb.newLabel();
             Label tryEnd = cb.newLabel();
             cb.exceptionCatch(tryStart, tryEnd, fault, CD_PPCEX);
+            cb.exceptionCatch(tryStart, tryEnd, leave, CD_LEAVE);
             for (BB b : bbs.values()) {
                 b.label = cb.newLabel();
             }
             // Prologue: load the footprint, the budget and the TLB.
+            // The register arrays. Each is first read at the highest index the region uses, the
+            // values unused: every later access, at a constant index no higher, is then one the
+            // JIT knows to be in range.
             cb.aload(1).getfield(CD_CPU, "gpr", CD_LARR).astore(gprs);
+            cb.aload(gprs).loadConstant(31).laload().lstore(tV);
+            cb.aload(1).getfield(CD_CPU, "spr", CD_LARR).astore(sprs);
+            cb.aload(sprs).loadConstant(Spr.CFAR).laload().lstore(tV);
             // Position independence: every address is the page's run-time address plus an offset.
             cb.aload(1).getfield(CD_CPU, "pc", CD_long).loadConstant(~0xfffL).land().lstore(pb);
             for (int v = 0; v < NVAL; v++) {
@@ -984,20 +1009,15 @@ final class RegionCompiler {
             cb.iconst_0().istore(wb);
             cb.lconst_0().lstore(tEa);
             cb.lconst_0().lstore(tPa);
-            cb.lconst_0().lstore(tV);
             cb.iconst_0().istore(tHit);
             if (hasMem) {
                 cb.aload(2).getfield(CD_INTERP, "mmu", CD_MMU).astore(mmu);
-                cb.aload(mmu).getfield(CD_MMU, "tag", CD_LARR).astore(tag);
-                cb.aload(mmu).getfield(CD_MMU, "addend", CD_LARR).astore(addend);
+                cb.aload(mmu).getfield(CD_MMU, "tlb", CD_LARR).astore(tlb);
                 cb.aload(mmu).getfield(CD_MMU, "epoch", CD_IARR).astore(epoch);
             }
             cb.labelBinding(tryStart);
             for (BB b : bbs.values()) {
                 block(b);
-            }
-            for (Runnable r : stubs) {
-                r.run();
             }
             cb.labelBinding(tryEnd);
             // Exit: pc = npc, icount = ic. Values were written back by the jumping site.
@@ -1033,6 +1053,20 @@ final class RegionCompiler {
             cb.iload(at).iaload().i2l().ladd().putfield(CD_CPU, "icount", CD_long);
             cb.aload(2).aload(ex).invokevirtual(CD_INTERP, "blockFault", MTD_FAULT);
             cb.iconst_1().ireturn();
+            // Leave (JitRt.budget, JitRt.leaveIf): every cached value is current at these sites, so
+            // all are written back; then continue after the site's instruction.
+            cb.labelBinding(leave);
+            cb.astore(ex);
+            writebackAll(written);
+            cb.lload(pb);
+            cdConst(CD_PCS_IDX, CD_LARR);
+            cb.iload(at).laload().ladd().loadConstant(4L).ladd();
+            truncate();
+            cb.lstore(npc);
+            cb.lload(ic);
+            cdConst(CD_OFFS_IDX, CD_IARR);
+            cb.iload(at).iaload().i2l().ladd().lconst_1().ladd().lstore(ic);
+            cb.goto_(tail);
         }
 
         /** Leave the region: write back dirty values, set npc from the stack (a long), go to the tail. */
@@ -1079,11 +1113,11 @@ final class RegionCompiler {
             dirty = b.dirtyIn;
             stale = 0;
             int len = b.insns.size();
-            // Budget: the whole block must fit before the end of the chunk.
-            Label ok = cb.newLabel();
-            cb.lload(ic).loadConstant((long) len).ladd().lload(end).lcmp().ifle(ok);
-            exitTo(b.start);
-            cb.labelBinding(ok);
+            // Budget: the whole block must fit before the end of the chunk; else leave, to continue
+            // at the block's first instruction (the site is the instruction before it). Every
+            // cached value is current at a block's start.
+            cb.loadConstant(site(b.start - 4, -1)).istore(at);
+            cb.lload(ic).loadConstant((long) len).lload(end).invokestatic(CD_RT, "budget", MTD_BUDGET);
             int last = b.term == T_FALL ? len : len - 1;
             for (int k = 0; k < last; k++) {
                 insn(b, b.insns.get(k), k);
@@ -1710,103 +1744,62 @@ final class RegionCompiler {
                 cb.lstore(tV);
             }
             faultSite(in, k);
-            boolean order = m.swap ? !le : le;
-            int bits = 8 * m.size;
-            String sfx = m.size == 1 ? "8" : bits + (order ? "le" : "be");
-            Label slow = cb.newLabel();
-            Label done = cb.newLabel();
-            // Fast path: real address or -1.
-            if (dr) {
-                cb.aload(tag).aload(addend).aload(epoch).lload(tEa)
-                        .loadConstant((mode & MODE_PR) != 0 ? 2 : 0)
-                        .loadConstant(m.store ? RadixMmu.STORE : RadixMmu.LOAD)
-                        .loadConstant(m.size)
-                        .invokestatic(CD_RT, "xlate", MTD_XLATE);
-            } else {
-                cb.lload(tEa).loadConstant(pm.size() - m.size).invokestatic(CD_RT, "real", MTD_J_JJ);
+            // JitRt's load or store for the size, byte order and mode:
+            // (ram, [code,] mmu, tlb, epoch, ea, ctx, mask, [value, page,] [swap]), in real mode
+            // (ram, [code,] mmu, ea, limit, mask, [value, page,] [swap]).
+            List<ClassDesc> args = new ArrayList<>();
+            cdConst(CD_RAM_IDX, CD_OBJECT);
+            args.add(CD_OBJECT);
+            if (m.store) {
+                cdConst(CD_CODE_IDX, CD_BARR);
+                args.add(CD_BARR);
             }
-            cb.dup2().lstore(tPa).loadConstant(-1L).lcmp().ifeq(slow);
+            cb.aload(mmu);
+            args.add(CD_MMU);
+            if (dr) {
+                cb.aload(tlb).aload(epoch).lload(tEa).loadConstant((mode & MODE_PR) != 0 ? 2 : 0);
+                args.addAll(List.of(CD_LARR, CD_IARR, CD_long, CD_int));
+            } else {
+                cb.lload(tEa).loadConstant(pm.size() - m.size);
+                args.addAll(List.of(CD_long, CD_long));
+            }
+            cb.loadConstant(Long.bitCount(pm.size()) == 1 ? pm.size() - 1 : -1L);
+            args.add(CD_long);
+            if (m.store) {
+                cb.lload(tV).loadConstant(pagePa);
+                args.addAll(List.of(CD_long, CD_long));
+            }
+            if (m.size > 1) {
+                cb.loadConstant(m.swap ? 1 : 0);
+                args.add(CD_boolean);
+            }
+            String helper = (m.store ? "st" : "ld") + 8 * m.size + (m.size == 1 ? "" : (m.swap ? !le : le) ? "le" : "be")
+                    + (dr ? "" : "r");
+            MethodTypeDesc type = MethodTypeDesc.of(m.store ? CD_boolean : CD_long, args);
             if (!m.store) {
-                cdConst(CD_RAM_IDX, RamAccess.TYPE);
-                cb.lload(tPa).invokestatic(CD_RAM_ACCESS, "ld" + sfx, MTD_LD);
-                cb.labelBinding(done);
-                // stack: raw value (zero-extended for 8/16, sign-extended 32, 64)
+                cb.invokestatic(CD_RT, helper, type);
+                // stack: the value, zero-extended (8, 16 bits) or sign-extended (32 bits)
                 if (m.size == 4 && !m.sign) {
                     cb.loadConstant(0xffffffffL).land();
                 } else if (m.size == 2 && m.sign) {
                     cb.l2i().i2s().i2l();
-                }
-                if (m.swap) {
-                    // byte-reversed loads: the other byte order, zero-extended
-                    if (m.size == 4) {
-                        cb.loadConstant(0xffffffffL).land();
-                    }
                 }
                 set(rt);
                 if (m.update) {
                     cb.lload(tEa);
                     set(ra);
                 }
-                int rd = bits;
-                stubs.add(() -> {
-                    cb.labelBinding(slow);
-                    cb.aload(mmu).lload(tEa).invokestatic(CD_RT, "rd" + rd, MTD_RD);
-                    if (m.swap) {
-                        // The MMU returns the guest-order value; reverse it.
-                        swapValue(m.size);
-                    }
-                    cb.goto_(done);
-                });
             } else {
-                cdConst(CD_RAM_IDX, RamAccess.TYPE);
-                cdConst(CD_PM_IDX, CD_PM);
-                cb.lload(tPa).lload(tV).loadConstant(pagePa).invokestatic(CD_RAM_ACCESS, "st" + sfx, MTD_ST);
+                cb.invokestatic(CD_RT, helper, type);
                 cb.istore(tHit);
-                cb.labelBinding(done);
                 if (m.update) {
                     cb.lload(tEa);
                     set(ra);
                 }
-                // A store into translated code or this page: leave after this instruction.
-                Label cont = cb.newLabel();
-                cb.iload(tHit).ifeq(cont);
-                long target = mask(sf, in.pc + 4);
-                long dirtyAtExit = dirty;
-                int kk = k;
-                Label exit = cb.newLabel();
-                cb.goto_(exit);
-                stubs.add(() -> {
-                    cb.labelBinding(exit);
-                    addIc(kk + 1);
-                    pushPc(target);
-                    cb.lstore(npc);
-                    writebackAll(dirtyAtExit);
-                    cb.goto_(tail);
-                });
-                cb.labelBinding(cont);
-                int wr = bits;
-                stubs.add(() -> {
-                    cb.labelBinding(slow);
-                    cb.aload(mmu).lload(tEa).lload(tV);
-                    if (m.swap) {
-                        swapValue(m.size);
-                    }
-                    cb.invokestatic(CD_RT, "wr" + wr, MTD_WR);
-                    cb.aload(mmu).getfield(CD_MMU, "guardHit", CD_boolean).istore(tHit);
-                    cb.goto_(done);
-                });
-            }
-        }
-
-        /** Reverse the bytes of the {@code size}-byte value (a long) on the stack, zero-extended. */
-        void swapValue(int size) {
-            switch (size) {
-                case 2 -> cb.l2i().invokestatic(CD_INT, "reverseBytes", MethodTypeDesc.of(CD_int, CD_int))
-                        .loadConstant(16).iushr().i2l();
-                case 4 -> cb.l2i().invokestatic(CD_INT, "reverseBytes", MethodTypeDesc.of(CD_int, CD_int)).i2l()
-                        .loadConstant(0xffffffffL).land();
-                case 8 -> cb.invokestatic(CD_LONG, "reverseBytes", MTD_J_J);
-                default -> {}
+                // A store into this page: leave after this instruction (the site is still this
+                // instruction's), with every cached value current.
+                fresh(used);
+                cb.iload(tHit).invokestatic(CD_RT, "leaveIf", MTD_LEAVE_IF);
             }
         }
 

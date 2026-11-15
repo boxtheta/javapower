@@ -1,10 +1,12 @@
 package org.boxtheta.javapower.cpu;
 
+import org.boxtheta.javapower.core.PhysicalMemory;
+
 /**
  * Small static helpers called by code {@link RegionCompiler} generates. They are written so the
  * JIT inlines them into the region's method: value computations whose operands are guest
- * registers held in JVM locals and the software TLB's hit path (guest RAM accesses are in
- * {@link RamAccess}).
+ * registers held in JVM locals, loads and stores (the software TLB's hit path, then guest RAM
+ * through {@link RamAccess}), and a region's rare exits.
  * Semantics mirror the instruction handlers ({@link Alu}, {@link LoadStore}) exactly.
  */
 final class JitRt {
@@ -20,17 +22,18 @@ final class JitRt {
      * crosses a page or misses (the caller then takes the MMU's full path, which does exactly
      * what the interpreter would). {@code ctxBase} is 2 in problem state, else 0; {@code type}
      * is {@link RadixMmu#LOAD} or {@link RadixMmu#STORE}.
+     *
+     * <p>One comparison covers both: the tag is the page of the access's first byte, compared
+     * with the page of its last. Indices are masked with the array lengths (powers of two, so
+     * the masks change nothing), which lets the JIT drop the range checks.
      */
-    static long xlate(long[] tag, long[] addend, int[] epoch, long ea, int ctxBase, int type, int size) {
-        if ((ea & 0xfff) > 0x1000 - size) {
-            return -1;
-        }
+    static long xlate(long[] tlb, int[] epoch, long ea, int ctxBase, int type, int size) {
         int ctx = ctxBase | (int) (ea >>> 63);
-        int slot = ((ctx * 3 + type) << RadixMmu.TLB_BITS) | ((int) (ea >>> 12) & TLB_MASK);
-        if (tag[slot] != ((ea & ~0xfffL) | epoch[ctx])) {
+        int e = ((((ctx * 3 + type) << RadixMmu.TLB_BITS) | ((int) (ea >>> 12) & TLB_MASK)) << 1) & (tlb.length - 1);
+        if (tlb[e] != (((ea + (size - 1)) & ~0xfffL) | epoch[ctx & (epoch.length - 1)])) {
             return -1;
         }
-        return addend[slot] + ea;
+        return tlb[(e + 1) & (tlb.length - 1)] + ea;
     }
 
     /** Real-mode (MSR[DR]=0) address of an access ending at or below {@code limit}, or -1. */
@@ -39,39 +42,328 @@ final class JitRt {
         return pa > limit ? -1 : pa;
     }
 
-    // ------------------------------------------------------------------ MMU slow paths
-    // The MMU's full access path (page crossing, TLB miss, faults); ea is already truncated.
+    // ------------------------------------------------------------------ loads and stores
+    //
+    // A region's loads and stores, one method per size, byte order in memory (le, be) and
+    // translation mode (the names ending in r are for real mode, MSR[DR]=0). ram is
+    // RamAccess.backing, code the code page flags (PhysicalMemory.jitCodePages), ea is already
+    // truncated, ctx is xlate's ctxBase, limit is the last real address at which the access still
+    // fits in RAM, and swap says that the byte order is the other one than the guest's (the
+    // byte-reversed instructions). mask is the RAM size minus one if that size is a power of
+    // two, else -1: masked with it, a real address in RAM is unchanged, and the JIT knows the
+    // access to be within the RAM's backing store (see PhysicalMemory.jitBacking) and makes it
+    // without a bounds check.
+    //
+    // Everything a region cannot do directly goes to the MMU's full path, here rather than in the
+    // generated code: the branch to it is then profiled once for all regions instead of once per
+    // access of every region, where the JIT would take it for never taken until it first is.
+    // For the same reason there is a method per mode and byte order rather than one that
+    // branches on them: the JIT decides what to inline from how often each call in these methods
+    // ran while they were profiled, which for a call made in one mode only would depend on the
+    // modes the guest was in at the time.
+    //
+    // Loads return the value zero-extended (8, 16 bits) or sign-extended (32 bits). Stores
+    // return whether the region must stop after the instruction, which is when the store went
+    // into the region's own page (the MMU's store guard, set for the region by the run loop).
+    // A store goes directly to RAM only outside pages that hold translated code and outside the
+    // region's page (real address page); the MMU's path does the code-write tracking.
 
-    static long rd8(RadixMmu m, long ea) {
-        return m.read8(ea);
+    /**
+     * Whether a store at real address {@code pa} (in RAM) must take the MMU's path: see above.
+     * {@code code} is {@link PhysicalMemory#jitCodePages}.
+     */
+    private static boolean tracked(byte[] code, long pa, long page) {
+        return code[(int) (pa >>> 12) & (code.length - 1)] != 0 || ((pa ^ page) >>> 12) == 0;
     }
 
-    static long rd16(RadixMmu m, long ea) {
-        return m.read16(ea);
+    static long ld8(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 1);
+        return pa == -1 ? loadSlow(m, ea, 1, false) : RamAccess.ld8(ram, pa & mask);
     }
 
-    static long rd32(RadixMmu m, long ea) {
-        return m.read32(ea);
+    static long ld16le(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 2);
+        return pa == -1 ? loadSlow(m, ea, 2, swap) : RamAccess.ld16le(ram, pa & mask);
     }
 
-    static long rd64(RadixMmu m, long ea) {
-        return m.read64(ea);
+    static long ld16be(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 2);
+        return pa == -1 ? loadSlow(m, ea, 2, swap) : RamAccess.ld16be(ram, pa & mask);
     }
 
-    static void wr8(RadixMmu m, long ea, long v) {
-        m.write8(ea, (int) v);
+    static long ld32le(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 4);
+        return pa == -1 ? loadSlow(m, ea, 4, swap) : RamAccess.ld32le(ram, pa & mask);
     }
 
-    static void wr16(RadixMmu m, long ea, long v) {
-        m.write16(ea, (int) v);
+    static long ld32be(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 4);
+        return pa == -1 ? loadSlow(m, ea, 4, swap) : RamAccess.ld32be(ram, pa & mask);
     }
 
-    static void wr32(RadixMmu m, long ea, long v) {
-        m.write32(ea, (int) v);
+    static long ld64le(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 8);
+        return pa == -1 ? loadSlow(m, ea, 8, swap) : RamAccess.ld64le(ram, pa & mask);
     }
 
-    static void wr64(RadixMmu m, long ea, long v) {
-        m.write64(ea, v);
+    static long ld64be(Object ram, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.LOAD, 8);
+        return pa == -1 ? loadSlow(m, ea, 8, swap) : RamAccess.ld64be(ram, pa & mask);
+    }
+
+    static boolean st8(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 1);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 1, false);
+        }
+        RamAccess.st8(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st16le(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 2);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 2, swap);
+        }
+        RamAccess.st16le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st16be(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 2);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 2, swap);
+        }
+        RamAccess.st16be(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st32le(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 4);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 4, swap);
+        }
+        RamAccess.st32le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st32be(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 4);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 4, swap);
+        }
+        RamAccess.st32be(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st64le(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 8);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 8, swap);
+        }
+        RamAccess.st64le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st64be(Object ram, byte[] code, RadixMmu m, long[] tlb, int[] epoch, long ea, int ctx, long mask, long v,
+            long page, boolean swap) {
+        long pa = xlate(tlb, epoch, ea, ctx, RadixMmu.STORE, 8);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 8, swap);
+        }
+        RamAccess.st64be(ram, pa & mask, v);
+        return false;
+    }
+
+    static long ld8r(Object ram, RadixMmu m, long ea, long limit, long mask) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 1, false) : RamAccess.ld8(ram, pa & mask);
+    }
+
+    static long ld16ler(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 2, swap) : RamAccess.ld16le(ram, pa & mask);
+    }
+
+    static long ld16ber(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 2, swap) : RamAccess.ld16be(ram, pa & mask);
+    }
+
+    static long ld32ler(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 4, swap) : RamAccess.ld32le(ram, pa & mask);
+    }
+
+    static long ld32ber(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 4, swap) : RamAccess.ld32be(ram, pa & mask);
+    }
+
+    static long ld64ler(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 8, swap) : RamAccess.ld64le(ram, pa & mask);
+    }
+
+    static long ld64ber(Object ram, RadixMmu m, long ea, long limit, long mask, boolean swap) {
+        long pa = real(ea, limit);
+        return pa == -1 ? loadSlow(m, ea, 8, swap) : RamAccess.ld64be(ram, pa & mask);
+    }
+
+    static boolean st8r(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 1, false);
+        }
+        RamAccess.st8(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st16ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 2, swap);
+        }
+        RamAccess.st16le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st16ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 2, swap);
+        }
+        RamAccess.st16be(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st32ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 4, swap);
+        }
+        RamAccess.st32le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st32ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 4, swap);
+        }
+        RamAccess.st32be(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st64ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 8, swap);
+        }
+        RamAccess.st64le(ram, pa & mask, v);
+        return false;
+    }
+
+    static boolean st64ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
+            long page, boolean swap) {
+        long pa = real(ea, limit);
+        if (pa == -1 || tracked(code, pa, page)) {
+            return storeSlow(m, ea, v, 8, swap);
+        }
+        RamAccess.st64be(ram, pa & mask, v);
+        return false;
+    }
+
+    // The MMU's full access path (page crossing, TLB miss, faults, MMIO, tracked stores); ea is
+    // already truncated. One method per direction, large enough that the JIT calls rather than
+    // inlines them: they are rare, and inlined they would be most of a region's code.
+
+    /** Load {@code size} bytes at {@code ea} in the guest's byte order, reversed with {@code swap}. */
+    static long loadSlow(RadixMmu m, long ea, int size, boolean swap) {
+        switch (size) {
+            case 1:
+                return m.read8(ea);
+            case 2: {
+                int v = m.read16(ea);
+                return swap ? Integer.reverseBytes(v) >>> 16 : v;
+            }
+            case 4: {
+                int v = m.read32(ea);
+                return swap ? Integer.reverseBytes(v) : v;
+            }
+            default: {
+                long v = m.read64(ea);
+                return swap ? Long.reverseBytes(v) : v;
+            }
+        }
+    }
+
+    /**
+     * Store the low {@code size} bytes of {@code v} at {@code ea} in the guest's byte order,
+     * reversed with {@code swap}. Returns whether the store hit the MMU's store guard.
+     */
+    static boolean storeSlow(RadixMmu m, long ea, long v, int size, boolean swap) {
+        switch (size) {
+            case 1:
+                m.write8(ea, (int) v);
+                break;
+            case 2:
+                m.write16(ea, swap ? Integer.reverseBytes((int) v) >>> 16 : (int) v);
+                break;
+            case 4:
+                m.write32(ea, swap ? Integer.reverseBytes((int) v) : (int) v);
+                break;
+            default:
+                m.write64(ea, swap ? Long.reverseBytes(v) : v);
+                break;
+        }
+        return m.guardHit;
+    }
+
+    // ------------------------------------------------------------------ leaving a region
+
+    /**
+     * Thrown by {@link #budget} and {@link #leaveIf} and caught by the region that called them,
+     * which then leaves: its rare exits. There is one instance, without a stack trace. An
+     * exception rather than a branch in the generated code for the reason given above for the
+     * MMU's path: the JIT compiles a branch that a region has not taken yet as a trap, and
+     * recompiles the region when it first is; the condition here is tested in one place for all
+     * regions, and the JIT turns the throw into a jump to the region's handler.
+     */
+    static final class Leave extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        Leave() {
+            super(null, null, false, false);
+        }
+    }
+
+    static final Leave LEAVE = new Leave();
+
+    /** Leave unless a block of {@code len} instructions fits before the end of the chunk. */
+    static void budget(long ic, long len, long end) {
+        if (ic + len > end) {
+            throw LEAVE;
+        }
+    }
+
+    /** Leave after an instruction whose store hit the region's page. */
+    static void leaveIf(boolean stop) {
+        if (stop) {
+            throw LEAVE;
+        }
     }
 
     // ------------------------------------------------------------------ values

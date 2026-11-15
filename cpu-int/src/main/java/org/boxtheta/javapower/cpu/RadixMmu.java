@@ -112,9 +112,14 @@ public final class RadixMmu implements GuestMemory {
 
     private final MmioTrap trap = new MmioTrap();
 
-    /** Tags and addends, indexed by ((ctx * 3 + type) << TLB_BITS) | (vpn & mask). */
-    final long[] tag = new long[4 * 3 * TLB_SIZE];
-    final long[] addend = new long[4 * 3 * TLB_SIZE];
+    /**
+     * The TLB: entry {@code ((ctx * 3 + type) << TLB_BITS) | (vpn & mask)} is the two longs at
+     * twice that index, its tag and its addend (real minus effective address of the page), side
+     * by side so that a lookup touches one cache line. The length is a power of two (16 where 12
+     * tables are used), which compiled code relies on to index it without range checks (see
+     * {@link JitRt#xlate}).
+     */
+    final long[] tlb = new long[2 * 16 * TLB_SIZE];
     /** Per-context epoch (1..4095) folded into the low 12 bits of every tag. */
     final int[] epoch = {1, 1, 1, 1};
 
@@ -191,7 +196,7 @@ public final class RadixMmu implements GuestMemory {
         int e = epoch[ctx] + 1;
         if (e > EPOCH_MASK) {
             for (int t = 0; t < 3; t++) {
-                Arrays.fill(tag, (ctx * 3 + t) << TLB_BITS, (ctx * 3 + t + 1) << TLB_BITS, 0L);
+                Arrays.fill(tlb, (ctx * 3 + t) << (TLB_BITS + 1), (ctx * 3 + t + 1) << (TLB_BITS + 1), 0L);
             }
             e = 1;
         }
@@ -215,9 +220,10 @@ public final class RadixMmu implements GuestMemory {
             return pa;
         }
         int ctx = (int) ((m >>> 13) & 2) | (int) (ea >>> 63);
-        int slot = ((ctx * 3 + type) << TLB_BITS) | ((int) (ea >>> 12) & (TLB_SIZE - 1));
-        if (tag[slot] == ((ea & PAGE_MASK) | epoch[ctx])) {
-            return addend[slot] + ea;
+        int e = (((ctx * 3 + type) << TLB_BITS) | ((int) (ea >>> 12) & (TLB_SIZE - 1))) << 1;
+        long[] t = tlb;
+        if (t[e] == ((ea & PAGE_MASK) | epoch[ctx])) {
+            return t[e + 1] + ea;
         }
         return miss(ea, type, ctx, size);
     }
@@ -359,9 +365,9 @@ public final class RadixMmu implements GuestMemory {
         int idx = (int) (ea >>> 12) & (TLB_SIZE - 1);
         for (int t = 0; t < 3; t++) {
             if ((prot & (1 << t)) != 0) {
-                int sl = ((ctx * 3 + t) << TLB_BITS) | idx;
-                tag[sl] = tagv;
-                addend[sl] = add;
+                int e = (((ctx * 3 + t) << TLB_BITS) | idx) << 1;
+                tlb[e] = tagv;
+                tlb[e + 1] = add;
             }
         }
         return raddr;

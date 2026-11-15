@@ -610,7 +610,7 @@ app/build/install/app/bin/app [--ram MiB] [--smp n] [--firmware slof.bin] [--dis
 | `--max-insns n` | Stop after CPU 0 has executed `n` instructions |
 | `--log-interrupts` | Print every interrupt to stderr |
 | `--status-secs n` | Print per-CPU progress to stderr every `n` seconds |
-| `--jit off\|blocks\|regions` | Compile hot guest code to JVM bytecode: not at all, basic blocks only, or blocks plus whole-page regions (default `regions`) |
+| `--jit off\|blocks\|regions` | Compile hot guest code to JVM bytecode: not at all, as basic blocks only, or as regions of a page, with basic blocks where no region can be built (default `regions`) |
 | `--no-code-sharing` | Compile code separately for each CPU and address space instead of sharing it |
 | `--persistent` | Write guest changes to the `--disk` and `--removable` images instead of a discarded snapshot |
 | `--load-state file` | Continue the machine saved in `file` (gzipped if the name ends in `.gz`); give the same hardware options |

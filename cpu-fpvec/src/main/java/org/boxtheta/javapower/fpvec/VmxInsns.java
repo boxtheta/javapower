@@ -331,7 +331,7 @@ public final class VmxInsns implements InsnSet {
 
     // ------------------------------------------------------------------ permute
 
-    /** Per-thread scratch for vperm: VRA:VRB as 32 bytes, so a selector byte is an index. */
+    /** Per-thread scratch for vperm (VRA:VRB as 32 bytes, so a selector byte is an index) and vbpermq. */
     private static final ThreadLocal<byte[]> PERM = ThreadLocal.withInitial(() -> new byte[32]);
     private static final VarHandle BE64 = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.BIG_ENDIAN);
 
@@ -734,15 +734,18 @@ public final class VmxInsns implements InsnSet {
         checkVec(s);
         int a = 32 + ra(insn), b = 32 + rb(insn);
         long ah = s.vsrHi[a], al = s.vsrLo[a], bh = s.vsrHi[b], bl = s.vsrLo[b];
-        // Branch-free: the indices are data, and a mispredicted branch per byte costs more than
-        // selecting both ways.
+        // The scratch holds VRA and two zero doublewords, so index / 64 picks the doubleword of
+        // any index, 0 for 128 and up, with neither a branch (the indices are data) nor a select.
+        byte[] t = PERM.get();
+        BE64.set(t, 0, ah);
+        BE64.set(t, 8, al);
+        BE64.set(t, 16, 0L);
+        BE64.set(t, 24, 0L);
         long perm = 0;
         for (int i = 0; i < 16; i++) {
             int index = (int) ((i < 8 ? bh : bl) >>> (56 - 8 * (i & 7))) & 0xff;
-            long lo = -(long) ((index >>> 6) & 1); // index 64..127 (or 192..255): the low doubleword
-            long w = (ah & ~lo) | (al & lo);
-            long bit = (w >>> (63 - (index & 63))) & 1 & ~(index >>> 7); // index >= 128: 0
-            perm |= bit << (15 - i);
+            long w = (long) BE64.get(t, (index >>> 3) & 24);
+            perm |= ((w >>> (~index & 63)) & 1) << (15 - i);
         }
         set(s, 32 + rt(insn), perm, 0);
     }

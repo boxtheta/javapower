@@ -1090,32 +1090,68 @@ public final class VmxInsns implements InsnSet {
         return s.is64() ? ea : ea & 0xffffffffL;
     }
 
+    /**
+     * lvx, lvxl: the aligned quadword in the mode's byte order. One translation through
+     * {@code GuestMemory.ramAddress} where the TLB already has it; otherwise the two doubleword
+     * loads through the MMU, which fault, walk and reach MMIO as they always did.
+     */
     static void lvx(CpuState s, int insn) {
         checkVec(s);
         long ea = ea(s, insn) & ~15L;
+        int t = 32 + rt(insn);
+        var m = s.mem;
+        long pa = m.ramAddress(ea, 16, false);
+        if (pa >= 0) {
+            var pm = m.ram();
+            if (s.littleEndian()) {
+                s.vsrLo[t] = pm.read64le(pa);
+                s.vsrHi[t] = pm.read64le(pa + 8);
+            } else {
+                s.vsrHi[t] = pm.read64be(pa);
+                s.vsrLo[t] = pm.read64be(pa + 8);
+            }
+            return;
+        }
         long hi, lo;
         if (s.littleEndian()) {
-            lo = s.mem.read64(ea);
-            hi = s.mem.read64(ea + 8);
+            lo = m.read64(ea);
+            hi = m.read64(ea + 8);
         } else {
-            hi = s.mem.read64(ea);
-            lo = s.mem.read64(ea + 8);
+            hi = m.read64(ea);
+            lo = m.read64(ea + 8);
         }
-        set(s, 32 + rt(insn), hi, lo);
+        set(s, t, hi, lo);
     }
 
+    /**
+     * stvx, stvxl. The slow path probes the last byte first, as this handler always has: a
+     * fault there reports DAR = EA + 15 (QEMU reports EA).
+     */
     static void stvx(CpuState s, int insn) {
         checkVec(s);
         long ea = ea(s, insn) & ~15L;
         int t = 32 + rt(insn);
         long hi = s.vsrHi[t], lo = s.vsrLo[t];
-        s.mem.translateData(ea + 15, true);
+        var m = s.mem;
+        long pa = m.ramAddress(ea, 16, true);
+        if (pa >= 0) {
+            var pm = m.ram();
+            if (s.littleEndian()) {
+                pm.write64le(pa, lo);
+                pm.write64le(pa + 8, hi);
+            } else {
+                pm.write64be(pa, hi);
+                pm.write64be(pa + 8, lo);
+            }
+            return;
+        }
+        m.translateData(ea + 15, true);
         if (s.littleEndian()) {
-            s.mem.write64(ea, lo);
-            s.mem.write64(ea + 8, hi);
+            m.write64(ea, lo);
+            m.write64(ea + 8, hi);
         } else {
-            s.mem.write64(ea, hi);
-            s.mem.write64(ea + 8, lo);
+            m.write64(ea, hi);
+            m.write64(ea + 8, lo);
         }
     }
 

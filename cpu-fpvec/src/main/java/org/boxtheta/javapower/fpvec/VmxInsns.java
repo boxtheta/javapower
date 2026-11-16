@@ -968,29 +968,48 @@ public final class VmxInsns implements InsnSet {
 
     // ------------------------------------------------------------------ crypto
 
-    static void aes(CpuState s, int insn, int kind) {
+    /** vcipher / vcipherlast: ShiftRows (row r of column c from column c + r), SubBytes, MixColumns. */
+    static void vcipher(CpuState s, int insn, boolean last) {
         checkVec(s);
         int a = 32 + ra(insn), b = 32 + rb(insn);
-        byte[] st = toBytes(s.vsrHi[a], s.vsrLo[a]);
-        byte[] r = switch (kind) {
-            case 0 -> Aes.cipher(st, true);
-            case 1 -> Aes.cipher(st, false);
-            case 2, 3 -> Aes.ncipher(st);
-            default -> Aes.sbox(st);
-        };
-        long rh = fromBytes(r, 0), rl = fromBytes(r, 8);
-        if (kind == 2) {
-            // vncipher: InvMixColumns(InvSubBytes(InvShiftRows(state)) ^ key)
-            byte[] x = toBytes(rh ^ s.vsrHi[b], rl ^ s.vsrLo[b]);
-            byte[] y = Aes.invMixColumns(x);
-            set(s, 32 + rt(insn), fromBytes(y, 0), fromBytes(y, 8));
-            return;
+        long hi = s.vsrHi[a], lo = s.vsrLo[a];
+        int c0 = (int) (hi >>> 32), c1 = (int) hi, c2 = (int) (lo >>> 32), c3 = (int) lo;
+        long rh, rl;
+        if (last) {
+            rh = words(Aes.sub(c0, c1, c2, c3), Aes.sub(c1, c2, c3, c0));
+            rl = words(Aes.sub(c2, c3, c0, c1), Aes.sub(c3, c0, c1, c2));
+        } else {
+            rh = words(Aes.mix(c0, c1, c2, c3), Aes.mix(c1, c2, c3, c0));
+            rl = words(Aes.mix(c2, c3, c0, c1), Aes.mix(c3, c0, c1, c2));
         }
-        if (kind != 4) {
-            rh ^= s.vsrHi[b];
-            rl ^= s.vsrLo[b];
+        set(s, 32 + rt(insn), rh ^ s.vsrHi[b], rl ^ s.vsrLo[b]);
+    }
+
+    /**
+     * vncipher / vncipherlast: InvShiftRows (row r of column c from column c - r), InvSubBytes,
+     * the round key, and (not last) InvMixColumns.
+     */
+    static void vncipher(CpuState s, int insn, boolean last) {
+        checkVec(s);
+        int a = 32 + ra(insn), b = 32 + rb(insn);
+        long hi = s.vsrHi[a], lo = s.vsrLo[a];
+        int c0 = (int) (hi >>> 32), c1 = (int) hi, c2 = (int) (lo >>> 32), c3 = (int) lo;
+        long rh = words(Aes.invSub(c0, c3, c2, c1), Aes.invSub(c1, c0, c3, c2)) ^ s.vsrHi[b];
+        long rl = words(Aes.invSub(c2, c1, c0, c3), Aes.invSub(c3, c2, c1, c0)) ^ s.vsrLo[b];
+        if (!last) {
+            rh = words(Aes.invMix((int) (rh >>> 32)), Aes.invMix((int) rh));
+            rl = words(Aes.invMix((int) (rl >>> 32)), Aes.invMix((int) rl));
         }
         set(s, 32 + rt(insn), rh, rl);
+    }
+
+    static void vsbox(CpuState s, int insn) {
+        checkVec(s);
+        int a = 32 + ra(insn);
+        long hi = s.vsrHi[a], lo = s.vsrLo[a];
+        int c0 = (int) (hi >>> 32), c1 = (int) hi, c2 = (int) (lo >>> 32), c3 = (int) lo;
+        set(s, 32 + rt(insn), words(Aes.sub(c0, c0, c0, c0), Aes.sub(c1, c1, c1, c1)),
+                words(Aes.sub(c2, c2, c2, c2), Aes.sub(c3, c3, c3, c3)));
     }
 
     static void vshasigma(CpuState s, int insn, boolean dw) {
@@ -1438,11 +1457,11 @@ public final class VmxInsns implements InsnSet {
         vc(t, 710, "vcmpgtfp", (s, i) -> vcmpfp(s, i, 2));
         vc(t, 966, "vcmpbfp", (s, i) -> vcmpfp(s, i, 3));
         // ---- crypto
-        vx(t, 1288, "vcipher", (s, i) -> aes(s, i, 0));
-        vx(t, 1289, "vcipherlast", (s, i) -> aes(s, i, 1));
-        vx(t, 1352, "vncipher", (s, i) -> aes(s, i, 2));
-        vx(t, 1353, "vncipherlast", (s, i) -> aes(s, i, 3));
-        t.add(0xfc00ffff, (4 << 26) | 1480, "vsbox", (s, i) -> aes(s, i, 4));
+        vx(t, 1288, "vcipher", (s, i) -> vcipher(s, i, false));
+        vx(t, 1289, "vcipherlast", (s, i) -> vcipher(s, i, true));
+        vx(t, 1352, "vncipher", (s, i) -> vncipher(s, i, false));
+        vx(t, 1353, "vncipherlast", (s, i) -> vncipher(s, i, true));
+        t.add(0xfc00ffff, (4 << 26) | 1480, "vsbox", VmxInsns::vsbox);
         vx(t, 1666, "vshasigmaw", (s, i) -> vshasigma(s, i, false));
         vx(t, 1730, "vshasigmad", (s, i) -> vshasigma(s, i, true));
         // ---- VSCR

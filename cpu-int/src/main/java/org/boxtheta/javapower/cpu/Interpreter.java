@@ -675,7 +675,8 @@ public final class Interpreter {
             chunkEnd = start + 1;
             jitOn = false;
         }
-        // Whether pc may start a compiled block: true at a branch target and after a block.
+        // Whether pc may start a compiled block: true at a branch target, after a block and after
+        // an isync that no compiled code could start with.
         boolean blockStart = true;
         while (true) {
             long pc = s.pc;
@@ -685,8 +686,25 @@ public final class Interpreter {
             long pa = fetchBase | (pc & 0xfff);
             if (blockStart && jitOn) {
                 int r = runBlock(pc, pa);
-                if (r != NO_BLOCK) {
+                if (r >= 0) {
                     if (r == CompiledBlock.FAULTED || s.icount >= chunkEnd || recheck) {
+                        return s.icount - start;
+                    }
+                    continue;
+                }
+                if (r == UNCOMPILABLE && (fetchLe ? pm.read32le(pa) : pm.read32be(pa)) == ISYNC) {
+                    // No compiled code starts with isync (see RegionCompiler: what follows it is
+                    // checked for changes only after it has run). Run it here and let the next
+                    // instruction start compiled code, as it may after a region that ends with
+                    // the isync; else straight-line code after a hot isync entry (such as the
+                    // isync after a mtmsrd, which ends the chunk) stays interpreted. Done on this
+                    // path, not after every interpreted instruction: a test there costs the
+                    // interpreter a few percent. isync cannot fault; no hook or trace bit is set
+                    // while the JIT is on.
+                    s.npc = (pc + 4) & pcMask;
+                    SystemInsns.isync(s, ISYNC);
+                    s.pc = s.npc;
+                    if (++s.icount >= chunkEnd || recheck) {
                         return s.icount - start;
                     }
                     continue;
@@ -920,8 +938,12 @@ public final class Interpreter {
 
     // ================================================================== compiled blocks
 
-    /** {@link #runBlock} result: no compiled block was run. */
+    /** {@link #runBlock} result (negative, unlike those of compiled code): no compiled block was run. */
     private static final int NO_BLOCK = -1;
+    /** {@link #runBlock} result: no compiled block was run, and none can be built for this entry. */
+    private static final int UNCOMPILABLE = -2;
+    /** isync: any other word with its primary opcode and XO is an invalid form (illegal instruction). */
+    private static final int ISYNC = 0x4c00012c;
     private static final int BLOCK_TABLE_BITS = 17;
 
     /**
@@ -1060,7 +1082,8 @@ public final class Interpreter {
      * {@code pa}, page already translated by the run loop): run its compiled code if that is
      * exactly equivalent to interpreting from here, i.e. the code words in memory are still the
      * ones it was built from and the code's first block fits before the end of the chunk.
-     * Returns {@link #NO_BLOCK} or the code's {@link CompiledBlock#run} result.
+     * Returns {@link #NO_BLOCK}, {@link #UNCOMPILABLE} or the code's {@link CompiledBlock#run}
+     * result.
      *
      * <p>This is the path of code that ran before and has not been written since (see
      * {@link #fastRun}); everything else is {@link #runBlockSlow}.
@@ -1143,8 +1166,14 @@ public final class Interpreter {
             }
         }
         if (c == null) {
-            if (b.uncompilable || ++b.count < blockThreshold || (c = compileBlock(b)) == null) {
+            if (b.uncompilable) {
+                return UNCOMPILABLE;
+            }
+            if (++b.count < blockThreshold) {
                 return NO_BLOCK;
+            }
+            if ((c = compileBlock(b)) == null) {
+                return UNCOMPILABLE;
             }
             if (!isCurrent(c)) {
                 return NO_BLOCK; // changed while being compiled (another thread): try again later

@@ -535,4 +535,41 @@ class BlockCompilerTest {
                     addi(21, 21, 1), addi(22, 22, 1), addi(20, 20, 1), addi(23, 23, 1)));
         });
     }
+
+    static final int ISYNC = 0x4c00012c;
+
+    /** mtmsrd rs,l. */
+    static int mtmsrd(int rs, int l) {
+        return (31 << 26) | (rs << 21) | (l << 16) | (178 << 1);
+    }
+
+    /**
+     * The body of a loop that follows an isync is compiled. mtmsrd ends the run loop's chunk, so
+     * each iteration starts a chunk at the isync, with which no compiled code can start; the
+     * rest of the body must still run compiled on every iteration, with the interpreter's
+     * results.
+     */
+    @Test
+    void codeAfterAnIsyncIsCompiled() {
+        int iterations = 200;
+        int[] body = new int[MIX.length + 2];
+        body[0] = mtmsrd(0, 1);
+        body[1] = ISYNC;
+        System.arraycopy(MIX, 0, body, 2, MIX.length);
+        for (boolean le : new boolean[] {true, false}) {
+            same(le, true, 20_000, m -> {
+                m.load(CODE, loop(iterations, body));
+                m.s.gpr[6] = DATA;
+            });
+            for (int tier : new int[] {BLOCKS, REGIONS, PROMOTED}) {
+                Machine m = new Machine(tier, le, true);
+                m.load(CODE, loop(iterations, body));
+                m.s.gpr[6] = DATA;
+                m.cpu.run(20_000);
+                assertEquals(iterations, m.s.gpr[20], "tier " + tier + ": iterations");
+                assertTrue(m.cpu.blocksRun >= iterations, "tier " + tier + ": compiled code ran "
+                        + m.cpu.blocksRun + " times in " + iterations + " iterations");
+            }
+        }
+    }
 }

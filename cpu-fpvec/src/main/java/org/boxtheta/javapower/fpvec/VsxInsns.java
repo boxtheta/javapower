@@ -107,22 +107,142 @@ public final class VsxInsns implements InsnSet {
         return toDouble((int) r);
     }
 
-    static void binary(CpuState s, int insn, int fmt, int esize, int nels, boolean scalar, boolean r2sp, int op) {
+    // The arithmetic handlers come in one method per shape (scalar, two binary64 elements, four
+    // binary32 elements), each a FastFp attempt followed by a call of the SoftFloat path: they
+    // must stay small enough for C2 to inline them into each instruction's Op, where the
+    // operation and format are constants. FastFp conditions: normal operands, results far from
+    // the overflow and underflow thresholds; only XX (and FI/FPRF for scalars) can change. An
+    // element outside them sends the whole instruction to SoftFloat.
+
+    /**
+     * Complete a scalar fast path: r (the binary64 result, or MISS) is rounded to single first
+     * when {@code r2sp} (QEMU's do_frsp after the binary64 operation). Returns false, having
+     * changed nothing, when either step missed.
+     */
+    private static boolean finishScalar(CpuState s, int insn, long r, boolean inexact, boolean r2sp, int mode) {
+        if (r == FastFp.MISS) {
+            return false;
+        }
+        if (r2sp) {
+            long q = FastFp.roundS(r, 0, mode);
+            if (q == FastFp.MISS) {
+                return false;
+            }
+            inexact |= FastFp.inexactS(r, 0);
+            r = q;
+        }
+        setFprfNormal(s, r < 0);
+        V.set(s, xt(insn), r, 0);
+        postInexact(s, inexact, true);
+        return true;
+    }
+
+    /** Complete a two-element binary64 fast path; false (nothing changed) if either missed. */
+    private static boolean finishVectorD(CpuState s, int insn, long r0, long r1, boolean inexact) {
+        if (r0 == FastFp.MISS || r1 == FastFp.MISS) {
+            return false;
+        }
+        V.set(s, xt(insn), r0, r1);
+        postInexact(s, inexact, false);
+        return true;
+    }
+
+    /** Complete a four-element binary32 fast path from packed FastFp results. */
+    private static boolean finishVectorS(CpuState s, int insn, long r0, long r1, long r2, long r3) {
+        if ((r0 | r1 | r2 | r3) < 0) {
+            return false; // a MISS_S
+        }
+        V.set(s, xt(insn), (r0 << 32) | (r1 & 0xffffffffL), (r2 << 32) | (r3 & 0xffffffffL));
+        postInexact(s, ((r0 | r1 | r2 | r3) & (1L << 32)) != 0, false);
+        return true;
+    }
+
+    /** xsadddp/xssubdp and, with {@code r2sp}, the sp forms (one method per operation, as in FpInsns). */
+    static void xsadd(CpuState s, int insn, boolean sub, boolean r2sp) {
         checkVsx(s);
-        int a = xa(insn), b = xb(insn);
-        if (scalar && !r2sp && (s.fpscr & 3) == 0) {
-            // Same conditions as the scalar FP fast path: normal operands, result far from the
-            // overflow/underflow thresholds, round-to-nearest; only XX/FI/FPRF can change.
-            long x = s.vsrHi[a], y = s.vsrHi[b];
-            long r = FastFp.arith2(op, x, y);
-            if (r != FastFp.MISS) {
-                int fl = FastFp.inexact2(op, x, y, r) ? SoftFloat.XX : 0;
-                setFprf(s, classD(r));
-                V.set(s, xt(insn), r, 0);
-                post(s, fl, true);
+        if (FastFp.on) {
+            long x = s.vsrHi[xa(insn)], y = s.vsrHi[xb(insn)] ^ (sub ? Long.MIN_VALUE : 0);
+            long rn = FastFp.add(x, y);
+            if (rn != FastFp.MISS) {
+                int mode = rmode(s);
+                double e = FastFp.addErr(x, y, rn);
+                if (finishScalar(s, insn, FastFp.roundD(rn, e, mode), FastFp.inexactD(e), r2sp, mode)) {
+                    return;
+                }
+            }
+        }
+        binary(s, insn, D, 8, 1, true, r2sp, sub ? 1 : 0);
+    }
+
+    static void xsmul(CpuState s, int insn, boolean r2sp) {
+        checkVsx(s);
+        if (FastFp.on) {
+            long x = s.vsrHi[xa(insn)], y = s.vsrHi[xb(insn)];
+            long rn = FastFp.mul(x, y);
+            if (rn != FastFp.MISS) {
+                int mode = rmode(s);
+                double e = FastFp.mulErr(x, y, rn);
+                if (finishScalar(s, insn, FastFp.roundD(rn, e, mode), FastFp.inexactD(e), r2sp, mode)) {
+                    return;
+                }
+            }
+        }
+        binary(s, insn, D, 8, 1, true, r2sp, 2);
+    }
+
+    static void xsdiv(CpuState s, int insn, boolean r2sp) {
+        checkVsx(s);
+        if (FastFp.on) {
+            long x = s.vsrHi[xa(insn)], y = s.vsrHi[xb(insn)];
+            long rn = FastFp.div(x, y);
+            if (rn != FastFp.MISS) {
+                int mode = rmode(s);
+                double e = FastFp.divErr(x, y, rn);
+                if (finishScalar(s, insn, FastFp.roundD(rn, e, mode), FastFp.inexactD(e), r2sp, mode)) {
+                    return;
+                }
+            }
+        }
+        binary(s, insn, D, 8, 1, true, r2sp, 3);
+    }
+
+    static void binaryVectorD(CpuState s, int insn, int op) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int a = xa(insn), b = xb(insn);
+            long x0 = s.vsrHi[a], y0 = s.vsrHi[b], x1 = s.vsrLo[a], y1 = s.vsrLo[b];
+            long rn0 = FastFp.rn2(op, x0, y0), rn1 = FastFp.rn2(op, x1, y1);
+            if (rn0 != FastFp.MISS && rn1 != FastFp.MISS) {
+                int mode = rmode(s);
+                double e0 = FastFp.err2(op, x0, y0, rn0), e1 = FastFp.err2(op, x1, y1, rn1);
+                if (finishVectorD(s, insn, FastFp.roundD(rn0, e0, mode), FastFp.roundD(rn1, e1, mode), e0 != 0 || e1 != 0)) {
+                    return;
+                }
+            }
+        }
+        binary(s, insn, D, 8, 2, false, false, op);
+    }
+
+    static void binaryVectorS(CpuState s, int insn, int op) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int a = xa(insn), b = xb(insn), mode = rmode(s);
+            long ah = s.vsrHi[a], al = s.vsrLo[a], bh = s.vsrHi[b], bl = s.vsrLo[b];
+            if (finishVectorS(s, insn,
+                    FastFp.arithS(op, V.w(ah, al, 0), V.w(bh, bl, 0), mode),
+                    FastFp.arithS(op, V.w(ah, al, 1), V.w(bh, bl, 1), mode),
+                    FastFp.arithS(op, V.w(ah, al, 2), V.w(bh, bl, 2), mode),
+                    FastFp.arithS(op, V.w(ah, al, 3), V.w(bh, bl, 3), mode))) {
                 return;
             }
         }
+        binary(s, insn, S, 4, 4, false, false, op);
+    }
+
+    /** The SoftFloat path of the binary operations. */
+    static void binary(CpuState s, int insn, int fmt, int esize, int nels, boolean scalar, boolean r2sp, int op) {
+        checkVsx(s);
+        int a = xa(insn), b = xb(insn);
         int n = scalar ? 1 : nels;
         elems(s, xt(insn), s.vsrHi[a], s.vsrLo[a], s.vsrHi[b], s.vsrLo[b], 0, 0, esize, n, scalar,
                 op == 3, r2sp, INV_ARITH, (sf, x, y, z) -> {
@@ -137,7 +257,68 @@ public final class VsxInsns implements InsnSet {
                 });
     }
 
-    /** sqrt (op 0), reciprocal estimate (1), reciprocal square root estimate (2). */
+    private static final long ONE = 0x3ff0000000000000L;
+
+    /** The RN result of sqrt (op 0) or of the reciprocal estimate (op 1, an exact 1/x). */
+    private static long unaryRn(int op, long x) {
+        return op == 0 ? FastFp.sqrt(x) : FastFp.div(ONE, x);
+    }
+
+    private static double unaryErr(int op, long x, long rn) {
+        return rn == FastFp.MISS ? FastFp.UNKNOWN : op == 0 ? FastFp.sqrtErr(x, rn) : FastFp.divErr(ONE, x, rn);
+    }
+
+    /**
+     * xssqrtdp and xsredp (op 0, 1) and, with {@code r2sp}, the sp forms. The reciprocal estimate
+     * is an exact division by QEMU's rules, whose invalid and zero-divide flags the fast path
+     * never raises.
+     */
+    static void unaryScalar(CpuState s, int insn, int op, boolean r2sp) {
+        checkVsx(s);
+        if (FastFp.on) {
+            long x = s.vsrHi[xb(insn)];
+            long rn = unaryRn(op, x);
+            double e = unaryErr(op, x, rn);
+            int mode = rmode(s);
+            if (finishScalar(s, insn, FastFp.roundD(rn, e, mode), FastFp.inexactD(e), r2sp, mode)) {
+                return;
+            }
+        }
+        unary(s, insn, D, 8, 1, true, r2sp, op);
+    }
+
+    static void unaryVectorD(CpuState s, int insn, int op) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int b = xb(insn), mode = rmode(s);
+            long x0 = s.vsrHi[b], x1 = s.vsrLo[b];
+            long rn0 = unaryRn(op, x0), rn1 = unaryRn(op, x1);
+            double e0 = unaryErr(op, x0, rn0), e1 = unaryErr(op, x1, rn1);
+            if (finishVectorD(s, insn, FastFp.roundD(rn0, e0, mode), FastFp.roundD(rn1, e1, mode), e0 != 0 || e1 != 0)) {
+                return;
+            }
+        }
+        unary(s, insn, D, 8, 2, false, false, op);
+    }
+
+    private static long unaryS(int op, int w, int mode) {
+        return op == 0 ? FastFp.sqrtS(w, mode) : FastFp.arithS(3, 0x3f800000, w, mode);
+    }
+
+    static void unaryVectorS(CpuState s, int insn, int op) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int b = xb(insn), mode = rmode(s);
+            long bh = s.vsrHi[b], bl = s.vsrLo[b];
+            if (finishVectorS(s, insn, unaryS(op, V.w(bh, bl, 0), mode), unaryS(op, V.w(bh, bl, 1), mode),
+                    unaryS(op, V.w(bh, bl, 2), mode), unaryS(op, V.w(bh, bl, 3), mode))) {
+                return;
+            }
+        }
+        unary(s, insn, S, 4, 4, false, false, op);
+    }
+
+    /** The SoftFloat path of sqrt (op 0), reciprocal estimate (1), reciprocal square root estimate (2). */
     static void unary(CpuState s, int insn, int fmt, int esize, int nels, boolean scalar, boolean r2sp, int op) {
         checkVsx(s);
         int b = xb(insn);
@@ -173,8 +354,72 @@ public final class VsxInsns implements InsnSet {
     }
 
     /**
-     * Multiply-add. A form: XT = XA*XB + XT; M form: XT = XA*XT + XB. QEMU's operand order for NaN
-     * propagation is (multiplicand XA, addend, other multiplicand).
+     * Scalar multiply-add, fmt D (xs*dp) or DS (xs*sp, one rounding to single). A form:
+     * XT = XA*XB + XT; M form: XT = XA*XT + XB.
+     */
+    static void maddScalar(CpuState s, int insn, int fmt, boolean mform, boolean negAdd, boolean negRes) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int t = xt(insn), add = mform ? xb(insn) : t, mul2 = mform ? t : xb(insn);
+            long x = s.vsrHi[xa(insn)], z = s.vsrHi[mul2], y = s.vsrHi[add] ^ (negAdd ? Long.MIN_VALUE : 0);
+            long rn = FastFp.fma(x, z, y);
+            if (rn != FastFp.MISS) {
+                double e = FastFp.fmaErr(x, z, y, rn);
+                long r = FastFp.round(fmt, rn, e, rmode(s));
+                if (r != FastFp.MISS) {
+                    r ^= negRes ? Long.MIN_VALUE : 0; // negated after rounding, as in SoftFloat.fma
+                    setFprfNormal(s, r < 0);
+                    V.set(s, t, r, 0);
+                    postInexact(s, FastFp.inexact(fmt, rn, e), true);
+                    return;
+                }
+            }
+        }
+        madd(s, insn, fmt, 8, 1, true, mform, negAdd, negRes);
+    }
+
+    static void maddVectorD(CpuState s, int insn, boolean mform, boolean negAdd, boolean negRes) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int t = xt(insn), a = xa(insn), add = mform ? xb(insn) : t, mul2 = mform ? t : xb(insn);
+            long sb = negAdd ? Long.MIN_VALUE : 0, neg = negRes ? Long.MIN_VALUE : 0;
+            long x0 = s.vsrHi[a], z0 = s.vsrHi[mul2], y0 = s.vsrHi[add] ^ sb;
+            long x1 = s.vsrLo[a], z1 = s.vsrLo[mul2], y1 = s.vsrLo[add] ^ sb;
+            long rn0 = FastFp.fma(x0, z0, y0), rn1 = FastFp.fma(x1, z1, y1);
+            if (rn0 != FastFp.MISS && rn1 != FastFp.MISS) {
+                int mode = rmode(s);
+                double e0 = FastFp.fmaErr(x0, z0, y0, rn0), e1 = FastFp.fmaErr(x1, z1, y1, rn1);
+                long r0 = FastFp.roundD(rn0, e0, mode), r1 = FastFp.roundD(rn1, e1, mode);
+                if (r0 != FastFp.MISS && r1 != FastFp.MISS && finishVectorD(s, insn, r0 ^ neg, r1 ^ neg, e0 != 0 || e1 != 0)) {
+                    return;
+                }
+            }
+        }
+        madd(s, insn, D, 8, 2, false, mform, negAdd, negRes);
+    }
+
+    static void maddVectorS(CpuState s, int insn, boolean mform, boolean negAdd, boolean negRes) {
+        checkVsx(s);
+        if (FastFp.on) {
+            int t = xt(insn), a = xa(insn), add = mform ? xb(insn) : t, mul2 = mform ? t : xb(insn);
+            int mode = rmode(s);
+            long ah = s.vsrHi[a], al = s.vsrLo[a], yh = s.vsrHi[add], yl = s.vsrLo[add];
+            long zh = s.vsrHi[mul2], zl = s.vsrLo[mul2];
+            long r0 = FastFp.fmaS(V.w(ah, al, 0), V.w(zh, zl, 0), V.w(yh, yl, 0), negAdd, mode);
+            long r1 = FastFp.fmaS(V.w(ah, al, 1), V.w(zh, zl, 1), V.w(yh, yl, 1), negAdd, mode);
+            long r2 = FastFp.fmaS(V.w(ah, al, 2), V.w(zh, zl, 2), V.w(yh, yl, 2), negAdd, mode);
+            long r3 = FastFp.fmaS(V.w(ah, al, 3), V.w(zh, zl, 3), V.w(yh, yl, 3), negAdd, mode);
+            long ns = negRes ? 0x80000000L : 0; // a MISS_S stays negative
+            if (finishVectorS(s, insn, r0 ^ ns, r1 ^ ns, r2 ^ ns, r3 ^ ns)) {
+                return;
+            }
+        }
+        madd(s, insn, S, 4, 4, false, mform, negAdd, negRes);
+    }
+
+    /**
+     * The SoftFloat path of multiply-add. A form: XT = XA*XB + XT; M form: XT = XA*XT + XB.
+     * QEMU's operand order for NaN propagation is (multiplicand XA, addend, other multiplicand).
      */
     static void madd(CpuState s, int insn, int fmt, int esize, int nels, boolean scalar, boolean mform,
                      boolean negAdd, boolean negRes) {
@@ -197,7 +442,18 @@ public final class VsxInsns implements InsnSet {
     static void xscmp(CpuState s, int insn, int kind) {
         checkVsx(s);
         long a = s.vsrHi[xa(insn)], b = s.vsrHi[xb(insn)];
+        if (FastFp.on && !FpInsns.isNanD(a) && !FpInsns.isNanD(b)) {
+            int rel = FastFp.compare(a, b);
+            boolean r = switch (kind) {
+                case 0 -> rel == SoftFloat.CMP_EQ;
+                case 1 -> rel != SoftFloat.CMP_LT;
+                default -> rel == SoftFloat.CMP_GT;
+            };
+            V.set(s, xt(insn), r ? -1L : 0, 0);
+            return;
+        }
         SoftFloat sf = SoftFloat.get();
+        sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
         sf.unpackD(0, a);
         sf.unpackD(1, b);
         int rel = sf.compare();
@@ -240,7 +496,14 @@ public final class VsxInsns implements InsnSet {
     static void xscmpou(CpuState s, int insn, boolean ordered) {
         checkVsx(s);
         long a = s.vsrHi[xa(insn)], b = s.vsrHi[xb(insn)];
+        if (FastFp.on && !FpInsns.isNanD(a) && !FpInsns.isNanD(b)) {
+            int cc = FastFp.compare(a, b);
+            s.fpscr = (s.fpscr & ~FPCC) | ((long) cc << 12);
+            s.setCrField((insn >>> 23) & 7, cc);
+            return;
+        }
         SoftFloat sf = SoftFloat.get();
+        sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
         sf.unpackD(0, a);
         sf.unpackD(1, b);
         int cc = sf.compare();
@@ -268,6 +531,7 @@ public final class VsxInsns implements InsnSet {
         int n = 16 / esize;
         int fmt = esize == 8 ? D : S;
         SoftFloat sf = SoftFloat.get();
+        sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
         boolean allTrue = true, allFalse = true;
         long rh = 0, rl = 0;
         for (int i = 0; i < n; i++) {
@@ -332,6 +596,7 @@ public final class VsxInsns implements InsnSet {
         checkVsx(s);
         long a = s.vsrHi[xa(insn)], b = s.vsrHi[xb(insn)];
         SoftFloat sf = SoftFloat.get();
+        sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
         sf.unpackD(0, a);
         sf.unpackD(1, b);
         int rel = sf.compare();
@@ -366,6 +631,7 @@ public final class VsxInsns implements InsnSet {
             }
         } else {
             SoftFloat sf = SoftFloat.get();
+            sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
             sf.unpackD(0, a);
             sf.unpackD(1, b);
             boolean lt = sf.compare() == SoftFloat.CMP_LT;
@@ -452,22 +718,29 @@ public final class VsxInsns implements InsnSet {
         checkVsx(s);
         int b = xb(insn);
         long bh = s.vsrHi[b], bl = s.vsrLo[b];
-        SoftFloat sf = SoftFloat.get();
+        SoftFloat sf = null; // fetched only for elements the fast path misses
         int all = 0;
         long rh = 0, rl = 0;
         for (int i = 0; i < nels; i++) {
             // source element: dw i (8), word i (4->4) or word 2i (4->8)
             int si = srcSize == 4 && dstSize == 8 ? 2 * i : i;
             long x = V.get(bh, bl, srcSize, si);
-            sf.resetFp(s.fpscr);
-            sf.unpack(0, srcSize == 8 ? D : S, 0, x);
-            long r = sf.toInt(dstSize * 8, signed, SoftFloat.RZ);
-            int fl = sf.flags;
-            all |= fl;
-            if ((fl & SoftFloat.VXCVI) != 0) {
-                invalidCvt(s, (fl & SoftFloat.VXSNAN) != 0, false);
-                if (sf.nanCvt) {
-                    r = !signed ? 0 : dstSize == 4 ? 0x80000000L : Long.MIN_VALUE;
+            long xd = srcSize == 8 ? x : toDouble((int) x); // exact; a NaN stays a NaN
+            long r = FastFp.on ? FastFp.toInt(xd, dstSize * 8, signed, SoftFloat.RZ) : FastFp.MISS;
+            if (r != FastFp.MISS) {
+                all |= FastFp.toIntFlags(xd, r);
+            } else {
+                if (sf == null) sf = SoftFloat.get();
+                sf.resetFp(s.fpscr);
+                sf.unpack(0, srcSize == 8 ? D : S, 0, x);
+                r = sf.toInt(dstSize * 8, signed, SoftFloat.RZ);
+                int fl = sf.flags;
+                all |= fl;
+                if ((fl & SoftFloat.VXCVI) != 0) {
+                    invalidCvt(s, (fl & SoftFloat.VXSNAN) != 0, false);
+                    if (sf.nanCvt) {
+                        r = !signed ? 0 : dstSize == 4 ? 0x80000000L : Long.MIN_VALUE;
+                    }
                 }
             }
             if (dup) {
@@ -485,6 +758,40 @@ public final class VsxInsns implements InsnSet {
     }
 
     /**
+     * {@link SoftFloat#fromInt} to fmt D (rounded to single afterwards if {@code r2sp}) or to
+     * fmt S (binary32 bits) through FastFp; MISS where FastFp does not apply.
+     */
+    private static long fromIntFast(long x, boolean signed, int fmt, boolean r2sp, int mode) {
+        if (x == 0) {
+            return 0;
+        }
+        long rn = FastFp.fromLong(x, signed);
+        if (rn == FastFp.MISS) {
+            return FastFp.MISS;
+        }
+        double es = FastFp.fromLongErr(x, rn);
+        if (fmt == S) {
+            long r = FastFp.roundS(rn, es, mode);
+            return r == FastFp.MISS ? FastFp.MISS : FastFp.narrowS(r) & 0xffffffffL;
+        }
+        long r = FastFp.roundD(rn, es, mode);
+        return r2sp && r != FastFp.MISS ? FastFp.roundS(r, 0, mode) : r;
+    }
+
+    /** Whether a {@link #fromIntFast} result was inexact (in either rounding). */
+    private static boolean fromIntInexact(long x, boolean signed, int fmt, boolean r2sp, int mode) {
+        if (x == 0) {
+            return false;
+        }
+        long rn = FastFp.fromLong(x, signed);
+        double es = FastFp.fromLongErr(x, rn);
+        if (fmt == S) {
+            return FastFp.inexactS(rn, es);
+        }
+        return FastFp.inexactD(es) || (r2sp && FastFp.inexactS(FastFp.roundD(rn, es, mode), 0));
+    }
+
+    /**
      * Integer to float. kind: srcSize/dstSize; {@code r2sp} rounds the binary64 result to single
      * (xscv[su]xdsp); {@code dup} duplicates a binary32 result into both words of its doubleword.
      */
@@ -493,7 +800,7 @@ public final class VsxInsns implements InsnSet {
         checkVsx(s);
         int b = xb(insn);
         long bh = s.vsrHi[b], bl = s.vsrLo[b];
-        SoftFloat sf = SoftFloat.get();
+        SoftFloat sf = null; // fetched only for elements the fast path misses
         int all = 0;
         int fprf = -1;
         long rh = 0, rl = 0;
@@ -501,13 +808,19 @@ public final class VsxInsns implements InsnSet {
             int si = srcSize == 4 && dstSize == 8 ? 2 * i : i;
             long x = V.get(bh, bl, srcSize, si);
             if (signed && srcSize == 4) x = (int) x;
-            sf.resetFp(s.fpscr);
             int fmt = dstSize == 8 ? D : S;
-            long r = sf.fromInt(fmt, 0, x, signed, false);
-            all |= sf.flags;
-            if (r2sp) {
-                r = frsp(s, sf, r);
+            long r = FastFp.on ? fromIntFast(x, signed, fmt, r2sp, rmode(s)) : FastFp.MISS;
+            if (r != FastFp.MISS) {
+                if (fromIntInexact(x, signed, fmt, r2sp, rmode(s))) all |= SoftFloat.XX;
+            } else {
+                if (sf == null) sf = SoftFloat.get();
+                sf.resetFp(s.fpscr);
+                r = sf.fromInt(fmt, 0, x, signed, false);
                 all |= sf.flags;
+                if (r2sp) {
+                    r = frsp(s, sf, r);
+                    all |= sf.flags;
+                }
             }
             if (scalar) fprf = classD(r);
             if (dup) {
@@ -558,6 +871,16 @@ public final class VsxInsns implements InsnSet {
 
     static void xsrsp(CpuState s, int insn) {
         checkVsx(s);
+        long b = s.vsrHi[xb(insn)];
+        if (FastFp.on) {
+            long r = (b & Long.MAX_VALUE) == 0 ? b : FastFp.normal(b) ? FastFp.roundS(b, 0, rmode(s)) : FastFp.MISS;
+            if (r != FastFp.MISS) {
+                setFprf(s, classD(r));
+                post(s, FastFp.flags(SoftFloat.DS, b, 0), true);
+                V.set(s, xt(insn), r, 0);
+                return;
+            }
+        }
         SoftFloat sf = SoftFloat.get();
         long r = frsp(s, sf, s.vsrHi[xb(insn)]);
         setFprf(s, classD(r));
@@ -1205,19 +1528,31 @@ public final class VsxInsns implements InsnSet {
         String[] ar = {"add", "sub", "mul", "div"};
         for (int op = 0; op < 4; op++) {
             int o = op;
-            xx3(t, 32 + 8 * op, "xs" + ar[op] + "dp", (s, i) -> binary(s, i, D, 8, 1, true, false, o));
-            xx3(t, 8 * op, "xs" + ar[op] + "sp", (s, i) -> binary(s, i, D, 8, 1, true, true, o));
-            xx3(t, 96 + 8 * op, "xv" + ar[op] + "dp", (s, i) -> binary(s, i, D, 8, 2, false, false, o));
-            xx3(t, 64 + 8 * op, "xv" + ar[op] + "sp", (s, i) -> binary(s, i, S, 4, 4, false, false, o));
+            Op dp = switch (op) {
+                case 0 -> (s, i) -> xsadd(s, i, false, false);
+                case 1 -> (s, i) -> xsadd(s, i, true, false);
+                case 2 -> (s, i) -> xsmul(s, i, false);
+                default -> (s, i) -> xsdiv(s, i, false);
+            };
+            Op sp = switch (op) {
+                case 0 -> (s, i) -> xsadd(s, i, false, true);
+                case 1 -> (s, i) -> xsadd(s, i, true, true);
+                case 2 -> (s, i) -> xsmul(s, i, true);
+                default -> (s, i) -> xsdiv(s, i, true);
+            };
+            xx3(t, 32 + 8 * op, "xs" + ar[op] + "dp", dp);
+            xx3(t, 8 * op, "xs" + ar[op] + "sp", sp);
+            xx3(t, 96 + 8 * op, "xv" + ar[op] + "dp", (s, i) -> binaryVectorD(s, i, o));
+            xx3(t, 64 + 8 * op, "xv" + ar[op] + "sp", (s, i) -> binaryVectorS(s, i, o));
         }
-        xx2(t, 75, "xssqrtdp", (s, i) -> unary(s, i, D, 8, 1, true, false, 0));
-        xx2(t, 11, "xssqrtsp", (s, i) -> unary(s, i, D, 8, 1, true, true, 0));
-        xx2(t, 203, "xvsqrtdp", (s, i) -> unary(s, i, D, 8, 2, false, false, 0));
-        xx2(t, 139, "xvsqrtsp", (s, i) -> unary(s, i, S, 4, 4, false, false, 0));
-        xx2(t, 90, "xsredp", (s, i) -> unary(s, i, D, 8, 1, true, false, 1));
-        xx2(t, 26, "xsresp", (s, i) -> unary(s, i, D, 8, 1, true, true, 1));
-        xx2(t, 218, "xvredp", (s, i) -> unary(s, i, D, 8, 2, false, false, 1));
-        xx2(t, 154, "xvresp", (s, i) -> unary(s, i, S, 4, 4, false, false, 1));
+        xx2(t, 75, "xssqrtdp", (s, i) -> unaryScalar(s, i, 0, false));
+        xx2(t, 11, "xssqrtsp", (s, i) -> unaryScalar(s, i, 0, true));
+        xx2(t, 203, "xvsqrtdp", (s, i) -> unaryVectorD(s, i, 0));
+        xx2(t, 139, "xvsqrtsp", (s, i) -> unaryVectorS(s, i, 0));
+        xx2(t, 90, "xsredp", (s, i) -> unaryScalar(s, i, 1, false));
+        xx2(t, 26, "xsresp", (s, i) -> unaryScalar(s, i, 1, true));
+        xx2(t, 218, "xvredp", (s, i) -> unaryVectorD(s, i, 1));
+        xx2(t, 154, "xvresp", (s, i) -> unaryVectorS(s, i, 1));
         xx2(t, 74, "xsrsqrtedp", (s, i) -> unary(s, i, D, 8, 1, true, false, 2));
         xx2(t, 10, "xsrsqrtesp", (s, i) -> unary(s, i, D, 8, 1, true, true, 2));
         xx2(t, 202, "xvrsqrtedp", (s, i) -> unary(s, i, D, 8, 2, false, false, 2));
@@ -1230,10 +1565,15 @@ public final class VsxInsns implements InsnSet {
             for (int m = 0; m < 2; m++) {
                 boolean mform = m == 1;
                 String f = mform ? "m" : "a";
-                xx3(t, xsdp[k] + 8 * m, "xs" + mn[k] + f + "dp", (s, i) -> madd(s, i, D, 8, 1, true, mform, negAdd, negRes));
-                xx3(t, xssp[k] + 8 * m, "xs" + mn[k] + f + "sp", (s, i) -> madd(s, i, DS, 8, 1, true, mform, negAdd, negRes));
-                xx3(t, xvdp[k] + 8 * m, "xv" + mn[k] + f + "dp", (s, i) -> madd(s, i, D, 8, 2, false, mform, negAdd, negRes));
-                xx3(t, xvsp[k] + 8 * m, "xv" + mn[k] + f + "sp", (s, i) -> madd(s, i, S, 4, 4, false, mform, negAdd, negRes));
+                // Without a hardware FMA the binary64 forms keep SoftFloat (see FpInsns.fmaOp).
+                xx3(t, xsdp[k] + 8 * m, "xs" + mn[k] + f + "dp", FastFp.HOST_FMA
+                        ? (s, i) -> maddScalar(s, i, D, mform, negAdd, negRes)
+                        : (s, i) -> madd(s, i, D, 8, 1, true, mform, negAdd, negRes));
+                xx3(t, xssp[k] + 8 * m, "xs" + mn[k] + f + "sp", (s, i) -> maddScalar(s, i, DS, mform, negAdd, negRes));
+                xx3(t, xvdp[k] + 8 * m, "xv" + mn[k] + f + "dp", FastFp.HOST_FMA
+                        ? (s, i) -> maddVectorD(s, i, mform, negAdd, negRes)
+                        : (s, i) -> madd(s, i, D, 8, 2, false, mform, negAdd, negRes));
+                xx3(t, xvsp[k] + 8 * m, "xv" + mn[k] + f + "sp", (s, i) -> maddVectorS(s, i, mform, negAdd, negRes));
             }
         }
         // ---- compares

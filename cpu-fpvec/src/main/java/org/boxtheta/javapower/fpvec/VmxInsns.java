@@ -1023,7 +1023,7 @@ public final class VmxInsns implements InsnSet {
             return;
         }
         if (six == 0 || six == 15) {
-            // What code uses: one function for all four words, on both words of a doubleword at once.
+            // What code uses: one function for all four words.
             set(s, 32 + rt(insn), sigma32x2(hi, st, six != 0), sigma32x2(lo, st, six != 0));
         } else {
             set(s, 32 + rt(insn), words(sigma32((int) (hi >>> 32), st, (six & 8) != 0), sigma32((int) hi, st, (six & 4) != 0)),
@@ -1031,14 +1031,12 @@ public final class VmxInsns implements InsnSet {
         }
     }
 
-    /** SHA-256 sigma0/sigma1 (st false) or Sigma0/Sigma1 (st true) of both words of x. */
+    /** sigma32 of both words of x. */
     static long sigma32x2(long x, boolean st, boolean bit) {
-        if (!st) {
-            return !bit ? ror32(x, 7) ^ ror32(x, 18) ^ shr32(x, 3) : ror32(x, 17) ^ ror32(x, 19) ^ shr32(x, 10);
-        }
-        return !bit ? ror32(x, 2) ^ ror32(x, 13) ^ ror32(x, 22) : ror32(x, 6) ^ ror32(x, 11) ^ ror32(x, 25);
+        return words(sigma32((int) (x >>> 32), st, bit), sigma32((int) x, st, bit));
     }
 
+    /** SHA-256 sigma0/sigma1 (st false) or Sigma0/Sigma1 (st true). */
     static int sigma32(int x, boolean st, boolean bit) {
         if (!st) {
             return !bit ? Integer.rotateRight(x, 7) ^ Integer.rotateRight(x, 18) ^ (x >>> 3)
@@ -1046,17 +1044,6 @@ public final class VmxInsns implements InsnSet {
         }
         return !bit ? Integer.rotateRight(x, 2) ^ Integer.rotateRight(x, 13) ^ Integer.rotateRight(x, 22)
                 : Integer.rotateRight(x, 6) ^ Integer.rotateRight(x, 11) ^ Integer.rotateRight(x, 25);
-    }
-
-    /** Each word of x rotated right by n (0 &lt; n &lt; 32). */
-    static long ror32(long x, int n) {
-        long low = ((1L << (32 - n)) - 1) * 0x0000000100000001L;
-        return ((x >>> n) & low) | ((x << (32 - n)) & ~low);
-    }
-
-    /** Each word of x shifted right by n (0 &lt; n &lt; 32). */
-    static long shr32(long x, int n) {
-        return (x >>> n) & (((1L << (32 - n)) - 1) * 0x0000000100000001L);
     }
 
     static long sigma64(long x, boolean st, boolean bit) {

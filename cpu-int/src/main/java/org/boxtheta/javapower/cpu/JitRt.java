@@ -66,7 +66,10 @@ final class JitRt {
     // return whether the region must stop after the instruction, which is when the store went
     // into the region's own page (the MMU's store guard, set for the region by the run loop).
     // A store goes directly to RAM only outside pages that hold translated code and outside the
-    // region's page (real address page); the MMU's path does the code-write tracking.
+    // region's page (real address page), and only if it lies in one page, the one checked: in
+    // translated mode xlate sees to that, in real mode the store helpers check it, as a store
+    // that crosses into the next page could reach code there. The MMU's path does the
+    // code-write tracking.
 
     /**
      * Whether a store at real address {@code pa} (in RAM) must take the MMU's path: see above.
@@ -229,7 +232,7 @@ final class JitRt {
     static boolean st16ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xffe || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 2, swap);
         }
         RamAccess.st16le(ram, pa & mask, v);
@@ -239,7 +242,7 @@ final class JitRt {
     static boolean st16ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xffe || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 2, swap);
         }
         RamAccess.st16be(ram, pa & mask, v);
@@ -249,7 +252,7 @@ final class JitRt {
     static boolean st32ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xffc || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 4, swap);
         }
         RamAccess.st32le(ram, pa & mask, v);
@@ -259,7 +262,7 @@ final class JitRt {
     static boolean st32ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xffc || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 4, swap);
         }
         RamAccess.st32be(ram, pa & mask, v);
@@ -269,7 +272,7 @@ final class JitRt {
     static boolean st64ler(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xff8 || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 8, swap);
         }
         RamAccess.st64le(ram, pa & mask, v);
@@ -279,7 +282,7 @@ final class JitRt {
     static boolean st64ber(Object ram, byte[] code, RadixMmu m, long ea, long limit, long mask, long v,
             long page, boolean swap) {
         long pa = real(ea, limit);
-        if (pa == -1 || tracked(code, pa, page)) {
+        if (pa == -1 || (ea & 0xfff) > 0xff8 || tracked(code, pa, page)) {
             return storeSlow(m, ea, v, 8, swap);
         }
         RamAccess.st64be(ram, pa & mask, v);

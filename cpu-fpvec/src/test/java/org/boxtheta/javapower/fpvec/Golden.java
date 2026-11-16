@@ -163,8 +163,17 @@ final class Golden {
         return 1000 + e.vector;
     }
 
-    /** Run one case; returns null on success or a description of the mismatch. */
+    /**
+     * Run one case, with the memory's fast path off and then on (loads and stores take
+     * {@code GuestMemory.ramAddress} where they can); returns null on success or a description
+     * of the mismatch.
+     */
     static String run(DecodeTable table, Case c, boolean bigEndian) {
+        String d = run(table, c, bigEndian, false);
+        return d != null ? d : run(table, c, bigEndian, true);
+    }
+
+    private static String run(DecodeTable table, Case c, boolean bigEndian, boolean fastPath) {
         State in = new State();
         in.apply(c.in());
         State exp = in.copy();
@@ -174,6 +183,9 @@ final class Golden {
         s.msr = Msr.SF | (bigEndian ? 0 : Msr.LE) | Msr.FP | Msr.VEC | Msr.VSX | Msr.FE0 | Msr.FE1 | Msr.PR;
         TestMemory m = new TestMemory(s, MEMBASE, MEMSIZE);
         System.arraycopy(in.mem, 0, m.bytes, 0, MEMSIZE);
+        if (fastPath) {
+            m.fastPath();
+        }
         s.mem = m;
         s.fpscr = in.fpscr;
         s.cr = in.cr;
@@ -203,9 +215,9 @@ final class Golden {
         System.arraycopy(s.gpr, 0, got.gpr, 0, 32);
         System.arraycopy(s.vsrHi, 0, got.hi, 0, 64);
         System.arraycopy(s.vsrLo, 0, got.lo, 0, 64);
-        got.mem = m.bytes.clone();
+        got.mem = m.contents();
         String d = exp.diff(got);
         if (d.isEmpty()) return null;
-        return (e == null ? "[undecoded] " : "") + d.trim();
+        return (fastPath ? "[fast path] " : "") + (e == null ? "[undecoded] " : "") + d.trim();
     }
 }

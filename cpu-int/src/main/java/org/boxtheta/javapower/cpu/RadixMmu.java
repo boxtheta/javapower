@@ -461,6 +461,47 @@ public final class RadixMmu implements GuestMemory {
         }
     }
 
+    /**
+     * The TLB's hit path (or real mode's bounds check) for an access of {@code len} bytes within
+     * one page: exactly the cases in which {@link #xlate} returns without walking or raising
+     * anything, for each part of the access. A store is checked against the store guard here,
+     * as {@link #write64} and the others do after translating.
+     */
+    @Override
+    public long ramAddress(long ea, int len, boolean store) {
+        long m = s.msr;
+        if (m >= 0) {
+            ea &= 0xffffffffL;
+        }
+        if ((ea & 0xfff) + len > 0x1000) {
+            return -1;
+        }
+        long pa;
+        if ((m & Msr.DR) == 0) {
+            pa = ea & 0x0FFFFFFFFFFFFFFFL;
+            if (pa > ramSize - len) {
+                return -1;
+            }
+        } else {
+            int ctx = (int) ((m >>> 13) & 2) | (int) (ea >>> 63);
+            int e = (((ctx * 3 + (store ? STORE : LOAD)) << TLB_BITS) | ((int) (ea >>> 12) & (TLB_SIZE - 1))) << 1;
+            long[] t = tlb;
+            if (t[e] != ((ea & PAGE_MASK) | epoch[ctx])) {
+                return -1;
+            }
+            pa = t[e + 1] + ea;
+        }
+        if (store) {
+            guard(pa, len);
+        }
+        return pa;
+    }
+
+    @Override
+    public PhysicalMemory ram() {
+        return pm;
+    }
+
     /** Whether {@code len} bytes at real address {@code pa} (from {@link #translateData}) are RAM. */
     boolean isRam(long pa, int len) {
         return pm.contains(pa, len);

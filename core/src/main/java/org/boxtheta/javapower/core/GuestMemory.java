@@ -34,4 +34,26 @@ public interface GuestMemory {
      * interrupts a load or store would. Used by larx/stcx, dcbz and friends.
      */
     long translateData(long ea, boolean store);
+
+    /**
+     * A fast path for instructions that access up to 16 bytes at once: the real address at which
+     * the {@code len} bytes (1 to 16) at {@code ea} lie in the guest RAM of {@link #ram}, if the
+     * access can be made there directly, else -1. It can when the bytes lie in one 4 KiB page of
+     * RAM whose translation for this kind of access is already known (MSR[DR]=0, or a cached
+     * translation): then the access cannot fault, and making it through {@link #ram}'s
+     * accessors (which track code writes) has exactly the effect the accesses of this interface
+     * would have. Otherwise (page crossing, a translation not cached, a fault, MMIO, or no fast
+     * path at all) the caller makes its accesses through this interface as before. Never
+     * raises an interrupt and changes no translation state; a store's address counts as
+     * written for the purposes of the implementation's store bookkeeping, so call it with
+     * {@code store} only right before making the store.
+     */
+    default long ramAddress(long ea, int len, boolean store) {
+        return -1;
+    }
+
+    /** The guest RAM {@link #ramAddress} refers to; null if it always returns -1. */
+    default PhysicalMemory ram() {
+        return null;
+    }
 }

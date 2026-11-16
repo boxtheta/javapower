@@ -899,107 +899,147 @@ public final class VsxInsns implements InsnSet {
         s.mem.translateData(addr(s, ea, len - 1), true);
     }
 
+    // The 16-byte forms first ask the MMU for the real address of the whole access
+    // (GuestMemory.ramAddress): where the TLB already has the page and the access stays in it,
+    // they make it with two doubleword accesses to RAM. Everything else (page crossing, a miss,
+    // a fault, MMIO, real mode outside RAM) takes the accesses through the MMU these handlers
+    // always made, in the same order, so faults, partial stores and TLB contents are unchanged.
+
+    /** The doubleword at real address {@code pa} in little- ({@code le}) or big-endian order. */
+    private static long rd64(org.boxtheta.javapower.core.PhysicalMemory pm, long pa, boolean le) {
+        return le ? pm.read64le(pa) : pm.read64be(pa);
+    }
+
+    private static void wr64(org.boxtheta.javapower.core.PhysicalMemory pm, long pa, boolean le, long v) {
+        if (le) {
+            pm.write64le(pa, v);
+        } else {
+            pm.write64be(pa, v);
+        }
+    }
+
     /** Full 16-byte load in the mode's byte order (lxv, lxvx, lvx-style). */
     static void ld128(CpuState s, int t, long ea) {
+        var m = s.mem;
+        boolean le = s.littleEndian();
+        long pa = m.ramAddress(ea, 16, false);
+        if (pa >= 0) {
+            var pm = m.ram();
+            if (le) {
+                s.vsrLo[t] = pm.read64le(pa);
+                s.vsrHi[t] = pm.read64le(pa + 8);
+            } else {
+                s.vsrHi[t] = pm.read64be(pa);
+                s.vsrLo[t] = pm.read64be(pa + 8);
+            }
+            return;
+        }
         long hi, lo;
-        if (s.littleEndian()) {
-            lo = s.mem.read64(ea);
-            hi = s.mem.read64(addr(s, ea, 8));
+        if (le) {
+            lo = m.read64(ea);
+            hi = m.read64(addr(s, ea, 8));
         } else {
-            hi = s.mem.read64(ea);
-            lo = s.mem.read64(addr(s, ea, 8));
+            hi = m.read64(ea);
+            lo = m.read64(addr(s, ea, 8));
         }
         V.set(s, t, hi, lo);
     }
 
     static void st128(CpuState s, int t, long ea) {
-        probeStore(s, ea, 16);
+        var m = s.mem;
+        boolean le = s.littleEndian();
         long hi = s.vsrHi[t], lo = s.vsrLo[t];
-        if (s.littleEndian()) {
-            s.mem.write64(ea, lo);
-            s.mem.write64(addr(s, ea, 8), hi);
+        long pa = m.ramAddress(ea, 16, true);
+        if (pa >= 0) {
+            var pm = m.ram();
+            if (le) {
+                pm.write64le(pa, lo);
+                pm.write64le(pa + 8, hi);
+            } else {
+                pm.write64be(pa, hi);
+                pm.write64be(pa + 8, lo);
+            }
+            return;
+        }
+        probeStore(s, ea, 16);
+        if (le) {
+            m.write64(ea, lo);
+            m.write64(addr(s, ea, 8), hi);
         } else {
-            s.mem.write64(ea, hi);
-            s.mem.write64(addr(s, ea, 8), lo);
+            m.write64(ea, hi);
+            m.write64(addr(s, ea, 8), lo);
         }
     }
 
-    /** Big-endian doubleword access regardless of MSR[LE]. */
-    static long readBE64(CpuState s, long ea) {
-        long v = s.mem.read64(ea);
-        return s.littleEndian() ? Long.reverseBytes(v) : v;
-    }
-
-    static void writeBE64(CpuState s, long ea, long v) {
-        s.mem.write64(ea, s.littleEndian() ? Long.reverseBytes(v) : v);
-    }
-
-    /** lxvd2x (0), lxvw4x (1), lxvh8x (2), lxvb16x (3). */
+    /**
+     * lxvd2x (0), lxvw4x (1), lxvh8x (2), lxvb16x (3). Each loads two doublewords, in the mode's
+     * byte order (d2x, w4x) or big-endian (h8x, b16x), and rearranges the elements in
+     * little-endian mode.
+     */
     static void lxvElems(CpuState s, int insn, int kind) {
         checkVsx(s);
         long ea = eaX(s, insn);
+        boolean le = s.littleEndian();
+        boolean order = le && kind < 2;
+        var m = s.mem;
+        long pa = m.ramAddress(ea, 16, false);
         long hi, lo;
-        switch (kind) {
-            case 0 -> {
-                hi = s.mem.read64(ea);
-                lo = s.mem.read64(addr(s, ea, 8));
+        if (pa >= 0) {
+            var pm = m.ram();
+            hi = rd64(pm, pa, order);
+            lo = rd64(pm, pa + 8, order);
+        } else {
+            hi = m.read64(ea);
+            lo = m.read64(addr(s, ea, 8));
+            if (le && kind >= 2) {
+                hi = Long.reverseBytes(hi);
+                lo = Long.reverseBytes(lo);
             }
-            case 1 -> {
-                hi = s.mem.read64(ea);
-                lo = s.mem.read64(addr(s, ea, 8));
-                if (s.littleEndian()) {
-                    hi = (hi >>> 32) | (hi << 32);
-                    lo = (lo >>> 32) | (lo << 32);
-                }
-            }
-            case 2 -> {
-                hi = readBE64(s, ea);
-                lo = readBE64(s, addr(s, ea, 8));
-                if (s.littleEndian()) {
-                    hi = V.bswapElems(hi, 2);
-                    lo = V.bswapElems(lo, 2);
-                }
-            }
-            default -> {
-                hi = readBE64(s, ea);
-                lo = readBE64(s, addr(s, ea, 8));
+        }
+        if (le) {
+            if (kind == 1) {
+                hi = (hi >>> 32) | (hi << 32);
+                lo = (lo >>> 32) | (lo << 32);
+            } else if (kind == 2) {
+                hi = V.bswapElems(hi, 2);
+                lo = V.bswapElems(lo, 2);
             }
         }
         V.set(s, xt(insn), hi, lo);
     }
 
+    /** stxvd2x (0), stxvw4x (1), stxvh8x (2), stxvb16x (3): the inverse of {@link #lxvElems}. */
     static void stxvElems(CpuState s, int insn, int kind) {
         checkVsx(s);
         long ea = eaX(s, insn);
         int t = xt(insn);
         long hi = s.vsrHi[t], lo = s.vsrLo[t];
-        probeStore(s, ea, 16);
-        switch (kind) {
-            case 0 -> {
-                s.mem.write64(ea, hi);
-                s.mem.write64(addr(s, ea, 8), lo);
-            }
-            case 1 -> {
-                if (s.littleEndian()) {
-                    hi = (hi >>> 32) | (hi << 32);
-                    lo = (lo >>> 32) | (lo << 32);
-                }
-                s.mem.write64(ea, hi);
-                s.mem.write64(addr(s, ea, 8), lo);
-            }
-            case 2 -> {
-                if (s.littleEndian()) {
-                    hi = V.bswapElems(hi, 2);
-                    lo = V.bswapElems(lo, 2);
-                }
-                writeBE64(s, ea, hi);
-                writeBE64(s, addr(s, ea, 8), lo);
-            }
-            default -> {
-                writeBE64(s, ea, hi);
-                writeBE64(s, addr(s, ea, 8), lo);
+        boolean le = s.littleEndian();
+        if (le) {
+            if (kind == 1) {
+                hi = (hi >>> 32) | (hi << 32);
+                lo = (lo >>> 32) | (lo << 32);
+            } else if (kind == 2) {
+                hi = V.bswapElems(hi, 2);
+                lo = V.bswapElems(lo, 2);
             }
         }
+        boolean order = le && kind < 2;
+        var m = s.mem;
+        long pa = m.ramAddress(ea, 16, true);
+        if (pa >= 0) {
+            var pm = m.ram();
+            wr64(pm, pa, order, hi);
+            wr64(pm, pa + 8, order, lo);
+            return;
+        }
+        probeStore(s, ea, 16);
+        if (le && kind >= 2) {
+            hi = Long.reverseBytes(hi);
+            lo = Long.reverseBytes(lo);
+        }
+        m.write64(ea, hi);
+        m.write64(addr(s, ea, 8), lo);
     }
 
     /** Scalar loads into dw0 (dw1 untouched, as QEMU): kind 0 lxsdx, 1 lxsiwax, 2 lxsiwzx, 3 lxsspx, 4 lxsibzx, 5 lxsihzx. */

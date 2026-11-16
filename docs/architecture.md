@@ -108,7 +108,8 @@ CPUs run, which PCI BARs need.
 - RAM stays as fast as without MMIO. The MMU looks at the bus only where it used to raise the
   machine check for unassigned memory: real mode's bounds check, and a table walk that ends
   outside RAM. MMIO pages never enter the software TLB, so the TLB hit path, the JIT's inline
-  RAM accesses (`JitRt`, `RamAccess`) and the code `RegionCompiler` generates are unchanged:
+  RAM accesses (`JitRt`, `RamAccess`), the code `RegionCompiler` generates and the vector
+  handlers' fast path (`GuestMemory.ramAddress`, which answers only for RAM) are unchanged:
   compiled code reaches MMIO through its existing slow path, the MMU's full access methods. Each
   MMIO access walks the page table again, which is cheap next to a device access and means a
   region unmapped or moved is never reached through a stale translation.

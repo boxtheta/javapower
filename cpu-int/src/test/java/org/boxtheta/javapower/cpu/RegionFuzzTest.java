@@ -588,6 +588,63 @@ class RegionFuzzTest {
     /** Cases that ran the FLIP stub, and that took a decrementer interrupt in the other byte order. */
     static final int[] FLIPPED = new int[2];
 
+    /**
+     * A real-mode store that crosses from one page into a page holding translated code changes
+     * that code: every tier must run the new code afterwards (code-write tracking of the second
+     * page, which the region's direct stores must not skip).
+     */
+    @Test
+    void realModeStoreCrossingIntoCode() {
+        long sub = DATA + 0x2000;
+        int addi1 = d(14, 18, 18, 1);
+        int addi100 = d(14, 18, 18, 100);
+        for (int size : new int[] {2, 4, 8}) {
+            for (boolean le : new boolean[] {false, true}) {
+                Mode mode = new Mode(le, le, true, false, false, false, false);
+                int st = switch (size) {
+                    case 2 -> d(44, 5, 20, 0); // sth r5, 0(r20)
+                    case 4 -> d(36, 5, 20, 0); // stw
+                    default -> d(62, 5, 20, 0); // std
+                };
+                List<Integer> code = new ArrayList<>();
+                code.add(d(14, 31, 0, 4)); // li r31, 4
+                long loop = CODE + 4L * code.size();
+                code.add(b(loop, sub) | 1); // bl sub
+                code.add(st);
+                code.add(d(14, 31, 31, -1));
+                code.add((11 << 26) | (7 << 23) | (1 << 21) | (31 << 16)); // cmpdi cr7, r31, 0
+                code.add(bc(4, 30, CODE + 4L * code.size(), loop, 0));
+                code.add(SC);
+                // The store's last half lands on the first half of `addi r18, r18, 1` and turns
+                // it into `addi r18, r18, 100` (little-endian, or a whole word) or into
+                // `addis r18, r18, 1` (the opcode byte first, big-endian).
+                int w = le || size == 8 ? addi100 : d(15, 18, 18, 1);
+                int half = size / 2;
+                long at = sub - half;
+                long v = 0;
+                for (int k = 0; k < size; k++) {
+                    int mb = k < half ? 0 : (le ? w >>> (8 * (k - half)) : w >>> (24 - 8 * (k - half))) & 0xff;
+                    v |= (long) mb << (le ? 8 * k : 8 * (size - 1 - k));
+                }
+                long[] r18 = new long[4];
+                for (int tier : new int[] {INTERP, BLOCKS, REGIONS, PROMOTED}) {
+                    Machine m = new Machine(tier, mode);
+                    m.load(CODE, code);
+                    m.load(sub, List.of(addi1, 0x4e800020)); // addi r18, r18, 1; blr
+                    m.s.gpr[5] = v;
+                    m.s.gpr[18] = 0;
+                    m.s.gpr[20] = at;
+                    m.cpu.run(1000);
+                    r18[tier] = m.s.gpr[18];
+                }
+                assertTrue(r18[INTERP] > 4, "size " + size + " le " + le + ": the store did not change the code");
+                for (int tier : new int[] {BLOCKS, REGIONS, PROMOTED}) {
+                    assertEquals(r18[INTERP], r18[tier], "size " + size + " le " + le + " tier " + tier);
+                }
+            }
+        }
+    }
+
     @Test
     void realMode() {
         campaign(120, false, false);

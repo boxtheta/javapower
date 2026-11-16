@@ -600,7 +600,9 @@ final class Alu {
 
     static void popcntw(CpuState s, int i) {
         long x = s.gpr[rt(i)];
-        s.gpr[ra(i)] = ((long) Integer.bitCount((int) (x >>> 32)) << 32) | Integer.bitCount((int) x);
+        // Long.bitCount of each half, not Integer.bitCount((int) x): for that, JDK 21's C2 on aarch64
+        // clears the upper half of x itself before the other word is counted.
+        s.gpr[ra(i)] = ((long) Long.bitCount(x >>> 32) << 32) | Long.bitCount(x & 0xffffffffL);
     }
 
     static void popcntd(CpuState s, int i) {

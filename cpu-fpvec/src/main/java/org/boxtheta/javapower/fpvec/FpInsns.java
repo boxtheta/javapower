@@ -5,6 +5,7 @@ import static org.boxtheta.javapower.fpvec.Fpscr.*;
 import org.boxtheta.javapower.core.CpuState;
 import org.boxtheta.javapower.core.DecodeTable;
 import org.boxtheta.javapower.core.InsnSet;
+import org.boxtheta.javapower.core.Op;
 
 /**
  * Scalar floating-point instructions (Book I chapter 4): arithmetic, FMA, estimates, conversions,
@@ -37,21 +38,83 @@ public final class FpInsns implements InsnSet {
         }
     }
 
+    /**
+     * Completion of a FastFp result: always a normal nonzero number, and inexact is the only
+     * exception it can raise (the same FPSCR as {@link #finish}, with less code: these
+     * handlers must stay small enough for C2 to inline them into each instruction's Op).
+     */
+    static void finishFast(CpuState s, int insn, long r, boolean inexact) {
+        setFpr(s, rt(insn), r);
+        setFprfNormal(s, r < 0);
+        postInexact(s, inexact, true);
+        if ((insn & 1) != 0) {
+            setCr1(s);
+        }
+    }
+
     // ------------------------------------------------------------------ arithmetic
 
     private static final int ADD = 0, SUB = 1, MUL = 2, DIV = 3;
+    private static final long ONE = 0x3ff0000000000000L;
 
-    static void arith2(CpuState s, int insn, int op, int fmt) {
+    // One method per operation rather than one switching on it: each stays small enough for C2
+    // to inline into the instruction's Op whatever was compiled first. FastFp conditions: normal
+    // operands, result far from the limits; only XX/FI/FPRF can change.
+
+    /** fadd/fsub (and the single forms with fmt DS). */
+    static void fadd(CpuState s, int insn, int fmt, boolean sub) {
         checkFp(s);
-        long a = s.vsrHi[ra(insn)];
-        long b = op == MUL ? s.vsrHi[rc(insn)] : s.vsrHi[rb(insn)];
-        if (fmt == SoftFloat.D && (s.fpscr & 3) == 0) {
-            long r = FastFp.arith2(op, a, b);
-            if (r != FastFp.MISS) {
-                finish(s, insn, r, FastFp.inexact2(op, a, b, r) ? SoftFloat.XX : 0);
-                return;
+        long a = s.vsrHi[ra(insn)], b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            long y = sub ? b ^ Long.MIN_VALUE : b;
+            long rn = FastFp.add(a, y);
+            if (rn != FastFp.MISS) {
+                double e = FastFp.addErr(a, y, rn);
+                long r = FastFp.round(fmt, rn, e, rmode(s));
+                if (r != FastFp.MISS) {
+                    finishFast(s, insn, r, FastFp.inexact(fmt, rn, e));
+                    return;
+                }
             }
         }
+        arith2Soft(s, insn, sub ? SUB : ADD, fmt, a, b);
+    }
+
+    static void fmul(CpuState s, int insn, int fmt) {
+        checkFp(s);
+        long a = s.vsrHi[ra(insn)], c = s.vsrHi[rc(insn)];
+        if (FastFp.on) {
+            long rn = FastFp.mul(a, c);
+            if (rn != FastFp.MISS) {
+                double e = FastFp.mulErr(a, c, rn);
+                long r = FastFp.round(fmt, rn, e, rmode(s));
+                if (r != FastFp.MISS) {
+                    finishFast(s, insn, r, FastFp.inexact(fmt, rn, e));
+                    return;
+                }
+            }
+        }
+        arith2Soft(s, insn, MUL, fmt, a, c);
+    }
+
+    static void fdiv(CpuState s, int insn, int fmt) {
+        checkFp(s);
+        long a = s.vsrHi[ra(insn)], b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            long rn = FastFp.div(a, b);
+            if (rn != FastFp.MISS) {
+                double e = FastFp.divErr(a, b, rn);
+                long r = FastFp.round(fmt, rn, e, rmode(s));
+                if (r != FastFp.MISS) {
+                    finishFast(s, insn, r, FastFp.inexact(fmt, rn, e));
+                    return;
+                }
+            }
+        }
+        arith2Soft(s, insn, DIV, fmt, a, b);
+    }
+
+    static void arith2Soft(CpuState s, int insn, int op, int fmt, long a, long b) {
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
         sf.unpackD(0, a);
@@ -68,6 +131,49 @@ public final class FpInsns implements InsnSet {
     static void fma(CpuState s, int insn, int fmt, boolean negAdd, boolean negRes) {
         checkFp(s);
         long a = s.vsrHi[ra(insn)], b = s.vsrHi[rb(insn)], c = s.vsrHi[rc(insn)];
+        if (FastFp.on) {
+            long addend = negAdd ? b ^ Long.MIN_VALUE : b;
+            long rn = FastFp.fma(a, c, addend);
+            if (rn != FastFp.MISS) {
+                double es = FastFp.fmaErr(a, c, addend, rn);
+                long r = FastFp.round(fmt, rn, es, rmode(s));
+                if (r != FastFp.MISS) {
+                    // negated after rounding, as in SoftFloat.fma
+                    finishFast(s, insn, negRes ? r ^ Long.MIN_VALUE : r, FastFp.inexact(fmt, rn, es));
+                    return;
+                }
+            }
+        }
+        fmaSoft(s, insn, fmt, negAdd, negRes, a, b, c);
+    }
+
+    /**
+     * The multiply-add handler for {@code fmt}. Without a hardware FMA, FastFp only takes exact
+     * products, which binary64 operands rarely have and binary32 ones (the single forms) usually
+     * do; there the binary64 forms keep the plain SoftFloat handler, which is cheaper than
+     * trying first (chosen once: both give the same results).
+     */
+    static Op fmaOp(int fmt, boolean negAdd, boolean negRes) {
+        if (fmt == SoftFloat.D && !FastFp.HOST_FMA) {
+            return (s, i) -> fmaSoftOnly(s, i, fmt, negAdd, negRes);
+        }
+        return (s, i) -> fma(s, i, fmt, negAdd, negRes);
+    }
+
+    /** The multiply-add handler without a fast path (see {@link #fmaOp}). */
+    static void fmaSoftOnly(CpuState s, int insn, int fmt, boolean negAdd, boolean negRes) {
+        checkFp(s);
+        long a = s.vsrHi[ra(insn)], b = s.vsrHi[rb(insn)], c = s.vsrHi[rc(insn)];
+        SoftFloat sf = SoftFloat.get();
+        sf.resetFp(s.fpscr);
+        sf.unpackD(0, a);
+        sf.unpackD(1, b);
+        sf.unpackD(2, c);
+        long r = sf.fma(fmt, negAdd, negRes);
+        finish(s, insn, r, sf.flags);
+    }
+
+    static void fmaSoft(CpuState s, int insn, int fmt, boolean negAdd, boolean negRes, long a, long b, long c) {
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
         sf.unpackD(0, a);
@@ -79,9 +185,25 @@ public final class FpInsns implements InsnSet {
 
     static void fsqrt(CpuState s, int insn, int fmt) {
         checkFp(s);
+        long b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            long rn = FastFp.sqrt(b);
+            if (rn != FastFp.MISS) {
+                double es = FastFp.sqrtErr(b, rn);
+                long r = FastFp.round(fmt, rn, es, rmode(s));
+                if (r != FastFp.MISS) {
+                    finishFast(s, insn, r, FastFp.inexact(fmt, rn, es));
+                    return;
+                }
+            }
+        }
+        fsqrtSoft(s, insn, fmt, b);
+    }
+
+    static void fsqrtSoft(CpuState s, int insn, int fmt, long b) {
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
-        sf.unpackD(0, s.vsrHi[rb(insn)]);
+        sf.unpackD(0, b);
         long r = sf.sqrt(fmt);
         finish(s, insn, r, sf.flags);
     }
@@ -90,6 +212,17 @@ public final class FpInsns implements InsnSet {
     static void fre(CpuState s, int insn, int fmt) {
         checkFp(s);
         long b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            long rn = FastFp.div(ONE, b);
+            if (rn != FastFp.MISS) {
+                double es = FastFp.divErr(ONE, b, rn);
+                long r = FastFp.round(fmt, rn, es, rmode(s));
+                if (r != FastFp.MISS) {
+                    finishFast(s, insn, r, FastFp.inexact(fmt, rn, es));
+                    return;
+                }
+            }
+        }
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
         sf.unpackD(0, 0x3ff0000000000000L);
@@ -106,6 +239,13 @@ public final class FpInsns implements InsnSet {
     static void frsqrte(CpuState s, int insn, int fmt) {
         checkFp(s);
         long b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            long r = FastFp.rsqrt(fmt, b, rmode(s));
+            if (r != FastFp.MISS) {
+                finishFast(s, insn, r, FastFp.rsqrtFlags(fmt, b, rmode(s)) != 0);
+                return;
+            }
+        }
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
         sf.unpackD(0, b);
@@ -132,6 +272,17 @@ public final class FpInsns implements InsnSet {
     static void frsp(CpuState s, int insn) {
         checkFp(s);
         long b = s.vsrHi[rb(insn)];
+        if (FastFp.on) {
+            if ((b & Long.MAX_VALUE) == 0) {
+                finish(s, insn, b, 0);
+                return;
+            }
+            long r = FastFp.normal(b) ? FastFp.roundS(b, 0, rmode(s)) : FastFp.MISS;
+            if (r != FastFp.MISS) {
+                finishFast(s, insn, r, FastFp.inexactS(b, 0));
+                return;
+            }
+        }
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
         sf.unpackD(0, b);
@@ -158,10 +309,22 @@ public final class FpInsns implements InsnSet {
      */
     static void fcti(CpuState s, int insn, int bits, boolean signed, boolean trunc) {
         checkFp(s);
+        long b = s.vsrHi[rb(insn)];
+        int mode = trunc ? SoftFloat.RZ : rmode(s);
+        if (FastFp.on) {
+            long r = FastFp.toInt(b, bits, signed, mode);
+            if (r != FastFp.MISS) {
+                setFpr(s, rt(insn), r);
+                post(s, FastFp.toIntFlags(b, r));
+                if ((insn & 1) != 0) {
+                    setCr1(s);
+                }
+                return;
+            }
+        }
         SoftFloat sf = SoftFloat.get();
         sf.resetFp(s.fpscr);
-        int mode = trunc ? SoftFloat.RZ : rmode(s);
-        sf.unpackD(0, s.vsrHi[rb(insn)]);
+        sf.unpackD(0, b);
         long r = sf.toInt(bits, signed, mode);
         int fl = sf.flags;
         if ((fl & SoftFloat.VXCVI) != 0) {
@@ -179,10 +342,26 @@ public final class FpInsns implements InsnSet {
 
     static void fcfid(CpuState s, int insn, int fmt, boolean signed, boolean fprf) {
         checkFp(s);
-        SoftFloat sf = SoftFloat.get();
-        sf.resetFp(s.fpscr);
-        long r = sf.fromInt(fmt, 0, s.vsrHi[rb(insn)], signed, false);
-        post(s, sf.flags); // QEMU checks status inside the helper: a trap leaves the target alone
+        long x = s.vsrHi[rb(insn)];
+        long r = FastFp.MISS;
+        int fl = 0;
+        if (FastFp.on) {
+            long rn = FastFp.fromLong(x, signed);
+            if (rn != FastFp.MISS) {
+                double es = FastFp.fromLongErr(x, rn);
+                r = FastFp.round(fmt, rn, es, rmode(s));
+                fl = FastFp.flags(fmt, rn, es);
+            } else if (x == 0) {
+                r = 0;
+            }
+        }
+        if (r == FastFp.MISS) {
+            SoftFloat sf = SoftFloat.get();
+            sf.resetFp(s.fpscr);
+            r = sf.fromInt(fmt, 0, x, signed, false);
+            fl = sf.flags;
+        }
+        post(s, fl); // QEMU checks status inside the helper: a trap leaves the target alone
         setFpr(s, rt(insn), r);
         if (fprf) {
             setFprf(s, classD(r));
@@ -197,11 +376,18 @@ public final class FpInsns implements InsnSet {
     static void fcmp(CpuState s, int insn, boolean ordered) {
         checkFp(s);
         long a = s.vsrHi[ra(insn)], b = s.vsrHi[rb(insn)];
+        int bf = (insn >>> 23) & 7;
+        if (FastFp.on && !isNanD(a) && !isNanD(b)) {
+            int c = FastFp.compare(a, b);
+            s.fpscr = (s.fpscr & ~(FPCC | FI)) | ((long) c << 12);
+            s.setCrField(bf, c);
+            return;
+        }
         SoftFloat sf = SoftFloat.get();
+        sf.reset(SoftFloat.RN); // no flush-to-zero left over from VMX
         sf.unpackD(0, a);
         sf.unpackD(1, b);
         int c = sf.compare();
-        int bf = (insn >>> 23) & 7;
         s.fpscr = (s.fpscr & ~FPCC) | ((long) c << 12);
         s.setCrField(bf, c);
         boolean deferred = false;
@@ -485,17 +671,17 @@ public final class FpInsns implements InsnSet {
         for (int p : new int[] {63, 59}) {
             int fmt = p == 63 ? D : DS;
             String sfx = p == 63 ? "" : "s";
-            t.addA(p, 21, "fadd" + sfx, (s, i) -> arith2(s, i, ADD, fmt));
-            t.addA(p, 20, "fsub" + sfx, (s, i) -> arith2(s, i, SUB, fmt));
-            t.addA(p, 25, "fmul" + sfx, (s, i) -> arith2(s, i, MUL, fmt));
-            t.addA(p, 18, "fdiv" + sfx, (s, i) -> arith2(s, i, DIV, fmt));
+            t.addA(p, 21, "fadd" + sfx, (s, i) -> fadd(s, i, fmt, false));
+            t.addA(p, 20, "fsub" + sfx, (s, i) -> fadd(s, i, fmt, true));
+            t.addA(p, 25, "fmul" + sfx, (s, i) -> fmul(s, i, fmt));
+            t.addA(p, 18, "fdiv" + sfx, (s, i) -> fdiv(s, i, fmt));
             t.addA(p, 22, "fsqrt" + sfx, (s, i) -> fsqrt(s, i, fmt));
             t.addA(p, 24, "fre" + sfx, (s, i) -> fre(s, i, fmt));
             t.addA(p, 26, "frsqrte" + sfx, (s, i) -> frsqrte(s, i, fmt));
-            t.addA(p, 29, "fmadd" + sfx, (s, i) -> fma(s, i, fmt, false, false));
-            t.addA(p, 28, "fmsub" + sfx, (s, i) -> fma(s, i, fmt, true, false));
-            t.addA(p, 31, "fnmadd" + sfx, (s, i) -> fma(s, i, fmt, false, true));
-            t.addA(p, 30, "fnmsub" + sfx, (s, i) -> fma(s, i, fmt, true, true));
+            t.addA(p, 29, "fmadd" + sfx, fmaOp(fmt, false, false));
+            t.addA(p, 28, "fmsub" + sfx, fmaOp(fmt, true, false));
+            t.addA(p, 31, "fnmadd" + sfx, fmaOp(fmt, false, true));
+            t.addA(p, 30, "fnmsub" + sfx, fmaOp(fmt, true, true));
         }
         t.addA(63, 23, "fsel", FpInsns::fsel);
 

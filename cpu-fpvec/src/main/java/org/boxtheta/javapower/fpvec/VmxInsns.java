@@ -859,6 +859,79 @@ public final class VmxInsns implements InsnSet {
         set(s, 32 + rt(insn), rh, rl);
     }
 
+    /**
+     * vaddfp (kind 0), vsubfp (1), vmaddfp (2), vnmsubfp (3). The FastFp path applies when every
+     * element has normal operands and a result at least 2^-125 and below the overflow threshold:
+     * then VSCR[NJ] changes nothing and the result is SoftFloat's under vec_status
+     * (round-to-nearest). Otherwise the whole instruction goes through {@link #fp}.
+     */
+    static void fpArith(CpuState s, int insn, int kind, F2 op) {
+        checkVec(s);
+        if (FastFp.on) {
+            int a = 32 + ra(insn), b = 32 + rb(insn), c = 32 + rc(insn);
+            long ah = s.vsrHi[a], al = s.vsrLo[a], bh = s.vsrHi[b], bl = s.vsrLo[b];
+            long ch = s.vsrHi[c], cl = s.vsrLo[c];
+            long r0 = fpElem(kind, V.w(ah, al, 0), V.w(bh, bl, 0), V.w(ch, cl, 0));
+            long r1 = fpElem(kind, V.w(ah, al, 1), V.w(bh, bl, 1), V.w(ch, cl, 1));
+            long r2 = fpElem(kind, V.w(ah, al, 2), V.w(bh, bl, 2), V.w(ch, cl, 2));
+            long r3 = fpElem(kind, V.w(ah, al, 3), V.w(bh, bl, 3), V.w(ch, cl, 3));
+            if ((r0 | r1 | r2 | r3) >= 0) {
+                set(s, 32 + rt(insn), (r0 << 32) | (r1 & 0xffffffffL), (r2 << 32) | (r3 & 0xffffffffL));
+                return;
+            }
+        }
+        fp(s, insn, kind < 2 ? 2 : 3, op);
+    }
+
+    /** One fpArith element, packed as FastFp returns it (the inexact flag above bit 31 is ignored). */
+    private static long fpElem(int kind, int a, int b, int c) {
+        return switch (kind) {
+            case 0, 1 -> FastFp.arithS(kind, a, b, SoftFloat.RN);
+            case 2 -> FastFp.fmaS(a, c, b, false, SoftFloat.RN);
+            default -> { // -(a*c - b), negated after rounding
+                long r = FastFp.fmaS(a, c, b, true, SoftFloat.RN);
+                yield r < 0 ? r : r ^ 0x80000000L;
+            }
+        };
+    }
+
+    /**
+     * vmaxfp / vminfp without NaN operands: the larger (smaller) value, +0 above -0, the first
+     * operand when equal, as SoftFloat.minmax. With VSCR[NJ] set, denormal operands (flushed
+     * to zero) go through {@link #fp}.
+     */
+    static void fpMinMax(CpuState s, int insn, boolean max, F2 op) {
+        checkVec(s);
+        if (FastFp.on) {
+            int a = 32 + ra(insn), b = 32 + rb(insn);
+            long ah = s.vsrHi[a], al = s.vsrLo[a], bh = s.vsrHi[b], bl = s.vsrLo[b];
+            boolean nj = (s.vscr & 0x10000) != 0;
+            long r0 = minMaxElem(V.w(ah, al, 0), V.w(bh, bl, 0), max, nj);
+            long r1 = minMaxElem(V.w(ah, al, 1), V.w(bh, bl, 1), max, nj);
+            long r2 = minMaxElem(V.w(ah, al, 2), V.w(bh, bl, 2), max, nj);
+            long r3 = minMaxElem(V.w(ah, al, 3), V.w(bh, bl, 3), max, nj);
+            if ((r0 | r1 | r2 | r3) >= 0) {
+                set(s, 32 + rt(insn), (r0 << 32) | r1, (r2 << 32) | r3);
+                return;
+            }
+        }
+        fp(s, insn, 2, op);
+    }
+
+    private static long minMaxElem(int x, int y, boolean max, boolean nj) {
+        int ax = x & 0x7fffffff, ay = y & 0x7fffffff;
+        if (ax > 0x7f800000 || ay > 0x7f800000) {
+            return -1; // a NaN
+        }
+        if (nj && ((ax != 0 && ax < 0x00800000) || (ay != 0 && ay < 0x00800000))) {
+            return -1; // a denormal that NJ flushes
+        }
+        // Integer keys in value order, -0 below +0.
+        int kx = x ^ ((x >> 31) & 0x7fffffff), ky = y ^ ((y >> 31) & 0x7fffffff);
+        boolean first = max ? kx >= ky : kx <= ky;
+        return (first ? x : y) & 0xffffffffL;
+    }
+
     static final int ONE_S = 0x3f800000;
 
     static void vrecip(CpuState s, int insn, boolean rsqrt) {
@@ -1461,13 +1534,13 @@ public final class VmxInsns implements InsnSet {
         vc(t, 135, "vcmpnew", (s, i) -> vcmp(s, i, (x, y) -> ~fill(eq(x, y, 32), 32)));
         vc(t, 391, "vcmpnezw", (s, i) -> vcmp(s, i, (x, y) -> nez(x, y, 32)));
         // ---- floating point
-        vx(t, 10, "vaddfp", (s, i) -> fp(s, i, 2, sf -> sf.add(SoftFloat.S, false)));
-        vx(t, 74, "vsubfp", (s, i) -> fp(s, i, 2, sf -> sf.add(SoftFloat.S, true)));
-        vx(t, 1034, "vmaxfp", (s, i) -> fp(s, i, 2, sf -> sf.minmax(SoftFloat.S, true, false)));
-        vx(t, 1098, "vminfp", (s, i) -> fp(s, i, 2, sf -> sf.minmax(SoftFloat.S, false, false)));
+        vx(t, 10, "vaddfp", (s, i) -> fpArith(s, i, 0, sf -> sf.add(SoftFloat.S, false)));
+        vx(t, 74, "vsubfp", (s, i) -> fpArith(s, i, 1, sf -> sf.add(SoftFloat.S, true)));
+        vx(t, 1034, "vmaxfp", (s, i) -> fpMinMax(s, i, true, sf -> sf.minmax(SoftFloat.S, true, false)));
+        vx(t, 1098, "vminfp", (s, i) -> fpMinMax(s, i, false, sf -> sf.minmax(SoftFloat.S, false, false)));
         // vmaddfp: a*c + b ; vnmsubfp: -(a*c - b)
-        va(t, 46, "vmaddfp", (s, i) -> fp(s, i, 3, sf -> sf.fma(SoftFloat.S, false, false)));
-        va(t, 47, "vnmsubfp", (s, i) -> fp(s, i, 3, sf -> sf.fma(SoftFloat.S, true, true)));
+        va(t, 46, "vmaddfp", (s, i) -> fpArith(s, i, 2, sf -> sf.fma(SoftFloat.S, false, false)));
+        va(t, 47, "vnmsubfp", (s, i) -> fpArith(s, i, 3, sf -> sf.fma(SoftFloat.S, true, true)));
         vxa(t, 266, 0, "vrefp", (s, i) -> vrecip(s, i, false));
         vxa(t, 330, 0, "vrsqrtefp", (s, i) -> vrecip(s, i, true));
         vxa(t, 522, 0, "vrfin", (s, i) -> fp(s, i, 1, sf -> sf.roundToInt(SoftFloat.S, SoftFloat.RN)));

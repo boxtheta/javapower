@@ -219,6 +219,33 @@ public final class Fpscr {
         }
     }
 
+    /**
+     * {@link #post} for an operation whose only possible exception is inexact (the FastFp
+     * paths): the same FPSCR result, without the overflow and underflow cases.
+     */
+    public static void postInexact(CpuState s, boolean inexact, boolean changeFi) {
+        long f = s.fpscr;
+        if (!inexact) {
+            if (changeFi) s.fpscr = f & ~FI;
+            return;
+        }
+        f |= XX | FX;
+        if (changeFi) f |= FI;
+        if ((f & XE) != 0) {
+            s.fpscr = f | FEX;
+            if (trapsEnabled(s)) {
+                throw PpcException.fpEnabled();
+            }
+            return;
+        }
+        s.fpscr = f;
+    }
+
+    /** FPRF of a normal nonzero binary64 or binary32 value: normal number, by sign. */
+    public static void setFprfNormal(CpuState s, boolean negative) {
+        s.fpscr = (s.fpscr & ~FPRF) | (negative ? 0x08L << 12 : 0x04L << 12);
+    }
+
     /** FPRF class code (C|FPCC) of a binary64 value. */
     public static int classD(long x) {
         boolean neg = x < 0;
